@@ -24,8 +24,12 @@
 > **评审修正（限流不再是硬编码常量）**：CF 版把额度写死成 30 帧/秒、20 chunk/秒、12 MiB/秒；自建中继改成在 `server.welcome` 里**广告**：
 >
 > ```json
-> { "type": "server.welcome", "protocol": 1, "peerOnline": false,
->   "limits": { "framesPerSecond": 30.0, "chunksPerSecond": 20.0, "bytesPerSecond": 12582912.0 } }
+> {
+>   "type": "server.welcome",
+>   "protocol": 1,
+>   "peerOnline": false,
+>   "limits": { "framesPerSecond": 30.0, "chunksPerSecond": 20.0, "bytesPerSecond": 12582912.0 }
+> }
 > ```
 >
 > 客户端 Pacer 用广告值推导，**但不是 1:1 取用**：保持今天这组四元组不变（帧 20 速率 / 20 突发、分片 15 速率 / 10 突发，相对 CF 的 30 / 20 分别留 2/3、3/4、1/2 的余量），自建中继把额度调高时按同一比例放大；字段缺失时退回 30/20/12 MiB 的 CF 缺省值。`manager.rs:60-71` 的注释和 `manager.rs:3227-3232` 的测试都在守「严格小于中继上限」，1:1 取用会立刻复现 `close 1008`。这样自建中继可以放开到 60 帧/秒，而 CF 版拿到的缺省推导值与今天完全一致。`manager.rs` 的 `outbound_pacing_stays_within_the_relay_budget` 测试改为断言「缺省值仍在中继缺省额度内」，继续当护栏。
@@ -101,13 +105,13 @@
 > 1. `webrtc` crate（0.21）必须在 `.github/workflows/release.yml` 的 **3 个 Windows 目标**上编译通过：`x86_64-pc-windows-msvc`、`i686-pc-windows-msvc`、`aarch64-pc-windows-msvc`。**先做一个只验证编译的 spike**，这是最大的进度风险。
 >
 >    **订正（Phase 8 规划评审）**：原文写的是「全部 7 个目标」。范围本来就是「客户端只做 Windows」，所以依赖用 `[target.'cfg(windows)'.dependencies]` 门控、`p2p` 模块用 `#[cfg(windows)]` 门控，另外 4 个非 Windows 目标（`macos-latest` × 2、`ubuntu-22.04`、`ubuntu-22.04-arm`）**完全不编译 `webrtc`**，风险面从 7 个降到 3 个。形状定死：
->
 >    - 依赖写 `webrtc = { version = "0.21", default-features = false, features = ["runtime-tokio", "crypto-ring"] }`（0.21 的默认就是这两个，显式写出来是为了抗上游改默认），放在根 `Cargo.toml` 的 `[workspace.dependencies]`，`src-tauri` 用 `webrtc.workspace = true`；
 >    - 门控挂在 `src-tauri/src/core/pair/mod.rs` 的 `#[cfg(windows)] pub mod p2p;` 那一行，不要在 `p2p.rs` 里再写一次 `#![cfg(windows)]`；
 >    - 调用点**不要**在 `manager.rs` 里散着写 `#[cfg(windows)]`。新开 `pair/link.rs` 做一层 cfg 中立的 seam：`#[cfg(windows)]` 一份真实现、`#[cfg(not(windows))]` 一份空实现。这样非 Windows 目标上 `live` 的调用点仍然会被编译，签名漂移能被 CI 抓到；
 >    - 不要改用 cargo feature 代替 `cfg`：feature 是全局加法式的，而 `release.yml` 的 `args` 是各目标共用的，改成按目标传参容易漏，`cfg(windows)` 漏不了。
 >
 >    **spike 结果（已跑完）**：`x86_64-pc-windows-msvc` 编译 + 实跑双 peer 互连通过；`i686-pc-windows-msvc` `cargo check` 通过；`aarch64-pc-windows-msvc` 本机因缺 `clang` 无法自证，但唯一需要 C 工具链的 `ring 0.17.14` **本来就在依赖树里**（`rustls` ← `reqwest`/`hyper-rustls` ← `tauri-plugin-updater`，以及 `tokio-tungstenite`），上游 `ayangweb/BongoCat` 的 release 在 `windows-latest` 上跑 aarch64-windows 是 success，所以没有引入新的构建工具要求。**注意**：本 fork 至今没跑过 `release.yml`（0 个 tag），想要本仓库的真实记录，`workflow_dispatch` 手动跑一次最便宜（会产出 Draft Release）。另：spike 的 ICE 证据只覆盖 loopback（绑定的是 `127.0.0.1:0`），**生产绝不能绑回环**——要么不设 `with_udp_addrs` 走缺省、要么绑通配地址，否则收不到真实 host 候选。
+>
 > 2. 仓库**没有 PR / 提交级别的编译或测试门禁**（`.github/workflows` 只有 `release.yml` / `sync-to-gitee.yml` / `upgradelink.yml`；`release.yml` 只在打 `v*` tag 时 `pnpm tauri build`，会编译但不跑测试）。Phase 8 是大重构，没有 CI 兜底很难受——先补一个跑 `cargo test --lib` + `pnpm test` + `tsc --noEmit` 的 job。（`server-relay/` 那一份已在 R25-7 落地，客户端侧仍留到 Phase 8。）
 > 3. 自建中继必须有受信任证书（客户端用 `rustls-tls-webpki-roots`）：文档强制要求域名；「允许自签 / 自定义 CA」作为可选设置项，默认不做。
 > 4. R10 的 secret 纪律要覆盖自建流程：compose 用 env 文件或 stdin 喂，**不要**写 `-e PAIR_AUTH_TOKEN=xxx`；需要一个与 `server-cloudflare/scripts/generate-pair.mjs` HKDF 等价的本地生成器（自建侧用户不装 Node）。
@@ -137,6 +141,18 @@
 > 4. **依赖兼容性（逐条核过）**：`tokio` 要求 `^1.52.3`、仓库锁 1.53.1 ✓；`rustls` 要求 `^0.23.27`、仓库锁 0.23.38 ✓ 且与 `tokio-tungstenite 0.30` 共用一份；`tokio-tungstenite` 在 `rtc` 里只是 dev-dependency 0.28，**不进生产依赖图**；`ring` 要求 0.17.14、仓库锁正好 0.17.14 → 不新增版本、不新增构建工具要求。`async-trait` 是**新的直接依赖**（`PeerConnectionEventHandler` 的 impl 必须挂 `#[async_trait::async_trait]`），但 0.1.89 已在 lock 里当传递依赖，加它不会动 lock。其余新增全是纯 Rust，没有 openssl / native-tls。
 > 5. **老客户端收到 `pair.signal` 的真实行为**：不是「忽略」，而是落进 `_` 分支 `emit(EVENT_MESSAGE)`，把整个信封（含 SDP）广播给所有 WebView；因为 `pair-message` 这个事件常量没有任何前端订阅者，实际是 no-op。结论不变（老客户端不会崩），但能力门控仍然必须做——否则对面是旧客户端时我们会白等一轮 ICE 超时。
 
+> **R27（Phase 8 起步落地：传输抽象、依赖门控、CI）—— 含只读审计提出的 2 个 P0**
+>
+> 1. **Phase 8a 已落地（`c975786`，零行为变化）**：`live` 泛型化为 `T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin, E: Display`，函数体只改 `transport.split()` 一行。四个辅助函数（`flush` / `enqueue_reply` / `send_next_chunk` / `send_frame`）与 `read_welcome` 的约束天然兼容，`SessionState` 不碰 socket，调用点只有 `run_session` 一处。**不需要 WS 适配器**：`WebSocketStream` 本来就同时满足两个 bound 且两侧同一个 `Error`。测试加了 `FakeTransport`（非 WebSocket 的传输替身）+ `wait_until`，用例 `live_runs_over_a_transport_that_is_not_a_websocket`。验证：`cargo test --lib` = 104 passed / 6 ignored；真中继 e2e 5/5。
+> 2. **`webrtc` 依赖门控已落地**：根 `Cargo.toml` 的 `[workspace.dependencies]` 加 `webrtc = { version = "0.21", default-features = false, features = ["runtime-tokio", "crypto-ring"] }`（0.21 的默认就是这两个，显式写是为了抗上游改默认）与 `async-trait`；`src-tauri/Cargo.toml` 放 `[target."cfg(windows)".dependencies]`；`src-tauri/src/core/pair/mod.rs` 加 `#[cfg(windows)] pub mod p2p;`。R24-1 的 spike 已跑完：`x86_64-pc-windows-msvc` 编译 + 双 peer 实跑互连通过（`connected` / DC `open` / SCTP 协商成功 / 收到 15 字节），`i686-pc-windows-msvc` `cargo check` 通过，`aarch64-pc-windows-msvc` 本机缺 `clang` 无法自证（唯一需要 C 工具链的 `ring 0.17.14` 本来就在依赖树里，上游 aarch64-windows release 是 success）。
+> 3. **R24-6 的测量结果（已量）**：`cargo build --release` 总墙钟 **5 分 23 秒**（323.4 s）；`target/release/bongo-cat.exe` = **12,761,088 字节（约 12.2 MiB）**；`Cargo.lock` 净新增 **41 个 crate**（`rtc-*` 家族、`rcgen`/`x509-parser`/`der-parser`/`asn1-rs`/`pem`/`yasna`、`crc`/`crc32c`/`ccm`/`ctr`/`md-5`、`quinn-udp`/`sansio`/`unicase`/`substring`/`minimal-lexical`/`oid-registry`/`rusticata-macros`/`munge`/`rancor` 等）。**没有 HEAD 基线**：本 fork 至今 0 个 tag、没跑过 `release.yml`，所以这是有依赖的绝对值而非增量，判为可接受；要不要进一步按 feature 门控，等 8b/8c 写完再看。
+> 4. **CI job 已落地（`.github/workflows/client-ci.yml`，先提交为 `1f4c198`，随后按审计意见修正）**。只读审计对 `1f4c198` 给出 `P0×2 + P1×1 + P2×3`，其中两个 P0 是「照着规划评审的建议写就会踩」的坑：
+>    - **P0-1**：规划评审建议的 `node-version: 20` 与 pnpm 11 不兼容。pnpm 11 用了 `node:sqlite`，在 Node 20 上连 `pnpm -v` 都崩 → 两个 job 都改 `node-version: 24`（并统一 `pnpm/action-setup@v4`、`version: 11`）。
+>    - **P0-2**：rust job 在干净检出上跑不起来。`tauri-build` 在 Windows 上要读 `icons/icon.ico` 生成资源文件，而 `src-tauri/icons` 不入库 → 必须在 `cargo test` 之前补 `pnpm install` + `pnpm build:icon` 两步。
+>    - **P1-1**：§11 那段「CI job 的形状」必须按实际落地的样子改（已改，见 §11）。
+>    - **P2**：加 `permissions: contents: read`；写明覆盖边界（`cargo test --lib` 不含 bin target、`tsc` 不含 `.vue`）；`paths` 去掉 `vite.config.ts`。
+> 5. **pnpm 11 的 `allowBuilds`（修 P0 时发现的深层问题）**：pnpm 11 默认拒绝执行依赖的 build script，只要有一条被忽略就让 `pnpm install` 以 `ERR_PNPM_IGNORED_BUILDS` 退出 1；更麻烦的是 `pnpm run` 之前那次依赖检查会**再跑一次 install**（`verify-deps-before-run` 默认值 `install`），命令行上的 `--config.strict-dep-builds=false` 传不进那一次（`PNPM_CONFIG_STRICT_DEP_BUILDS=false` 这种带 `PNPM_CONFIG_` 前缀的环境变量能穿进去，但每条命令、每个 CI step 都得带，比 `allowBuilds` 脆得多），于是 `pnpm test`、`pnpm build:icon`、`pnpm exec vitest run` 会跟着一起红。唯一的干净修法是仓库根新增 `pnpm-workspace.yaml` 并声明 `allowBuilds: { '@parcel/watcher': true, esbuild: true, simple-git-hooks: true }`（这正是 pnpm 11 自己写占位内容时用的键；只放占位字符串值不管用）。实测：`pnpm install --frozen-lockfile` → 0；`pnpm test` → 51 tests 通过；`pnpm build:icon` → 0 且生成 `icon.ico`；`tsc --noEmit` → 0。副作用是本地 `simple-git-hooks` 会被真装上，从此本机每次 commit 都走 `npx lint-staged`（= 对 staged 文件跑 `eslint --fix`）+ `commitlint -e`；CI 不受影响（CI 里不会触发 pre-commit）。
+
 ---
 
 # 1. 目标与非目标
@@ -160,20 +176,20 @@
 
 # 2. 三种服务端形态
 
-| 形态 | 部署方式 | 谁维护 | 适用 |
-| --- | --- | --- | --- |
-| Cloudflare 版 | `wrangler` + Durable Object | 用户 A | 免费、零运维、不用域名；额度受限（30 帧/秒、每日请求数） |
-| 自建版 | `docker compose up -d` | 用户 A | 完全自主；可放开到 60 帧/秒；可顺带跑 coturn |
-| 裸机 / NAS | 编译 `server-relay` 直接跑 | 用户 A | 有公网 IP 的机器；**必须有域名 + 受信任证书**，否则客户端连不上 |
+| 形态          | 部署方式                    | 谁维护 | 适用                                                            |
+| ------------- | --------------------------- | ------ | --------------------------------------------------------------- |
+| Cloudflare 版 | `wrangler` + Durable Object | 用户 A | 免费、零运维、不用域名；额度受限（30 帧/秒、每日请求数）        |
+| 自建版        | `docker compose up -d`      | 用户 A | 完全自主；可放开到 60 帧/秒；可顺带跑 coturn                    |
+| 裸机 / NAS    | 编译 `server-relay` 直接跑  | 用户 A | 有公网 IP 的机器；**必须有域名 + 受信任证书**，否则客户端连不上 |
 
 自建版推荐组合：香港轻量云（腾讯云 / 阿里云）→ `1 核 1GB / 2 Mbps`。带宽参考（只算中继形态的转发）：
 
-| 场景 | 建议带宽 |
-| --- | --- |
-| 猫咪状态 + 文字聊天 | 1 Mbps 就够 |
-| 再加语音、偶尔图片 | 2~3 Mbps |
-| 图片/文件传输体验正常 | 5 Mbps |
-| 经常传几十/几百 MB | 10 Mbps+ |
+| 场景                  | 建议带宽    |
+| --------------------- | ----------- |
+| 猫咪状态 + 文字聊天   | 1 Mbps 就够 |
+| 再加语音、偶尔图片    | 2~3 Mbps    |
+| 图片/文件传输体验正常 | 5 Mbps      |
+| 经常传几十/几百 MB    | 10 Mbps+    |
 
 猫咪状态本身约几百字节 × 最高 60 次/秒，两人合计仍可忽略；吃带宽的只有文件。P2P 打通后连这些都不经过服务器。
 
@@ -266,10 +282,10 @@ E: Display
 
 ## 5.2 两条 DataChannel
 
-| 通道 | 选项 | 承载 |
-| --- | --- | --- |
+| 通道        | 选项                                  | 承载                                     |
+| ----------- | ------------------------------------- | ---------------------------------------- |
 | `pet-state` | `ordered = false, maxRetransmits = 0` | pet state、stats（可覆盖流，丢帧不重传） |
-| `reliable` | 有序可靠 | 聊天、暂离、ACK、附件分片 |
+| `reliable`  | 有序可靠                              | 聊天、暂离、ACK、附件分片                |
 
 Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在中继。`reliable` 通道留给后续阶段——附件分片要走它，不能走 `pet-state`（见 R21）。
 
@@ -388,37 +404,44 @@ perf(pair): raise the pet state ceiling and interpolate remotely
 
 # 11. 测试与验证
 
-| 层 | 手段 |
-| --- | --- |
-| 静态 | `cargo check --lib`、`cargo fmt --check`（注意仓库既有差异）、`eslint src`、`tsc --noEmit` |
-| 单元 | `cargo test --lib`（含新增的额度、夹紧、信令编码用例）、`vitest run`（前端 mapper 与插值纯函数） |
-| 中继 e2e | 对 CF 与自建两份中继各跑一次 `cargo test --lib pair::e2e -- --ignored` |
-| 真机 | 双端跑 `pnpm tauri dev`（或安装包），验证 P2P 打通、回落、60Hz 视觉 |
-| 打包 | `pnpm tauri build --debug`；确认体积与编译时间变化 |
+| 层       | 手段                                                                                             |
+| -------- | ------------------------------------------------------------------------------------------------ |
+| 静态     | `cargo check --lib`、`cargo fmt --check`（注意仓库既有差异）、`eslint src`、`tsc --noEmit`       |
+| 单元     | `cargo test --lib`（含新增的额度、夹紧、信令编码用例）、`vitest run`（前端 mapper 与插值纯函数） |
+| 中继 e2e | 对 CF 与自建两份中继各跑一次 `cargo test --lib pair::e2e -- --ignored`                           |
+| 真机     | 双端跑 `pnpm tauri dev`（或安装包），验证 P2P 打通、回落、60Hz 视觉                              |
+| 打包     | `pnpm tauri build --debug`；确认体积与编译时间变化                                               |
 
-新增 CI job（R24）后，静态与单元两层应在 PR 上自动跑。
+新增的 CI job 已在 `.github/workflows/client-ci.yml` 落地（R24-2、R27），单元层与静态层的 `tsc` 现在会在 PR 上自动跑（`cargo fmt --check` 与 `eslint src` 仍不在门禁内）。触发用 `push` + `pull_request` + `workflow_dispatch`，`paths` 过滤 `src/**`、`src-tauri/**`、`scripts/**`、`pnpm-workspace.yaml`、`Cargo.toml`、`Cargo.lock`、`package.json`、`pnpm-lock.yaml`、`tsconfig*.json`、`vitest.config.ts` 和 workflow 自身。**不**过滤 `vite.config.ts` / `uno.config.ts`——这两个 job 都不读它们（`vitest run` 只读 `vitest.config.ts`）。`scripts/**` 与 `pnpm-workspace.yaml` 必须留在列表里：前者是 `pnpm build:icon` 直接执行的东西，后者决定 `pnpm install` 能否成功。
 
-**CI job 的形状（Phase 8 规划评审给的建议，落地时照此写）**：触发用 `pull_request` + `push` + `workflow_dispatch`，`paths` 过滤 `src-tauri/**`、`src/**`、`package.json`、`pnpm-lock.yaml` 和 workflow 自身。
+**实际形状（与规划评审的建议有两处必改，见 R27）**：
 
-- `jobs.rust` 走 **`windows-latest`**：`dtolnay/rust-toolchain@stable` + `swatinem/rust-cache@v2`（`workspaces: .`，`Cargo.lock` 在仓库根）→ `cargo test --lib`。放 Windows 有三条理由：`release.yml` 的 ubuntu 任务必须装 `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libudev-dev patchelf xdg-utils pkg-config libasound2-dev` 才编得过 `cpal` / `rdev` / `gilrs`，Windows 任务一个系统依赖都不装；`#[cfg(windows)]` 的 `p2p` 只在 Windows 编译，放 Linux 等于 8b/8c 的关键代码没有 CI 兜底；真机验证也在 Windows。
-- `jobs.web` 走 `ubuntu-latest`：`pnpm/action-setup@v3` + `setup-node@v4`（node 20、`cache: pnpm`）→ `pnpm install --frozen-lockfile` → `pnpm test`（`vitest run`，`environment: 'node'`，不需要浏览器依赖）→ `node node_modules/typescript/bin/tsc --noEmit`。
+- `jobs.rust` 走 **`windows-latest`**：`checkout@v4` → `pnpm/action-setup@v4`（`version: 11`）→ `setup-node@v4`（`node-version: 24`、`cache: pnpm`）→ `pnpm install --frozen-lockfile` → **`pnpm build:icon`** → `dtolnay/rust-toolchain@stable` → `swatinem/rust-cache@v2`（`workspaces: .`，`Cargo.lock` 在仓库根）→ `cargo test --lib`。放 Windows 有三条理由：`release.yml` 的 ubuntu 任务必须装 `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libudev-dev patchelf xdg-utils pkg-config libasound2-dev` 才编得过 `cpal` / `rdev` / `gilrs`，Windows 任务一个系统依赖都不装；`#[cfg(windows)]` 的 `p2p` 只在 Windows 编译，放 Linux 等于 8b/8c 的关键代码没有 CI 兜底；真机验证也在 Windows。
+- **图标生成是 rust job 的必需前置**：`tauri-build` 在 Windows 上要读 `icons/icon.ico` 生成 Windows 资源文件，而 `src-tauri/icons` **不入库**（`src-tauri/.gitignore` 里就写着 `icons`）。`release.yml` 是靠 `pnpm tauri build` 的 `beforeBuildCommand`（= `pnpm build`，内含 `build:icon`）顺带生成的，这个 job 必须显式补同一步，否则干净检出上 `cargo test` 直接报 `icons/icon.ico not found`。图标由入库的 `src-tauri/assets/logo.png` 生成。
+- `jobs.web` 走 `ubuntu-latest`：`pnpm/action-setup@v4`（`version: 11`）+ `setup-node@v4`（`node-version: 24`、`cache: pnpm`）→ `pnpm install --frozen-lockfile` → `pnpm test`（`vitest run`，`environment: 'node'`，不需要浏览器依赖）→ `node node_modules/typescript/bin/tsc --noEmit`。
+- 两个 job 都加 `permissions: contents: read`。
+- **Node 必须是 24（≥22.13），不能用 20**：pnpm 11 用了 `node:sqlite`，在 Node 20 上连 `pnpm -v` 都崩。
+- **`pnpm-workspace.yaml` 的 `allowBuilds` 是必需的**：pnpm 11 默认拒绝执行依赖的 build script，只要有一条被忽略就让 `pnpm install` 以 `ERR_PNPM_IGNORED_BUILDS` 退出 1；更麻烦的是 `pnpm run` 前的那次依赖检查会**再跑一次 install**（`verify-deps-before-run` 默认值 `install`），命令行上的 `--config.strict-dep-builds=false` 传不进那一次，于是 `pnpm test` / `pnpm build:icon` 会跟着一起红。仓库根因此新增 `pnpm-workspace.yaml`，显式放开 `@parcel/watcher`、`esbuild`、`simple-git-hooks` 三个（都不影响构建产物）。副作用：本机 `simple-git-hooks` 会被真装上（AGENTS.md 已如实记录）。
 - CI 上**不要**加 `--store-dir .pnpm-store`（那是本机 store 的特例，见 AGENTS.md），也**不要**加 `cargo fmt --check`（仓库既有 diff 会让它一直红）。
 - 成本：Windows runner 上 `cargo test --lib` 要冷编译整个 tauri lib，务必配 rust-cache，不要做 matrix。
+- **覆盖边界**（P2，别当成全量门禁）：`cargo test --lib` 只覆盖 lib target，不含 bin target 与 `--all-targets`；`tsc --noEmit` 只覆盖 `.ts`（仓库没装 `vue-tsc`，`.vue` 里的类型问题仍靠 review 与实跑）。`vite build` 与 `eslint` 不在这个门禁内。
+
+**R24-6 的测量结果（依赖落地那一刻量的，见 R27-3）**：`cargo build --release` 总墙钟 **5 分 23 秒**（323.4 s），`target/release/bongo-cat.exe` = **12,761,088 字节（约 12.2 MiB）**，`Cargo.lock` 净新增 **41 个 crate**。仓库**没有 HEAD 基线**（至今 0 个 tag、没跑过 `release.yml`），所以这组数字是「有依赖的绝对值」而不是增量；要不要进一步按 feature 门控，等 8b/8c 真写完之后再看。
 
 ---
 
 # 12. 风险与未决
 
-| 风险 | 影响 | 缓解 |
-| --- | --- | --- |
-| `webrtc-rs` 在 3 个 Windows release 目标上编译失败 | Phase 8 无法交付 | 编译 spike 已过（R24-1）；4 个非 Windows 目标已用 `cfg` 门控排除 |
-| Windows 定时器精度 15.6ms 影响 60Hz | 发不出真正 60Hz | 事件驱动而非固定 16ms 定时器 |
-| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB） | 附件分片在 P2P 上失败 | 48 KiB 保守默认 + 真机大文件验证 |
-| `panic = "abort"` 下 webrtc 内部 panic 会带走整个 App | 一条 P2P 连接的问题升级成整个应用崩溃 | `p2p.rs` 里对 webrtc 的 `Result` 一律不许 `unwrap` / `expect`，DC / ICE 失败只走回落 |
-| 自签 / 裸 IP 无法连自建中继 | 部署文档承诺的「compose up 就能用」落空 | 文档强制域名 + Caddy；可选自签开关 |
-| UDP 被封 / 跨境抖动 | P2P 打洞失败率高 | TURN 备 TCP/443；打不通就走中继 |
-| STUN 暴露公网 IP 与 README 隐私承诺 | 隐私承诺被质疑 | 默认不填公共 STUN，设置页写明 |
-| `webrtc` 拉长编译与体积 | 发布耗时、安装包变大 | 依赖落地那一刻量一次（R24-6），必要时按 feature 门控 |
+| 风险                                                  | 影响                                    | 缓解                                                                                 |
+| ----------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------ |
+| `webrtc-rs` 在 3 个 Windows release 目标上编译失败    | Phase 8 无法交付                        | 编译 spike 已过（R24-1）；4 个非 Windows 目标已用 `cfg` 门控排除                     |
+| Windows 定时器精度 15.6ms 影响 60Hz                   | 发不出真正 60Hz                         | 事件驱动而非固定 16ms 定时器                                                         |
+| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB）        | 附件分片在 P2P 上失败                   | 48 KiB 保守默认 + 真机大文件验证                                                     |
+| `panic = "abort"` 下 webrtc 内部 panic 会带走整个 App | 一条 P2P 连接的问题升级成整个应用崩溃   | `p2p.rs` 里对 webrtc 的 `Result` 一律不许 `unwrap` / `expect`，DC / ICE 失败只走回落 |
+| 自签 / 裸 IP 无法连自建中继                           | 部署文档承诺的「compose up 就能用」落空 | 文档强制域名 + Caddy；可选自签开关                                                   |
+| UDP 被封 / 跨境抖动                                   | P2P 打洞失败率高                        | TURN 备 TCP/443；打不通就走中继                                                      |
+| STUN 暴露公网 IP 与 README 隐私承诺                   | 隐私承诺被质疑                          | 默认不填公共 STUN，设置页写明                                                        |
+| `webrtc` 拉长编译与体积                               | 发布耗时、安装包变大                    | 依赖落地那一刻量一次（R24-6），必要时按 feature 门控                                 |
 
 未决：自建中继是否默认广告 60 帧/秒（还是留给环境变量）。
 
