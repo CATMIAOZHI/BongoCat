@@ -30,15 +30,25 @@
 >
 > 客户端 Pacer 用广告值推导，**但不是 1:1 取用**：保持今天这组四元组不变（帧 20 速率 / 20 突发、分片 15 速率 / 10 突发，相对 CF 的 30 / 20 分别留 2/3、3/4、1/2 的余量），自建中继把额度调高时按同一比例放大；字段缺失时退回 30/20/12 MiB 的 CF 缺省值。`manager.rs:60-71` 的注释和 `manager.rs:3227-3232` 的测试都在守「严格小于中继上限」，1:1 取用会立刻复现 `close 1008`。这样自建中继可以放开到 60 帧/秒，而 CF 版拿到的缺省推导值与今天完全一致。`manager.rs` 的 `outbound_pacing_stays_within_the_relay_budget` 测试改为断言「缺省值仍在中继缺省额度内」，继续当护栏。
 >
+> **措辞订正（Phase 8 规划评审）**：上面那句「`outbound_pacing_stays_within_the_relay_budget` 测试改为断言『缺省值仍在中继缺省额度内』」与实现不符——那条测试**没有改**，它仍然硬编码中继的 30/20 当护栏；真正新增、守「缺省 = CF 推导」的是另一条 `the_default_pacing_is_the_cloudflare_derivation`。两条各守一件事，不是 bug。
+>
 > 部署产物：`Dockerfile` + `docker-compose.yml`（relay + Caddy 自动 TLS）+ 部署文档。文档必须写清：香港节点可避开大陆 ICP 备案（大陆节点依法需备案）；1 核 1GB / 2 Mbps 够用、5 Mbps 舒服；**客户端用 `rustls-tls-webpki-roots`，必须是域名 + 受信任证书，裸 IP 或自签证书连不上**。Cloudflare 版保留为「免费方案」。
 
 > **R21（P2P：信令钉在中继上，心跳改用应用级 Ping，能力门控对象是对端）**
 >
+> 本节的行号以 `2629fe2`（本计划定稿那版）为准。此后 `manager.rs` 又改过两次（`f99a862` 的额度参数化、Phase 8a 的 `live` 泛型化），行号已经整体漂移，**读代码时以函数名 / 注释定位**，不要按行号找。
+>
 > WebSocket 中继兼任信令通道，服务器只交换 SDP / ICE candidate。
 >
-> **评审修正 1（不新增帧 kind）**：中继会校验帧 kind，未知值直接 `close 1008`（`server-cloudflare/src/pair.ts:155-161`）。所以信令**复用 `FrameKind::Ping`(8)** 承载一个新的应用类型 `pair.signal`（kind 8 早就在中继的已知集合里，旧中继不会踢）。已部署的旧客户端收到未知应用类型只会走 `_` 分支忽略（`manager.rs:2509-2516`），不会崩。
+> **评审修正 1（不新增帧 kind）**：中继会校验帧 kind，未知值直接 `close 1008`（`server-cloudflare/src/pair.ts:155-161`）。所以信令**复用 `FrameKind::Ping`(8)** 承载一个新的应用类型 `pair.signal`（kind 8 早就在中继的已知集合里，旧中继不会踢）。已部署的旧客户端收到未知应用类型**不会崩**——它落进 `_` 分支（`manager.rs:2509-2516`）；「忽略」这个词不准确，真实行为见 R26 第 5 条。
 >
 > **评审修正 2（心跳，连发送点一起改）**：DataChannel 上**不能用** `Message::Ping`——现有判定是 `awaiting_pong && last_inbound.elapsed() >= 2×心跳`（`manager.rs:1439-1445`），而 `awaiting_pong` 只在有入站消息时清除（`1385`）。只把适配器的 Ping/Pong 写成空操作、ticker 照旧发 `Message::Ping`（`1449`）是不行的：心跳根本没发出去，`awaiting_pong` 永远不为假，对端安静两分钟就命中超时判定，`run_session` 会重连整条会话并 `abort_transfers`（在传的附件被砍）。所以**发送点必须一起改**：`1449` 的 ticker 改成入队一条应用级 `pair.ping` 帧（中继也照样转发，两端通用），WS 层 Ping/Pong 在适配器里当空操作只作兜底。响应侧有现成实现：`protocol.rs:32` 的 `FrameKind::Ping`，收到就回 pong 在 `manager.rs:2249-2256`。立即失败条件 = 适配器流报错/结束、DC 或 ICE 进入 failed/closed、`send` 失败；心跳只做兜底。
+>
+> **心跳归属（Phase 8 规划评审的定论，二选一已选）**：**心跳跟着当前生效的传输走**，即采纳上面的「修正 2」，**不**采用「按 kind 把心跳钉在中继」的另一种读法——后者要求 `live` 同时握住两个 sink，和 §4.1 的单泛型传输形状直接冲突。三条实现约束必须一起落：
+>
+> - ticker 分支要自己 `pacer.acquire().await` 再发。现在的不变量是「所有**应用帧**都必须先过 `Pacer::acquire`，不走 pacer 的只有 WS 控制帧：心跳 `Message::Ping` 与断开时的 `Message::Close`」（`send_frame` 上方那段注释）；心跳换成应用帧后它变成又一条应用帧，那段注释必须同步改，否则下次读代码的人会以为心跳可以绕过 pacer。
+> - **不要把心跳塞进 `state.reliable`**：那条队列上限 512，队满时会挤掉最旧的聊天消息并把它退回 `pending`（`retry_dropped_chat`），等于每 60 秒一次系统性扰动。心跳直接 pacer + `send_frame` 就够。
+> - `awaiting_pong` / `last_inbound` 的清除条件要覆盖**所有**入站源。Phase 8c 起入站有两处（中继流、DC 分支），只清一处会假超时或永不超时。
 >
 > **评审修正 3（切换必须在 `live` 内部完成）**：`run_session` 把 `live` 的**任何**退出都当成断线并 `abort_transfers`（`manager.rs:1116-1128`），所以不能靠「退出重进 `live`」来换传输，否则每次切换都会砍掉正在跑的附件传输。
 >
@@ -48,7 +58,7 @@
 >
 > 回落策略：中继**一直保持**（它本身就是信令通道 + 离线检测，成本只是一枚 60 秒心跳），不做「失败再回落」。并行推进：一连上中继就是可用状态、状态立刻从中继发；ICE 在后台同时跑；只有 DC `open` 且应用级 ping/pong 往返成功，才把**可覆盖流**切过去。ICE 那 10~30 秒对用户不可见。切换按消息边界进行，**绝不在传输中途切**（V1 没有断点续传，接收侧要求分片序号严格递增，`transfer.rs:306-317`）；DC 中途掉线立刻回中继，当前附件按 §43 判失败。
 >
-> 第一阶段（Phase 8）**只让 DC 承载可覆盖流（pet state / stats）**，附件分片、聊天、控制、信令、心跳、重连全部留在中继。**附件分片绝不能走 `pet-state` 通道**（它是 `ordered=false, maxRetransmits=0`，而接收侧要求分片序号严格递增、V1 没有断点续传，丢一片或乱一片整单就废）；将来要让传输走 P2P，只能走 `reliable` 通道。这样范围比「全量替换」小得多，也天然绕开上面那个心跳陷阱。
+> 第一阶段（Phase 8）**只让 DC 承载可覆盖流（pet state / stats）**，附件分片、聊天、控制、信令、重连留在中继；**心跳是唯一的例外——它跟当前生效的传输走**（见上面的「心跳归属」）。**附件分片绝不能走 `pet-state` 通道**（它是 `ordered=false, maxRetransmits=0`，而接收侧要求分片序号严格递增、V1 没有断点续传，丢一片或乱一片整单就废）；将来要让传输走 P2P，只能走 `reliable` 通道。这样范围比「全量替换」小得多。
 >
 > STUN/TURN 来源 = `server.welcome` 广告 + 设置项覆盖。固定双人用**静态凭据**可接受（coturn `lt-cred-mech`，一对用户名密码只经已鉴权的 welcome 下发）；更严就用 `use-auth-secret`（username = 过期时间戳，password = `base64(hmac-sha1(secret, username))`）。TURN 建议同时开 UDP 与 TCP/443（部分运营商/企业网封 UDP）；coturn 的 TLS 证书要单独配，Caddy 只管 HTTP。
 >
@@ -66,7 +76,9 @@
 >
 > 夹紧规则：上界 ≤ 512 KiB **且** ≤ `MAX_BINARY_FRAME_SIZE - 14 - 24 - 16`；**加下界**（如 ≥ 4 KiB），否则对端把 `chunk_size` 报成 1 就能逼你在本地写十亿次小文件。`chunk_size` 在 AEAD 覆盖范围内、只有配对端能改，所以这是防呆，不是外部攻击面。
 >
-> P2P 下用更小值（48 KiB 保守默认，因为 SCTP 默认消息上限 64 KiB，RFC 8841）；中继下保持 512 KiB。
+> P2P 下用更小值（48 KiB 保守默认）；中继下保持 512 KiB。
+>
+> **理由订正（Phase 8 规划评审）**：原先写的「SCTP 默认消息上限 64 KiB，RFC 8841」在本实现里不成立，48 KiB 这个**结论**保留、**理由**换掉。真实情况：`webrtc` 0.21 的 SCTP 上限是 `MAX_MESSAGE_SIZE = 262144`（256 KiB，`rtc-0.21.0/src/peer_connection/configuration/setting_engine.rs`），只有超过它才报 `ErrOutboundPacketTooLarge`（`rtc-sctp-0.21.0/src/association/stream.rs`），**256 KiB 以内由实现自己分片**；`DataChannelEvent::OnMessage` 文档里那句「最多 16384 字节」在整个 crate 里只出现一次、是抄自 W3C 的旧文案，没有任何代码常量或校验支撑，它提到的 "detach API" 在 0.21 里也不存在。所以不必把 P2P 分片降到 12 KiB。夹紧上界（≤ `MAX_BINARY_FRAME_SIZE - 14 - 24 - 16`）继续保留——DC 路径的帧同样要过 `SessionState::encode` 的 1 MiB 检查。
 >
 > **连带修正**：Pacer 也是按**块/秒**算的（`manager.rs:70-71`，15 块/秒），48 KiB × 15 ≈ 720 KiB/s，比现在慢一个数量级。所以分片额度要么改成按字节，要么和传输层一起参数化。
 
@@ -86,12 +98,21 @@
 
 > **R24（工程前置：CI、编译 spike、证书）—— 评审提出的漏项，按风险排序**
 >
-> 1. `webrtc` crate（0.21，默认 `runtime-tokio` + `crypto-ring`）必须在 `.github/workflows/release.yml` 的**全部 7 个目标**上编译通过（含 `i686-pc-windows-msvc` 与 `aarch64-unknown-linux-gnu`）。**先做一个只验证编译的 spike**，这是最大的进度风险。
+> 1. `webrtc` crate（0.21）必须在 `.github/workflows/release.yml` 的 **3 个 Windows 目标**上编译通过：`x86_64-pc-windows-msvc`、`i686-pc-windows-msvc`、`aarch64-pc-windows-msvc`。**先做一个只验证编译的 spike**，这是最大的进度风险。
+>
+>    **订正（Phase 8 规划评审）**：原文写的是「全部 7 个目标」。范围本来就是「客户端只做 Windows」，所以依赖用 `[target.'cfg(windows)'.dependencies]` 门控、`p2p` 模块用 `#[cfg(windows)]` 门控，另外 4 个非 Windows 目标（`macos-latest` × 2、`ubuntu-22.04`、`ubuntu-22.04-arm`）**完全不编译 `webrtc`**，风险面从 7 个降到 3 个。形状定死：
+>
+>    - 依赖写 `webrtc = { version = "0.21", default-features = false, features = ["runtime-tokio", "crypto-ring"] }`（0.21 的默认就是这两个，显式写出来是为了抗上游改默认），放在根 `Cargo.toml` 的 `[workspace.dependencies]`，`src-tauri` 用 `webrtc.workspace = true`；
+>    - 门控挂在 `src-tauri/src/core/pair/mod.rs` 的 `#[cfg(windows)] pub mod p2p;` 那一行，不要在 `p2p.rs` 里再写一次 `#![cfg(windows)]`；
+>    - 调用点**不要**在 `manager.rs` 里散着写 `#[cfg(windows)]`。新开 `pair/link.rs` 做一层 cfg 中立的 seam：`#[cfg(windows)]` 一份真实现、`#[cfg(not(windows))]` 一份空实现。这样非 Windows 目标上 `live` 的调用点仍然会被编译，签名漂移能被 CI 抓到；
+>    - 不要改用 cargo feature 代替 `cfg`：feature 是全局加法式的，而 `release.yml` 的 `args` 是各目标共用的，改成按目标传参容易漏，`cfg(windows)` 漏不了。
+>
+>    **spike 结果（已跑完）**：`x86_64-pc-windows-msvc` 编译 + 实跑双 peer 互连通过；`i686-pc-windows-msvc` `cargo check` 通过；`aarch64-pc-windows-msvc` 本机因缺 `clang` 无法自证，但唯一需要 C 工具链的 `ring 0.17.14` **本来就在依赖树里**（`rustls` ← `reqwest`/`hyper-rustls` ← `tauri-plugin-updater`，以及 `tokio-tungstenite`），上游 `ayangweb/BongoCat` 的 release 在 `windows-latest` 上跑 aarch64-windows 是 success，所以没有引入新的构建工具要求。**注意**：本 fork 至今没跑过 `release.yml`（0 个 tag），想要本仓库的真实记录，`workflow_dispatch` 手动跑一次最便宜（会产出 Draft Release）。另：spike 的 ICE 证据只覆盖 loopback（绑定的是 `127.0.0.1:0`），**生产绝不能绑回环**——要么不设 `with_udp_addrs` 走缺省、要么绑通配地址，否则收不到真实 host 候选。
 > 2. 仓库**没有 PR / 提交级别的编译或测试门禁**（`.github/workflows` 只有 `release.yml` / `sync-to-gitee.yml` / `upgradelink.yml`；`release.yml` 只在打 `v*` tag 时 `pnpm tauri build`，会编译但不跑测试）。Phase 8 是大重构，没有 CI 兜底很难受——先补一个跑 `cargo test --lib` + `pnpm test` + `tsc --noEmit` 的 job。（`server-relay/` 那一份已在 R25-7 落地，客户端侧仍留到 Phase 8。）
 > 3. 自建中继必须有受信任证书（客户端用 `rustls-tls-webpki-roots`）：文档强制要求域名；「允许自签 / 自定义 CA」作为可选设置项，默认不做。
 > 4. R10 的 secret 纪律要覆盖自建流程：compose 用 env 文件或 stdin 喂，**不要**写 `-e PAIR_AUTH_TOKEN=xxx`；需要一个与 `server-cloudflare/scripts/generate-pair.mjs` HKDF 等价的本地生成器（自建侧用户不装 Node）。
 > 5. 香港节点避备案是对的，但 UDP 可能被封、跨境链路抖动大——这恰恰是 P2P 收益最大的场景，TURN 要备 TCP/443。
-> 6. `webrtc` 会明显拉长编译时间与产物体积（7 个目标）——Phase 8 开始前先量一次。
+> 6. `webrtc` 会明显拉长编译时间与产物体积（3 个 Windows 目标）——**依赖落地那一刻量**：8b 的第一个提交只加依赖 + 空 `p2p.rs` + cfg 门控，先量再决定要不要进一步按 feature 门控。量法（Windows 本机、同 profile 同 target）：编译时间用 `cargo build --release --target x86_64-pc-windows-msvc --timings`（基线用当前 HEAD 量一次，重点看总墙钟和 `rtc-*` / `ring` / `rkyv` / `rcgen` 的占比）；体积看 `target/release/bongo-cat.exe` 与 `pnpm tauri build` 出来的 `bundle/nsis/*.exe`。规模参考（评审已量）：净新增 41 个 crate 名（`rtc-*` 家族 15 个，加 `rcgen`/`x509-parser`/`der-parser`/`asn1-rs`/`pem`/`yasna`、`rkyv`/`bytecheck`/`ptr_meta`/`rend`/`rancor`/`munge`、`quinn-udp`/`crc32c`/`crc`/`event-listener`/`sansio`/`unicase`/`ccm`/`ctr`/`md-5` 等），`bytes` 会被顶到 1.12.x。注意根 `Cargo.toml` 的 `[profile.release]` 是 `panic=abort` + `lto=true` + `codegen-units=1`，链接阶段超线性，成本主要体现在 fat LTO，别只看 `cargo check` 的时间。
 
 > **R25（Phase 7 实现评审的收口）—— 只读审计提出的 1 个 P1 与 14 个 P2，实现阶段已逐条处理**
 >
@@ -103,6 +124,18 @@
 > 6. **握手也要校验与超时**：读请求头有 10 秒超时；`Sec-WebSocket-Version` 必须是 13（否则 426 + `Sec-WebSocket-Version: 13` 头），`Sec-WebSocket-Key` 必须是 16 字节的 base64（否则 400）。解析错误串里不再回显请求头原文——漏了冒号的 `Authorization` 不会把凭据带进日志。
 > 7. **CI**：新增 `.github/workflows/pair-relay.yml`，对 `server-relay/` 跑 `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test`。
 > 8. **顶替时的离线通知对齐 CF**：`4002`（同一 deviceId 重连）**不发**离线通知（CF 的 `announceOffline` 按 deviceId 过滤掉了）；`4004`（陈旧顶替）**要发**——CF 靠被顶替连接的 close 事件补，自建版显式补，并放在新连接上线之前，存活方的帧序列是「旧的离线 → 新的上线」，终态是在线。两处有意的差别（README 已写明）：CF 那条离线帧是在新连接被接受之后才发的，所以**新连接自己**也会收到、反而显示「对方离线」；自建版只发给多出来的那一方。另外 `admit` 的 `peerOnline` 仍沿用「动手之前算好的 remaining」（与 CF 一致）：如果存活方恰好在那一刻停摆，它会在广播里被摘掉，于是新连接的 welcome 会说 `peerOnline: true` 而注册表里其实只剩它自己——窗口很窄（要求存活方队列满），且对方重连时会再发一次上线通知，自愈，所以按评审建议保留现状。`bytesPerSecond` 是广告但不被客户端消费（README 已写明）。
+
+---
+
+> **R26（Phase 8 规划评审的收口）—— 只读评审 subagent 的结论是 `CHANGES REQUIRED`，5 处必改已全部并入上面各条**
+>
+> 评审确认「按原样做」的结论，记在这里备查：
+>
+> 1. **`webrtc` 依赖门控**：`[target.'cfg(windows)'.dependencies]` + `#[cfg(windows)]`，非 Windows 的 4 个目标完全不编译 `webrtc`；形状细节见 R24-1。
+> 2. **Phase 8a 的形状**：`live` 的泛型化只需改签名与 `transport.split()` 一行，四个辅助函数（`flush` / `enqueue_reply` / `send_next_chunk` / `send_frame`）与 `read_welcome` 的约束天然兼容，`SessionState` 不碰 socket，调用点只有 `run_session` 一处。**不需要 WS 适配器**（见 §4.1 的订正）。
+> 3. **`pair.signal` 走 `FrameKind::Ping`(8) 的尺寸安全**：中继侧 `is_known_frame_kind` 是 `(1..=8)`、没有按 kind 的尺寸限制，唯一上限是 1 MiB（`MAX_BINARY_FRAME_SIZE`）；CF 侧同理（`pair.ts:157` 判定、`143` 上限，R21 修正 1 引的 `155-161` 准确）；客户端入站只在 Binary 分支查 1 MiB。固定开销 = 14 帧头 + 24 nonce + 16 tag，信封 JSON 约 95 字节；700 字节的 SDP 整帧约 850 字节，非 trickle 把 6 个候选全塞进 SDP 也就约 1.5 KiB，相对 1 MiB 有约 700 倍余量。kind 8 同时承载信令与应用级心跳，靠信封里的 `message_type` 区分，互不冲突；分片桶只对 kind 6 计数，所以 kind 8 **不占分片桶**（帧桶与字节桶照常计，信令只有个位数帧，可忽略）。
+> 4. **依赖兼容性（逐条核过）**：`tokio` 要求 `^1.52.3`、仓库锁 1.53.1 ✓；`rustls` 要求 `^0.23.27`、仓库锁 0.23.38 ✓ 且与 `tokio-tungstenite 0.30` 共用一份；`tokio-tungstenite` 在 `rtc` 里只是 dev-dependency 0.28，**不进生产依赖图**；`ring` 要求 0.17.14、仓库锁正好 0.17.14 → 不新增版本、不新增构建工具要求。`async-trait` 是**新的直接依赖**（`PeerConnectionEventHandler` 的 impl 必须挂 `#[async_trait::async_trait]`），但 0.1.89 已在 lock 里当传递依赖，加它不会动 lock。其余新增全是纯 Rust，没有 openssl / native-tls。
+> 5. **老客户端收到 `pair.signal` 的真实行为**：不是「忽略」，而是落进 `_` 分支 `emit(EVENT_MESSAGE)`，把整个信封（含 SDP）广播给所有 WebView；因为 `pair-message` 这个事件常量没有任何前端订阅者，实际是 no-op。结论不变（老客户端不会崩），但能力门控仍然必须做——否则对面是旧客户端时我们会白等一轮 ICE 超时。
 
 ---
 
@@ -206,13 +239,21 @@ T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin,
 E: Display
 ```
 
-函数体只改 `transport.split()` 一行；让 DataChannel 适配器**直接收发 `tokio_tungstenite::Message`**（所有应用数据都走 `Binary`）。四个辅助函数一个字都不用动，也不需要引入内部 enum。
+函数体只改 `transport.split()` 一行。四个辅助函数一个字都不用动，也不需要引入内部 enum。
 
-WS 专有帧的处理点：`1256`（主动 `Close`）、`1431-1435`（入站 Close → `describe_close`）、`1436`（`Ok(_)` 已兜住 Pong/Frame）、`1449`（心跳 Ping，见 R21）。适配器里 Ping/Pong 空操作、Close → `dc.close()`、DC 关闭 → 回 `Ok(Message::Close(None))` 或结束流。
+**订正（Phase 8 规划评审）**：原文要求「再写一个把 WebSocket 当传输的适配器」，这是多余的——`WebSocketStream<MaybeTlsStream<TcpStream>>` 本来就同时实现了 `Sink<Message, Error = WsError>` 与 `Stream<Item = Result<Message, WsError>>`，两个 bound 是同一个 Error，中继这条路直接把 `PairSocket` 传进来即可，`manager.rs` 因此不再需要认识 `PairSocket` 这个类型。真正需要适配器的只有 DataChannel 那一侧（Phase 8b/8c），它按同一组约束接进来、直接收发 `tokio_tungstenite::Message`（所有应用数据都走 `Binary`）。
+
+传输专有的帧处理点（以函数名定位；行号会漂，见 R21 开头的说明）：主动 `Close`（`Disconnect` 分支）、入站 `Message::Close` → `describe_close`、`Ok(_)` 兜住 Pong/Frame、ticker 的 `Message::Ping`（见 R21「心跳归属」）。DataChannel 适配器里 Ping/Pong 当空操作、`Close` → `dc.close()`、DC 关闭 → 回 `Ok(Message::Close(None))` 或结束流。
 
 ## 4.2 传输切换
 
 按 R21：`live` 常读中继流，出站 sink 指向当前生效传输；信令钉在中继；切换按消息边界；DC 掉线立刻回中继。日志与错误文案改中性。
+
+**入站分支（Phase 8 规划评审补的缺口）**：上面只说清了**出站**，入站同样是必须的。DC 上来的 `pet-state` 得有人读，所以 `live` 的 `select!` 要加一条 DC 入站分支，把字节喂给现成的 `handle_binary`（它只吃 `&[u8]` + `&mut SessionState`，天然与传输无关），并同时更新 `last_inbound` / `awaiting_pong`（见 R21「心跳归属」第三条）。三条硬约束：
+
+- **DC 断开绝不能变成 `live` 的返回值**：一旦返回 `Outcome::Lost`，`run_session` 就会 `abort_transfers` + 整条会话重连。DC 掉线只允许「把 active 切回中继」。
+- DC 的入站读循环若放在单独任务里，帧要经一条 channel 送回 `live`，不能就地处理——`SessionState` 只有一个所有者。
+- 「传输在途时延后切换」对可覆盖流天然成立（快照是绝对值、latest wins），但对将来走 `reliable` 的附件分片是硬要求（接收侧要求分片序号严格递增、V1 无断点续传）。
 
 ---
 
@@ -279,8 +320,8 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 
 ## Phase 8a：传输层抽象重构（零行为变化）
 
-- 交付：`live` 泛型化 + 一个「把 WebSocket 当传输」的适配器；
-- 验证：现有 `cargo test --lib`（97 passed）全绿；真中继 e2e 5 条全绿。这一步单独可审、单独可提交。
+- 交付：`live` 泛型化（`T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin`，`E: Display`）。**没有适配器**——`PairSocket` 自己就满足这组约束（订正理由见 §4.1）。另加一条用例，把 `live` 跑在一条**不是 WebSocket** 的传输替身上，锁住「`manager.rs` 不再认识 WS 类型」这个不变量；
+- 验证：改动前基线 `cargo test --lib` = 103 passed / 6 ignored（原文的「97 passed」是旧数，`f99a862` 那版在 `manager.rs` 加过用例）；改动后全绿（8a 落地时 104 passed / 6 ignored，含新增那条）；真中继 e2e 5 条全绿。这一步单独可审、单独可提交。
 
 ## Phase 8b：信令 + ICE + DataChannel
 
@@ -357,21 +398,31 @@ perf(pair): raise the pet state ceiling and interpolate remotely
 
 新增 CI job（R24）后，静态与单元两层应在 PR 上自动跑。
 
+**CI job 的形状（Phase 8 规划评审给的建议，落地时照此写）**：触发用 `pull_request` + `push` + `workflow_dispatch`，`paths` 过滤 `src-tauri/**`、`src/**`、`package.json`、`pnpm-lock.yaml` 和 workflow 自身。
+
+- `jobs.rust` 走 **`windows-latest`**：`dtolnay/rust-toolchain@stable` + `swatinem/rust-cache@v2`（`workspaces: .`，`Cargo.lock` 在仓库根）→ `cargo test --lib`。放 Windows 有三条理由：`release.yml` 的 ubuntu 任务必须装 `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libudev-dev patchelf xdg-utils pkg-config libasound2-dev` 才编得过 `cpal` / `rdev` / `gilrs`，Windows 任务一个系统依赖都不装；`#[cfg(windows)]` 的 `p2p` 只在 Windows 编译，放 Linux 等于 8b/8c 的关键代码没有 CI 兜底；真机验证也在 Windows。
+- `jobs.web` 走 `ubuntu-latest`：`pnpm/action-setup@v3` + `setup-node@v4`（node 20、`cache: pnpm`）→ `pnpm install --frozen-lockfile` → `pnpm test`（`vitest run`，`environment: 'node'`，不需要浏览器依赖）→ `node node_modules/typescript/bin/tsc --noEmit`。
+- CI 上**不要**加 `--store-dir .pnpm-store`（那是本机 store 的特例，见 AGENTS.md），也**不要**加 `cargo fmt --check`（仓库既有 diff 会让它一直红）。
+- 成本：Windows runner 上 `cargo test --lib` 要冷编译整个 tauri lib，务必配 rust-cache，不要做 matrix。
+
 ---
 
 # 12. 风险与未决
 
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
-| `webrtc-rs` 在 7 个 release 目标上编译失败 | Phase 8 无法交付 | 先做编译 spike（R24-1） |
+| `webrtc-rs` 在 3 个 Windows release 目标上编译失败 | Phase 8 无法交付 | 编译 spike 已过（R24-1）；4 个非 Windows 目标已用 `cfg` 门控排除 |
 | Windows 定时器精度 15.6ms 影响 60Hz | 发不出真正 60Hz | 事件驱动而非固定 16ms 定时器 |
-| SCTP 消息上限（默认 64 KiB） | 附件分片在 P2P 上失败 | 48 KiB 保守默认 + 真机大文件验证 |
+| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB） | 附件分片在 P2P 上失败 | 48 KiB 保守默认 + 真机大文件验证 |
+| `panic = "abort"` 下 webrtc 内部 panic 会带走整个 App | 一条 P2P 连接的问题升级成整个应用崩溃 | `p2p.rs` 里对 webrtc 的 `Result` 一律不许 `unwrap` / `expect`，DC / ICE 失败只走回落 |
 | 自签 / 裸 IP 无法连自建中继 | 部署文档承诺的「compose up 就能用」落空 | 文档强制域名 + Caddy；可选自签开关 |
 | UDP 被封 / 跨境抖动 | P2P 打洞失败率高 | TURN 备 TCP/443；打不通就走中继 |
 | STUN 暴露公网 IP 与 README 隐私承诺 | 隐私承诺被质疑 | 默认不填公共 STUN，设置页写明 |
-| `webrtc` 拉长编译与体积 | 发布耗时、安装包变大 | Phase 8 前量一次，必要时按 feature 门控 |
+| `webrtc` 拉长编译与体积 | 发布耗时、安装包变大 | 依赖落地那一刻量一次（R24-6），必要时按 feature 门控 |
 
-未决：`webrtc-rs` 是否暴露 SCTP `max-message-size`（决定 48 KiB 是否可放宽）；自建中继是否默认广告 60 帧/秒（还是留给环境变量）。
+未决：自建中继是否默认广告 60 帧/秒（还是留给环境变量）。
+
+**已定**：`webrtc-rs` 是否暴露 SCTP `max-message-size`——0.21 默认 256 KiB（`MAX_MESSAGE_SIZE`）且超限之前由实现自己分片，48 KiB 不必改（理由见 R22）。
 
 ---
 
