@@ -3,32 +3,42 @@ name: Client CI
 # 客户端（Vue + src-tauri）的编译与测试门禁。仓库此前只有 release.yml，它只在打
 # `v*` tag 时 `pnpm tauri build`，会编译但一条测试都不跑；Phase 8 要动会话主循环和
 # 传输层，没有 PR 级的门禁很难受（R24-2）。server-relay/ 那一份在 pair-relay.yml。
+#
+# paths 里不放 vite.config.ts / uno.config.ts：这两步都不读它们（vitest 只读
+# vitest.config.ts），放进去只会多触发。vite build 与 eslint 不在这个门禁的范围内。
 on:
   push:
     paths:
       - 'src/**'
       - 'src-tauri/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'package.json'
-      - 'pnpm-lock.yaml'
+      # rust job 的 Generate icons 直接执行 scripts/；pnpm-workspace.yaml 决定 Install 能否成功
+      - 'scripts/**'
+      - pnpm-workspace.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - package.json
+      - pnpm-lock.yaml
       - 'tsconfig*.json'
-      - 'vitest.config.ts'
-      - 'vite.config.ts'
-      - '.github/workflows/client-ci.yml'
+      - vitest.config.ts
+      - .github/workflows/client-ci.yml
   pull_request:
     paths:
       - 'src/**'
       - 'src-tauri/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'package.json'
-      - 'pnpm-lock.yaml'
+      - 'scripts/**'
+      - pnpm-workspace.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - package.json
+      - pnpm-lock.yaml
       - 'tsconfig*.json'
-      - 'vitest.config.ts'
-      - 'vite.config.ts'
-      - '.github/workflows/client-ci.yml'
+      - vitest.config.ts
+      - .github/workflows/client-ci.yml
   workflow_dispatch:
+
+# 两个 job 都只读仓库
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -39,6 +49,34 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      # pnpm 11 要求 Node >= 22.13（它用了 node:sqlite，Node 20 上连 `pnpm -v` 都崩）
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # 普通 install 就行：仓库根有 pnpm-workspace.yaml，里面 allowBuilds 把 pnpm 11
+      # 默认拦下的三个 build script 显式放开了，否则 `pnpm install` 会以
+      # ERR_PNPM_IGNORED_BUILDS 退出 1，而 `pnpm run` 前的那次依赖检查会再触发一遍、
+      # 让后面的步骤也一起红（本机复现过）。
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # 生成图标这一步看着多余，其实是必需的：tauri-build 在 Windows 上要拿
+      # `icons/icon.ico` 生成 Windows 资源文件，而 `src-tauri/icons` **不入库**
+      # （`src-tauri/.gitignore` 里就写着 icons），干净检出上直接 `cargo test` 会报
+      # "icons/icon.ico not found"。release.yml 是走 `pnpm tauri build` 的
+      # beforeBuildCommand（= `pnpm build`，其中包含 build:icon）顺带生成的，
+      # 这里必须显式走同一步。图标由 `src-tauri/assets/logo.png` 生成，那张图入库。
+      - name: Generate icons
+        run: pnpm build:icon
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,17 +102,15 @@ jobs:
         with:
           version: 11
 
+      # 同上：pnpm 11 需要 Node >= 22.13
       - name: Setup node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
-      # pnpm 11 默认不跑依赖的 build script，`--frozen-lockfile` 会因为
-      # ERR_PNPM_IGNORED_BUILDS 直接退出 1（本机复现过）。显式关掉那个严格模式：
-      # 被跳过的 esbuild / @parcel/watcher / simple-git-hooks 不影响 vitest 与 tsc。
       - name: Install
-        run: pnpm install --frozen-lockfile --config.strict-dep-builds=false
+        run: pnpm install --frozen-lockfile
 
       - name: Test
         run: pnpm test

@@ -37,9 +37,8 @@
 ### 本机 pnpm 注意事项
 
 - 本机 `node_modules` 是用工作区内的 store 装的，pnpm 命令要带 `--store-dir .pnpm-store`，否则报 `ERR_PNPM_UNEXPECTED_STORE`。
-- pnpm 11 默认不执行依赖的 build script，`pnpm add` 会打印 `ERR_PNPM_IGNORED_BUILDS` 并以退出码 1 结束；这时依赖其实已经装好，用 `pnpm test`、`eslint`、`vite build` 复核即可。
-- 上面那种情况下 pnpm 会在仓库根目录生成带占位文字（`set this to true or false`）的 `pnpm-workspace.yaml`；它只是提示文件，不要提交。
-- `simple-git-hooks` 的 build script 同样被忽略，`.git/hooks` 里没有装钩子；提交前自己跑一遍 `node node_modules/eslint/bin/eslint.js --fix src` 与 `commitlint` 校验。
+- 仓库根的 `pnpm-workspace.yaml` 里声明了 `allowBuilds`（esbuild / @parcel/watcher / simple-git-hooks）。pnpm 11 默认拒绝执行依赖的 build script，而且只要有一条被忽略就让 `pnpm install` 以 `ERR_PNPM_IGNORED_BUILDS` 退出 1；更麻烦的是 `pnpm run` 之前那次依赖检查会**再跑一次 install**，命令行上的 `--config.strict-dep-builds=false` 传不进那一次，于是 `pnpm test`、`pnpm build:icon` 也会跟着失败。所以这个文件是 pnpm 11 要求的正式配置，不是它生成的占位提示文件：不要删，也不要让它退回 `set this to true or false` 的占位内容。
+- 提交前仍然自己跑一遍 `node node_modules/eslint/bin/eslint.js --fix src` 与 `commitlint` 校验（`simple-git-hooks` 的钩子装没装取决于本机跑没跑过 `prepare`，别依赖它）。
 
 ## 提交与发布
 
