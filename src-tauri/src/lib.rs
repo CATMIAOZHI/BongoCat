@@ -45,7 +45,12 @@ pub fn run() {
             core::pair::pair_send_ping,
             core::pair::pair_send_presence,
             core::pair::pair_send_pet_state,
-            core::pair::pair_send_stats
+            core::pair::pair_send_stats,
+            core::pair::pair_send_chat,
+            core::pair::pair_history_list,
+            core::pair::pair_history_stats,
+            core::pair::pair_history_export,
+            core::pair::pair_history_start_new_epoch
         ])
         .plugin(tauri_plugin_admin_status::init())
         .plugin(tauri_plugin_custom_window::init())

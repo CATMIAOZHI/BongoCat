@@ -19,9 +19,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::client::{self, PairFailure, PairSocket};
 use super::crypto::{self, PairCipher};
+use super::history::{
+    ChatMessage, MESSAGE_TEXT_LIMIT, MessageDirection, MessageStatus, NewMessage, PairHistory,
+};
 use super::protocol::{
-    AppEnvelope, FrameHeader, FrameKind, InputStats, MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION,
-    PetSnapshot, PresencePayload, PresenceState, RecentMessageIds, ServerFrame, message_type,
+    AppEnvelope, ChatAckPayload, ChatTextPayload, FrameHeader, FrameKind, InputStats,
+    MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PetSnapshot, PresencePayload, PresenceState,
+    RecentMessageIds, ServerFrame, message_type, now_millis,
 };
 use super::secret;
 
@@ -32,8 +36,19 @@ pub const EVENT_PET_STATE: &str = "pair-pet-state";
 pub const EVENT_STATS: &str = "pair-stats";
 pub const EVENT_MESSAGE: &str = "pair-message";
 pub const EVENT_ERROR: &str = "pair-error";
+/// 收到一条新消息（§47）：聊天窗口据此追加，远端猫据此做 Q 弹/闪光/提示音
+pub const EVENT_MESSAGE_RECEIVED: &str = "pair-message-received";
+/// 已有消息的状态变化（sent / delivered / failed）
+pub const EVENT_MESSAGE_UPDATED: &str = "pair-message-updated";
 
 const RELIABLE_QUEUE_LIMIT: usize = 512;
+/// 一次重连最多补发多少条历史消息，避免对方一上线就被灌满
+const CHAT_RESEND_LIMIT: usize = 100;
+/// 出站节奏（R18）：中继每个 socket 只给 30 帧/秒（桶容量同为 30）。一次性补发几十条
+/// 离线消息会把桶扣穿、被 `close 1008` 断开，而重连后又补发同一批，变成「连上就被踢」的
+/// 空转，ack 也永远收不到。客户端主动按 20 帧/秒放行，给心跳与实时快照留出余量。
+const OUTBOUND_FRAMES_PER_SECOND: f64 = 20.0;
+const OUTBOUND_BURST: f64 = 20.0;
 const RECENT_MESSAGE_LIMIT: usize = 256;
 pub const HEARTBEAT_ENV: &str = "BONGO_PAIR_HEARTBEAT_SECS";
 const DEFAULT_HEARTBEAT_SECS: u64 = 60;
@@ -137,15 +152,18 @@ pub struct PairManager {
     pending: Mutex<PendingReplaceable>,
     generation: AtomicU64,
     envelope_seq: AtomicU64,
+    history: Arc<PairHistory>,
     sink: Arc<dyn PairEventSink>,
 }
 
 impl PairManager {
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn new(device_id: String, sink: Arc<dyn PairEventSink>) -> Self {
+    pub fn new(device_id: String, sink: Arc<dyn PairEventSink>, history: Arc<PairHistory>) -> Self {
         Self {
             status: Mutex::new(PairStatus {
                 state: PairConnectionState::Disconnected,
@@ -161,8 +179,14 @@ impl PairManager {
             pending: Mutex::new(PendingReplaceable::default()),
             generation: AtomicU64::new(0),
             envelope_seq: AtomicU64::new(0),
+            history,
             sink,
         }
+    }
+
+    /// 本地聊天库。历史读取与导出等命令直接用它，不经过连接状态。
+    pub fn history(&self) -> &Arc<PairHistory> {
+        &self.history
     }
 
     pub fn status(&self) -> PairStatus {
@@ -312,6 +336,76 @@ impl PairManager {
             .ok_or_else(|| "当前没有连接".to_string())
     }
 
+    /// 发一条文本消息（§31）。
+    ///
+    /// 先写本地库再上网：连不上或发送失败时留在 `pending`，等对端上线后由
+    /// [`Self::resend_pending_chat`] 重发（§32）。服务器不存，所以离线期间对方收不到。
+    pub fn send_chat(self: &Arc<Self>, text: &str) -> Result<ChatMessage, String> {
+        if text.trim().is_empty() {
+            return Err("消息内容不能为空".to_string());
+        }
+
+        if text.len() > MESSAGE_TEXT_LIMIT {
+            return Err(format!("单条消息最多 {} KiB", MESSAGE_TEXT_LIMIT / 1024));
+        }
+
+        let epoch = self.history.epoch()?;
+        let message = self.history.insert(&NewMessage::outgoing_text(
+            uuid::Uuid::new_v4().to_string(),
+            text.to_string(),
+            now_millis(),
+            epoch,
+        ))?;
+
+        self.deliver_chat(&message);
+
+        // 回读一次：发出去之后状态可能已经变成 sent
+        Ok(self.history.find(&message.id)?.unwrap_or(message))
+    }
+
+    /// 尽力发一条已经入库的消息；发不出去就保持原状态，交给下次重连
+    fn deliver_chat(self: &Arc<Self>, message: &ChatMessage) {
+        let Some(text) = message.text.clone() else {
+            return;
+        };
+
+        let payload = json!({ "messageId": message.id, "text": text });
+
+        if self
+            .enqueue(FrameKind::Chat, message_type::CHAT_TEXT, payload)
+            .is_err()
+        {
+            return;
+        }
+
+        self.publish_message_status(&message.id, MessageStatus::Sent);
+    }
+
+    /// 状态真的变了才广播，避免重复事件把 UI 刷成重渲染
+    fn publish_message_status(&self, id: &str, status: MessageStatus) {
+        let Ok(Some(updated)) = self.history.set_status(id, status) else {
+            return;
+        };
+
+        self.sink.emit(
+            EVENT_MESSAGE_UPDATED,
+            serde_json::to_value(updated).unwrap_or(Value::Null),
+        );
+    }
+
+    /// 对端上线后补发还没送达的消息（§32）
+    fn resend_pending_chat(self: &Arc<Self>) {
+        let Ok(pending) = self.history.pending(CHAT_RESEND_LIMIT) else {
+            tauri_plugin_log::log::warn!("读取待发送消息失败，本次不补发");
+
+            return;
+        };
+
+        for message in pending {
+            self.deliver_chat(&message);
+        }
+    }
+
     /// 取走所有待发送的可覆盖状态（每次 flush 只取一次，取走后由连接任务负责送达）
     fn take_pending_replaceable(&self) -> Vec<(FrameKind, AppEnvelope)> {
         let mut pending = Self::lock(&self.pending);
@@ -321,12 +415,7 @@ impl PairManager {
         pending.entries.drain().map(|(_, item)| item).collect()
     }
 
-    fn enqueue(
-        &self,
-        kind: FrameKind,
-        message_type: &str,
-        payload: Value,
-    ) -> Result<(), String> {
+    fn enqueue(&self, kind: FrameKind, message_type: &str, payload: Value) -> Result<(), String> {
         let sender = self.sender()?;
 
         let envelope = AppEnvelope::new(message_type, self.next_envelope_seq(), payload);
@@ -446,7 +535,8 @@ pub fn is_valid_device_id(device_id: &str) -> bool {
 
 struct SessionState {
     cipher: PairCipher,
-    reliable: VecDeque<Vec<u8>>,
+    /// 可靠队列：帧与它对应的信封一起存，队列满时才知道挤掉的是哪条消息
+    reliable: VecDeque<(Vec<u8>, AppEnvelope)>,
     /// 每种可覆盖类型各自最多留一帧（`BTreeMap` 同时保证发送顺序稳定）
     replaceable: BTreeMap<u8, Vec<u8>>,
     frame_seq: u32,
@@ -481,33 +571,74 @@ impl SessionState {
         Ok(frame)
     }
 
-    /// 返回 `true` 表示可靠队列已满、挤掉了最旧的一帧（调用方需要告知用户）
+    /// 返回被挤掉的那一帧的信封（`None` 表示没有丢弃）。调用方要把它对应的消息退回
+    /// 可重试状态：只报一句「队列已满」而让消息停在「已发送」，等于骗用户。
     fn queue(
         &mut self,
         kind: FrameKind,
         envelope: &AppEnvelope,
         replaceable: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<AppEnvelope>, String> {
         let frame = self.encode(kind, envelope)?;
 
         if replaceable {
             // 实时状态 latest wins：每类只留最新一帧，绝不无限堆积
             self.replaceable.insert(kind.as_byte(), frame);
 
-            return Ok(false);
+            return Ok(None);
         }
 
         let dropped = if self.reliable.len() >= RELIABLE_QUEUE_LIMIT {
-            self.reliable.pop_front();
-
-            true
+            // 队头是最旧的一帧，连它的信封一起拿出来，才能找回对应的消息
+            self.reliable.pop_front().map(|(_, dropped)| dropped)
         } else {
-            false
+            None
         };
 
-        self.reliable.push_back(frame);
+        self.reliable.push_back((frame, envelope.clone()));
 
         Ok(dropped)
+    }
+}
+
+/// 出站节奏控制器（R18）。令牌按时间连续补充，容量等于每秒上限。
+struct Pacer {
+    tokens: f64,
+    updated_at: tokio::time::Instant,
+}
+
+impl Pacer {
+    fn new() -> Self {
+        Self {
+            tokens: OUTBOUND_BURST,
+            updated_at: tokio::time::Instant::now(),
+        }
+    }
+
+    /// 按经过的时间补充令牌，但不允许攒成无限突发（纯函数，便于单测）
+    fn refill(tokens: f64, elapsed_secs: f64) -> f64 {
+        (tokens + elapsed_secs.max(0.0) * OUTBOUND_FRAMES_PER_SECOND).min(OUTBOUND_BURST)
+    }
+
+    /// 取一枚令牌；没有就等到下一枚补充出来
+    async fn acquire(&mut self) {
+        loop {
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(self.updated_at).as_secs_f64();
+
+            self.updated_at = now;
+            self.tokens = Self::refill(self.tokens, elapsed);
+
+            if self.tokens >= 1.0 {
+                self.tokens -= 1.0;
+
+                return;
+            }
+
+            let wait = (1.0 - self.tokens) / OUTBOUND_FRAMES_PER_SECOND;
+
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+        }
     }
 }
 
@@ -627,11 +758,14 @@ async fn run_session(
                     None | Some(Command::Disconnect) => return,
                     Some(Command::Send { kind, envelope }) => {
                         match state.queue(kind, &envelope, false) {
-                            Ok(true) => manager.emit_error(
-                                generation,
-                                "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
-                            ),
-                            Ok(false) => {}
+                            Ok(Some(dropped)) => {
+                                manager.emit_error(
+                                    generation,
+                                    "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
+                                );
+                                retry_dropped_chat(&manager, &dropped);
+                            }
+                            Ok(None) => {}
                             Err(error) => manager.emit_error(generation, error),
                         }
                     }
@@ -661,8 +795,9 @@ async fn live(
     receiver: &mut mpsc::UnboundedReceiver<Command>,
 ) -> Outcome {
     let (mut sink, mut stream) = socket.split();
+    let mut pacer = Pacer::new();
 
-    if let Err(error) = flush(&mut sink, state).await {
+    if let Err(error) = flush(&mut sink, state, &mut pacer).await {
         return Outcome::Lost(PairFailure {
             message: error,
             fatal: false,
@@ -689,14 +824,15 @@ async fn live(
                     match state.queue(kind, &envelope, false) {
                         Err(error) => manager.emit_error(generation, error),
                         Ok(dropped) => {
-                            if dropped {
+                            if let Some(dropped) = dropped {
                                 manager.emit_error(
                                     generation,
                                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                 );
+                                retry_dropped_chat(manager, &dropped);
                             }
 
-                            if let Err(error) = flush(&mut sink, state).await {
+                            if let Err(error) = flush(&mut sink, state, &mut pacer).await {
                                 return Outcome::Lost(PairFailure { message: error, fatal: false });
                             }
                         }
@@ -709,7 +845,7 @@ async fn live(
                         }
                     }
 
-                    if let Err(error) = flush(&mut sink, state).await {
+                    if let Err(error) = flush(&mut sink, state, &mut pacer).await {
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
                 }
@@ -741,14 +877,15 @@ async fn live(
                                 match state.queue(kind, &reply, false) {
                                     Err(error) => manager.emit_error(generation, error),
                                     Ok(dropped) => {
-                                        if dropped {
+                                        if let Some(dropped) = dropped {
                                             manager.emit_error(
                                                 generation,
                                                 "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                             );
+                                            retry_dropped_chat(manager, &dropped);
                                         }
 
-                                        if let Err(error) = flush(&mut sink, state).await {
+                                        if let Err(error) = flush(&mut sink, state, &mut pacer).await {
                                             return Outcome::Lost(PairFailure {
                                                 message: error,
                                                 fatal: false,
@@ -814,20 +951,24 @@ fn describe_close(code: Option<u16>) -> PairFailure {
     }
 }
 
-async fn flush<S>(sink: &mut S, state: &mut SessionState) -> Result<(), String>
+async fn flush<S>(sink: &mut S, state: &mut SessionState, pacer: &mut Pacer) -> Result<(), String>
 where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
-    while let Some(frame) = state.reliable.pop_front() {
+    while let Some((frame, envelope)) = state.reliable.pop_front() {
+        pacer.acquire().await;
+
         if let Err(error) = send_frame(sink, Message::Binary(frame.clone().into())).await {
-            state.reliable.push_front(frame);
+            state.reliable.push_front((frame, envelope));
 
             return Err(error);
         }
     }
 
     while let Some((key, frame)) = state.replaceable.pop_first() {
+        pacer.acquire().await;
+
         if let Err(error) = send_frame(sink, Message::Binary(frame.clone().into())).await {
             state.replaceable.insert(key, frame);
 
@@ -838,7 +979,26 @@ where
     Ok(())
 }
 
+/// 队列满时被挤掉的聊天消息退回「等待发送」（§32）：下一次对端上线会重新补发，
+/// 既不假装「已发送」，也不会变成无法重试的终态。
+fn retry_dropped_chat(manager: &Arc<PairManager>, envelope: &AppEnvelope) {
+    if envelope.message_type != message_type::CHAT_TEXT {
+        return;
+    }
+
+    let Some(id) = envelope.payload.get("messageId").and_then(Value::as_str) else {
+        return;
+    };
+
+    manager.publish_message_status(id, MessageStatus::Pending);
+}
+
 /// 带超时的写入。对端不读数据时 `send` 会无限等待；超时后由调用方把连接判为断开。
+///
+/// 注意：所有**应用帧**都必须先过 `Pacer::acquire`（应用帧现在只有 `flush` 调用本函数），
+/// 否则一次补发就会把中继的令牌桶扣穿、被 `close 1008` 踢掉。不走 pacer 的只有 WS
+/// 控制帧：心跳 `Message::Ping`（本函数的唯一非应用帧调用点）与断开时的
+/// `Message::Close`（直接 `sink.send`，不经过本函数），中继根本看不到它们。
 async fn send_frame<S>(sink: &mut S, message: Message) -> Result<(), String>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -898,9 +1058,10 @@ fn handle_binary(
                 status.peer_name = payload.display_name.clone();
             });
 
-            manager
-                .sink
-                .emit(EVENT_PRESENCE, serde_json::to_value(payload).unwrap_or(Value::Null));
+            manager.sink.emit(
+                EVENT_PRESENCE,
+                serde_json::to_value(payload).unwrap_or(Value::Null),
+            );
 
             Ok(None)
         }
@@ -926,16 +1087,70 @@ fn handle_binary(
                 status.remote_stats = Some(stats.clone());
             });
 
-            manager
-                .sink
-                .emit(EVENT_STATS, serde_json::to_value(stats).unwrap_or(Value::Null));
+            manager.sink.emit(
+                EVENT_STATS,
+                serde_json::to_value(stats).unwrap_or(Value::Null),
+            );
+
+            Ok(None)
+        }
+        message_type::CHAT_TEXT => {
+            // 畸形或超长就直接丢掉：对端不可信，不能让一条坏消息打断网络层
+            let Ok(payload) = serde_json::from_value::<ChatTextPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            if payload.text.trim().is_empty() || payload.text.len() > MESSAGE_TEXT_LIMIT {
+                return Ok(None);
+            }
+
+            // 同一条消息重发（对端没收到 ack 时会重试）只补一次 ack，不重复入库与通知
+            if manager.history.find(&payload.message_id)?.is_none() {
+                let epoch = manager.history.epoch()?;
+                let stored = manager.history.insert(&NewMessage::incoming_text(
+                    payload.message_id.clone(),
+                    payload.text,
+                    now_millis(),
+                    epoch,
+                ))?;
+
+                manager.sink.emit(
+                    EVENT_MESSAGE_RECEIVED,
+                    serde_json::to_value(stored).unwrap_or(Value::Null),
+                );
+            }
+
+            Ok(Some((
+                FrameKind::Ack,
+                AppEnvelope::new(
+                    message_type::CHAT_ACK,
+                    manager.next_envelope_seq(),
+                    json!({ "messageId": payload.message_id }),
+                ),
+            )))
+        }
+        message_type::CHAT_ACK => {
+            let Ok(payload) = serde_json::from_value::<ChatAckPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            // ack 只对本机发出的消息有意义：对端如果 ack 一条 incoming 的 id，
+            // 不该把本地那行「已收到」改成「对方已收到」
+            if let Some(message) = manager.history.find(&payload.message_id)?
+                && message.direction == MessageDirection::Outgoing
+            {
+                manager.publish_message_status(&payload.message_id, MessageStatus::Delivered);
+            }
 
             Ok(None)
         }
         _ => {
-            manager
-                .sink
-                .emit(EVENT_MESSAGE, serde_json::to_value(envelope).unwrap_or(Value::Null));
+            manager.sink.emit(
+                EVENT_MESSAGE,
+                serde_json::to_value(envelope).unwrap_or(Value::Null),
+            );
 
             Ok(None)
         }
@@ -1001,6 +1216,11 @@ fn publish_peer(manager: &Arc<PairManager>, generation: u64, online: bool) {
     manager
         .sink
         .emit(EVENT_PEER_CHANGED, json!({ "online": online }));
+
+    if online {
+        // §32：对方上线了，把离线期间攒下的消息补发出去
+        manager.resend_pending_chat();
+    }
 }
 
 #[cfg(test)]
@@ -1038,9 +1258,23 @@ mod tests {
 
     fn test_manager() -> (Arc<PairManager>, Arc<TestSink>) {
         let sink = Arc::new(TestSink::default());
-        let manager = Arc::new(PairManager::new("test-device".into(), sink.clone()));
+        let history = Arc::new(PairHistory::in_memory().unwrap());
+        let manager = Arc::new(PairManager::new(
+            "test-device".into(),
+            sink.clone(),
+            history,
+        ));
 
         (manager, sink)
+    }
+
+    /// 给 manager 装一条假的会话通道：这样 `send_chat` 会走「真的发出去」的分支
+    fn with_session(manager: &Arc<PairManager>) -> mpsc::UnboundedReceiver<Command> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+
+        *PairManager::lock(&manager.sender) = Some(sender);
+
+        receiver
     }
 
     /// 伪造一条来自对端的加密帧，交给 `handle_binary` 处理
@@ -1051,10 +1285,7 @@ mod tests {
         envelope: &AppEnvelope,
     ) -> Result<Reply, String> {
         let frame = PairCipher::new(&ROOT_KEY)
-            .seal(
-                &FrameHeader::new(kind, 0),
-                &envelope.to_bytes().unwrap(),
-            )
+            .seal(&FrameHeader::new(kind, 0), &envelope.to_bytes().unwrap())
             .unwrap();
 
         handle_binary(manager, 0, state, &frame)
@@ -1132,7 +1363,7 @@ mod tests {
                 )
                 .unwrap();
 
-            assert!(!dropped, "第 {index} 条不应该触发丢弃");
+            assert!(dropped.is_none(), "第 {index} 条不应该触发丢弃");
         }
 
         let dropped = state
@@ -1143,8 +1374,10 @@ mod tests {
             )
             .unwrap();
 
-        // 静默丢消息会让聊天永久缺一条；这里必须让调用方拿到信号
-        assert!(dropped, "超出上限时必须报告丢弃");
+        // 静默丢消息会让聊天永久缺一条；这里必须让调用方拿到被挤掉的那一条
+        let dropped = dropped.expect("超出上限时必须报告丢弃");
+
+        assert_eq!(dropped.message_type, message_type::PING);
         assert_eq!(state.reliable.len(), RELIABLE_QUEUE_LIMIT);
     }
 
@@ -1185,7 +1418,11 @@ mod tests {
         let snapshot = serde_json::to_value(PetSnapshot::default()).unwrap();
 
         manager
-            .send_replaceable(FrameKind::PetState, message_type::PET_STATE, snapshot.clone())
+            .send_replaceable(
+                FrameKind::PetState,
+                message_type::PET_STATE,
+                snapshot.clone(),
+            )
             .unwrap();
         manager
             .send_replaceable(
@@ -1317,6 +1554,312 @@ mod tests {
 
         assert!(sink.payloads(EVENT_CONNECTION_CHANGED).is_empty());
         assert!(sink.payloads(EVENT_PEER_CHANGED).is_empty());
+    }
+
+    #[test]
+    fn chat_text_is_stored_and_acked() {
+        let (manager, sink) = test_manager();
+        let mut state = SessionState::new(&ROOT_KEY);
+        let envelope = AppEnvelope::new(
+            message_type::CHAT_TEXT,
+            1,
+            json!({ "messageId": "m1", "text": "你好" }),
+        );
+
+        let (kind, reply) = deliver(&manager, &mut state, FrameKind::Chat, &envelope)
+            .unwrap()
+            .expect("收到 chat.text 必须回 ack");
+
+        assert_eq!(kind, FrameKind::Ack);
+        assert_eq!(reply.message_type, message_type::CHAT_ACK);
+        assert_eq!(reply.payload["messageId"], "m1");
+
+        let stored = manager.history.find("m1").unwrap().unwrap();
+
+        assert_eq!(stored.text.as_deref(), Some("你好"));
+        assert_eq!(stored.direction, MessageDirection::Incoming);
+        assert_eq!(stored.status, MessageStatus::Received);
+        assert_eq!(sink.payloads(EVENT_MESSAGE_RECEIVED).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_chat_text_is_acked_but_stored_once() {
+        let (manager, sink) = test_manager();
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        // 对端没收到 ack 时会重发：换一条信封（新 envelope id）再投一次
+        for seq in [1, 2] {
+            let envelope = AppEnvelope::new(
+                message_type::CHAT_TEXT,
+                seq,
+                json!({ "messageId": "m1", "text": "你好" }),
+            );
+
+            assert!(
+                deliver(&manager, &mut state, FrameKind::Chat, &envelope)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        assert_eq!(manager.history.count(None).unwrap(), 1);
+        assert_eq!(
+            sink.payloads(EVENT_MESSAGE_RECEIVED).len(),
+            1,
+            "重发不该再通知一次"
+        );
+    }
+
+    #[test]
+    fn chat_ack_marks_the_message_delivered() {
+        let (manager, sink) = test_manager();
+
+        manager
+            .history
+            .insert(&NewMessage::outgoing_text("m1".into(), "你好".into(), 1, 1))
+            .unwrap();
+
+        let mut state = SessionState::new(&ROOT_KEY);
+        let envelope = AppEnvelope::new(message_type::CHAT_ACK, 1, json!({ "messageId": "m1" }));
+
+        assert!(
+            deliver(&manager, &mut state, FrameKind::Ack, &envelope)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            manager.history.find("m1").unwrap().unwrap().status,
+            MessageStatus::Delivered
+        );
+        assert_eq!(sink.payloads(EVENT_MESSAGE_UPDATED).len(), 1);
+    }
+
+    /// ack 只能改动本机发出的消息：对端 ack 一条自己发来的 id 不该动本地那行
+    #[test]
+    fn chat_ack_ignores_incoming_messages() {
+        let (manager, sink) = test_manager();
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        manager
+            .history
+            .insert(&NewMessage::incoming_text("m1".into(), "你好".into(), 1, 1))
+            .unwrap();
+
+        let envelope = AppEnvelope::new(message_type::CHAT_ACK, 1, json!({ "messageId": "m1" }));
+
+        assert!(
+            deliver(&manager, &mut state, FrameKind::Ack, &envelope)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            manager.history.find("m1").unwrap().unwrap().status,
+            MessageStatus::Received
+        );
+        assert!(sink.payloads(EVENT_MESSAGE_UPDATED).is_empty());
+    }
+
+    /// 可靠队列挤掉一条聊天帧时，那条消息要退回「等待发送」，不能停在「已发送」
+    #[test]
+    fn dropped_chat_frames_send_the_message_back_to_pending() {
+        let (manager, sink) = test_manager();
+        let stored = manager
+            .history
+            .insert(&NewMessage::outgoing_text("m1".into(), "你好".into(), 1, 1))
+            .unwrap();
+
+        manager.publish_message_status("m1", MessageStatus::Sent);
+
+        assert_eq!(
+            manager.history.find("m1").unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
+
+        retry_dropped_chat(
+            &manager,
+            &AppEnvelope::new(
+                message_type::CHAT_TEXT,
+                1,
+                json!({ "messageId": stored.id, "text": "你好" }),
+            ),
+        );
+
+        assert_eq!(
+            manager.history.find("m1").unwrap().unwrap().status,
+            MessageStatus::Pending
+        );
+        assert_eq!(sink.payloads(EVENT_MESSAGE_UPDATED).len(), 2);
+
+        // 非聊天帧没有对应的消息，不能误改状态
+        retry_dropped_chat(
+            &manager,
+            &AppEnvelope::new(message_type::CHAT_ACK, 2, json!({ "messageId": "m1" })),
+        );
+        assert_eq!(
+            manager.history.find("m1").unwrap().unwrap().status,
+            MessageStatus::Pending
+        );
+    }
+
+    #[test]
+    fn pacer_refills_at_the_configured_rate_and_caps_at_the_burst() {
+        assert!(
+            (Pacer::refill(0.0, 0.05) - 1.0).abs() < 1e-9,
+            "50ms 应当补一枚令牌"
+        );
+        assert!(
+            (Pacer::refill(5.0, 0.0) - 5.0).abs() < 1e-9,
+            "没有经过时间就不补充"
+        );
+        assert!(
+            (Pacer::refill(19.5, 30.0) - OUTBOUND_BURST).abs() < 1e-9,
+            "长时间空闲也不能攒成无限突发"
+        );
+        assert!(
+            (Pacer::refill(1.0, -5.0) - 1.0).abs() < 1e-9,
+            "时钟异常不该扣令牌"
+        );
+    }
+
+    /// 客户端自己也得守住中继的预算，否则一次补发就会被 close 1008
+    #[test]
+    fn outbound_pacing_stays_within_the_relay_budget() {
+        // server-cloudflare/src/protocol.ts: MAX_FRAMES_PER_SECOND = 30
+        const RELAY_FRAMES_PER_SECOND: f64 = 30.0;
+
+        assert!(OUTBOUND_BURST < RELAY_FRAMES_PER_SECOND);
+        assert!(OUTBOUND_FRAMES_PER_SECOND < RELAY_FRAMES_PER_SECOND);
+    }
+
+    /// 单看「突发 < 中继上限」还不够：真正的不变量是**任意时刻累计放行量**都不超过中继的
+    /// 令牌桶，否则第一次滚动秒里 20 突发 + 20 补充就会追上中继的 30 容量。
+    #[test]
+    fn cumulative_pacing_never_drains_the_relay_bucket() {
+        // server-cloudflare/src/protocol.ts: MAX_FRAMES_PER_SECOND = 30，容量同为 30
+        const RELAY_FRAMES_PER_SECOND: f64 = 30.0;
+        const RELAY_BURST: f64 = 30.0;
+        const STEP_SECS: f64 = 0.005;
+        const STEPS: usize = 20_000;
+
+        let mut client_tokens = OUTBOUND_BURST;
+        let mut relay_tokens = RELAY_BURST;
+        let mut released = 0usize;
+
+        for step in 1..=STEPS {
+            client_tokens = Pacer::refill(client_tokens, STEP_SECS);
+            relay_tokens = (relay_tokens + STEP_SECS * RELAY_FRAMES_PER_SECOND).min(RELAY_BURST);
+
+            if client_tokens < 1.0 {
+                continue;
+            }
+
+            client_tokens -= 1.0;
+            relay_tokens -= 1.0;
+            released += 1;
+
+            let elapsed = step as f64 * STEP_SECS;
+
+            assert!(
+                relay_tokens >= 0.0,
+                "中继令牌桶被扣穿：第 {released} 帧，t = {elapsed}s"
+            );
+            assert!(
+                released as f64 <= RELAY_BURST + RELAY_FRAMES_PER_SECOND * elapsed + 1e-9,
+                "累计放行量超过中继预算：第 {released} 帧，t = {elapsed}s"
+            );
+        }
+
+        // 第一秒正好放行 20 突发 + 20 补充，仍在中继的 60 以内
+        assert!(released > 1_000, "模拟没有真的发送：{released} 帧");
+    }
+
+    #[test]
+    fn malformed_or_oversized_chat_payloads_are_ignored() {
+        let (manager, sink) = test_manager();
+        let mut state = SessionState::new(&ROOT_KEY);
+        let oversized = "x".repeat(MESSAGE_TEXT_LIMIT + 1);
+
+        for payload in [
+            json!({ "messageId": "m1" }),
+            json!({ "messageId": "m1", "text": "   " }),
+            json!({ "messageId": "m2", "text": oversized }),
+        ] {
+            let envelope = AppEnvelope::new(message_type::CHAT_TEXT, 1, payload);
+
+            assert!(
+                deliver(&manager, &mut state, FrameKind::Chat, &envelope)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert_eq!(manager.history.count(None).unwrap(), 0);
+        assert!(sink.payloads(EVENT_MESSAGE_RECEIVED).is_empty());
+    }
+
+    #[test]
+    fn send_chat_rejects_empty_and_oversized_text() {
+        let (manager, _sink) = test_manager();
+
+        assert!(manager.send_chat("").is_err());
+        assert!(manager.send_chat("   ").is_err());
+        assert!(
+            manager
+                .send_chat(&"x".repeat(MESSAGE_TEXT_LIMIT + 1))
+                .is_err()
+        );
+        assert_eq!(
+            manager.history.count(None).unwrap(),
+            0,
+            "被拒绝的消息不该入库"
+        );
+    }
+
+    #[test]
+    fn sending_chat_marks_it_sent_and_queues_one_frame() {
+        let (manager, sink) = test_manager();
+        let mut receiver = with_session(&manager);
+
+        let message = manager.send_chat("你好").unwrap();
+
+        assert_eq!(message.status, MessageStatus::Sent);
+
+        match receiver.try_recv().expect("应当排一条 chat 帧") {
+            Command::Send { kind, envelope } => {
+                assert_eq!(kind, FrameKind::Chat);
+                assert_eq!(envelope.message_type, message_type::CHAT_TEXT);
+                assert_eq!(envelope.payload["messageId"], message.id);
+                assert_eq!(envelope.payload["text"], "你好");
+            }
+            _ => panic!("排队的应当是一条 chat 帧"),
+        }
+
+        assert_eq!(sink.payloads(EVENT_MESSAGE_UPDATED).len(), 1);
+    }
+
+    #[test]
+    fn offline_chat_stays_pending_until_the_peer_comes_back() {
+        let (manager, _sink) = test_manager();
+
+        // 没有会话：消息留在本地 pending（§32）
+        let message = manager.send_chat("回来叫我").unwrap();
+
+        assert_eq!(message.status, MessageStatus::Pending);
+        assert_eq!(manager.history.pending(10).unwrap().len(), 1);
+
+        // 对端上线：一定要补发
+        let mut receiver = with_session(&manager);
+
+        manager.resend_pending_chat();
+
+        assert!(matches!(
+            receiver.try_recv().expect("上线后应当补发"),
+            Command::Send { .. }
+        ));
+        assert_eq!(
+            manager.history.find(&message.id).unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
     }
 
     #[test]

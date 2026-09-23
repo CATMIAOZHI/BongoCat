@@ -108,6 +108,8 @@ pub mod message_type {
     pub const PRESENCE: &str = "pair.presence";
     pub const PET_STATE: &str = "pair.pet-state";
     pub const STATS: &str = "pair.stats";
+    pub const CHAT_TEXT: &str = "chat.text";
+    pub const CHAT_ACK: &str = "chat.ack";
 }
 
 /// 应用层信封（加密前的内容）
@@ -168,6 +170,21 @@ pub struct PresencePayload {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+}
+
+/// `chat.text` 的载荷（§31）。`message_id` 由发送方生成，也是本地库里的主键。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTextPayload {
+    pub message_id: String,
+    pub text: String,
+}
+
+/// `chat.ack` 的载荷：只说「哪条消息收到了」，不回到信
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAckPayload {
+    pub message_id: String,
 }
 
 /// 键盘活动：只有「哪只手 + 强度」，永远不含具体键名（见 docs/pair-plan.md 的 §17 / §18 与 R2 / R3）
@@ -440,7 +457,11 @@ mod tests {
         assert!(!json.contains("KeyA"));
         assert!(!json.contains("KeyboardPress"));
 
-        for number in [snapshot.keyboard.intensity, snapshot.pointer.x, snapshot.pointer.y] {
+        for number in [
+            snapshot.keyboard.intensity,
+            snapshot.pointer.x,
+            snapshot.pointer.y,
+        ] {
             assert!((0.0..=1.0).contains(&number));
         }
     }

@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod crypto;
+pub mod history;
 pub mod manager;
 pub mod protocol;
 pub mod secret;
@@ -17,10 +18,9 @@ use std::sync::Arc;
 use serde_json::json;
 use tauri::{AppHandle, Manager as _, Runtime, State, command};
 
+use history::{ChatMessage, ExportFormat, ExportSummary, HistoryPage, HistoryStats, PairHistory};
 use manager::{AppEventSink, PairManager, PairStatus};
-use protocol::{
-    FrameKind, InputStats, PetSnapshot, PresencePayload, PresenceState, message_type,
-};
+use protocol::{FrameKind, InputStats, PetSnapshot, PresencePayload, PresenceState, message_type};
 
 /// 应用启动时调用：准备设备 id，并把 PairManager 注册为全局状态
 ///
@@ -33,9 +33,33 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
 
         uuid::Uuid::new_v4().to_string()
     });
+    let history = Arc::new(open_history(app));
     let sink = Arc::new(AppEventSink::new(app.clone()));
 
-    app.manage(Arc::new(PairManager::new(device_id, sink)));
+    app.manage(Arc::new(PairManager::new(device_id, sink, history)));
+}
+
+/// 打开本地聊天库。
+///
+/// 打不开时退化成内存库：聊天记录不落盘，但连接、宠物同步这些功能必须照常可用，
+/// 否则一个磁盘问题会让整个联机功能失效。
+fn open_history<R: Runtime>(app: &AppHandle<R>) -> PairHistory {
+    let path = app
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|directory| directory.join("pair").join("pair.db"));
+
+    match path {
+        Some(path) => PairHistory::open(&path).unwrap_or_else(fallback_history),
+        None => fallback_history("无法定位聊天数据库路径".to_string()),
+    }
+}
+
+fn fallback_history(reason: String) -> PairHistory {
+    tauri_plugin_log::log::error!("聊天数据库不可用（本次运行不落盘）: {reason}");
+
+    PairHistory::in_memory().unwrap_or_else(|error| panic!("内存聊天数据库不可用: {error}"))
 }
 
 #[command]
@@ -146,8 +170,92 @@ pub async fn pair_send_stats(
     manager: State<'_, Arc<PairManager>>,
     stats: InputStats,
 ) -> Result<(), String> {
+    // §33：本地统计同时在 SQLite 里留一份（按天一行），供以后回看
+    if !stats.date.is_empty()
+        && let Err(error) = manager.history().upsert_input_stats(
+            &stats.date,
+            stats.today_keyboard,
+            stats.today_mouse,
+        )
+    {
+        tauri_plugin_log::log::warn!("写入输入统计失败: {error}");
+    }
+
     let payload =
         serde_json::to_value(stats).map_err(|err| format!("序列化输入统计失败: {err}"))?;
 
     manager.send_replaceable(FrameKind::Stats, message_type::STATS, payload)
+}
+
+/// 发一条文本消息（§31）。
+///
+/// 返回本地已经落库的那一行：连不上时状态是 `pending`，会在对端上线后自动重发（§32）。
+#[command]
+pub async fn pair_send_chat(
+    manager: State<'_, Arc<PairManager>>,
+    text: String,
+) -> Result<ChatMessage, String> {
+    Arc::clone(&manager).send_chat(&text)
+}
+
+/// 读取聊天历史（§34），每次最多一页，滚到顶部再往前翻
+#[command]
+pub async fn pair_history_list(
+    manager: State<'_, Arc<PairManager>>,
+    before: Option<i64>,
+    limit: Option<usize>,
+) -> Result<HistoryPage, String> {
+    let history = manager.history();
+    let limit = limit
+        .unwrap_or(history::DEFAULT_PAGE_LIMIT)
+        .clamp(1, history::MAX_PAGE_LIMIT);
+
+    history.list(history.epoch()?, before, limit)
+}
+
+/// 本地保存进度（§36）：当前周期条数 + 总条数 + 当前周期号
+#[command]
+pub async fn pair_history_stats(
+    manager: State<'_, Arc<PairManager>>,
+) -> Result<HistoryStats, String> {
+    let history = manager.history();
+    let epoch = history.epoch()?;
+
+    Ok(HistoryStats {
+        epoch,
+        current: history.count(Some(epoch))?,
+        total: history.count(None)?,
+    })
+}
+
+/// 导出聊天记录到用户选定的路径（§35）。附件不进 JSON，Phase 5 会导出到同目录。
+#[command]
+pub async fn pair_history_export(
+    manager: State<'_, Arc<PairManager>>,
+    format: ExportFormat,
+    path: String,
+) -> Result<ExportSummary, String> {
+    let messages = manager.history().all()?;
+    let exported_at = protocol::now_millis();
+    let content = format.render(&messages, exported_at)?;
+
+    std::fs::write(&path, content).map_err(|err| format!("写入导出文件失败: {err}"))?;
+
+    Ok(ExportSummary {
+        path,
+        format,
+        messages: messages.len(),
+        exported_at,
+    })
+}
+
+/// 导出并开始新的记录周期（§36）。`deleteOld` 为真时删除旧周期消息，默认保留。
+#[command]
+pub async fn pair_history_start_new_epoch(
+    manager: State<'_, Arc<PairManager>>,
+    delete_old: Option<bool>,
+) -> Result<i64, String> {
+    manager
+        .history()
+        .start_new_epoch(delete_old.unwrap_or(false))
 }

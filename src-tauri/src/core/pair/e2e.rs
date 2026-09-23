@@ -18,7 +18,11 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::client;
 use super::crypto::{self};
-use super::manager::{EVENT_CONNECTION_CHANGED, EVENT_PRESENCE, PairConnectionState, PairManager};
+use super::history::{MessageStatus, PairHistory};
+use super::manager::{
+    EVENT_CONNECTION_CHANGED, EVENT_MESSAGE_RECEIVED, EVENT_MESSAGE_UPDATED, EVENT_PEER_CHANGED,
+    EVENT_PRESENCE, PairConnectionState, PairManager,
+};
 use super::protocol::{FrameKind, PresencePayload, PresenceState, message_type};
 
 /// 记录所有事件的测试用 sink
@@ -27,9 +31,17 @@ struct RecordingSink {
     events: Mutex<Vec<(String, Value)>>,
 }
 
+/// 每个 e2e 客户端一个内存聊天库：端到端用例不碰真实磁盘
+fn memory_history() -> Arc<PairHistory> {
+    Arc::new(PairHistory::in_memory().expect("内存聊天库"))
+}
+
 impl RecordingSink {
     fn status_events(&self, event: &str) -> Vec<Value> {
-        let events = self.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         events
             .iter()
@@ -115,8 +127,16 @@ async fn two_clients_exchange_encrypted_presence() {
 
     let sink_a = Arc::new(RecordingSink::default());
     let sink_b = Arc::new(RecordingSink::default());
-    let manager_a = Arc::new(PairManager::new("e2e-a".into(), sink_a.clone()));
-    let manager_b = Arc::new(PairManager::new("e2e-b".into(), sink_b.clone()));
+    let manager_a = Arc::new(PairManager::new(
+        "e2e-a".into(),
+        sink_a.clone(),
+        memory_history(),
+    ));
+    let manager_b = Arc::new(PairManager::new(
+        "e2e-b".into(),
+        sink_b.clone(),
+        memory_history(),
+    ));
 
     manager_a.start(&relay, Some(&secret_text)).unwrap();
     manager_b.start(&relay, Some(&secret_text)).unwrap();
@@ -158,7 +178,11 @@ async fn two_clients_exchange_encrypted_presence() {
     )
     .await;
 
-    assert!(arrived, "B 没有收到 A 的 presence：errors={:?}", sink_b.errors());
+    assert!(
+        arrived,
+        "B 没有收到 A 的 presence：errors={:?}",
+        sink_b.errors()
+    );
 
     let payload = sink_b.presence_events().into_iter().next().unwrap();
 
@@ -171,6 +195,290 @@ async fn two_clients_exchange_encrypted_presence() {
         sink_a.presence_events().is_empty(),
         "发送方收到了自己的消息：{:?}",
         sink_a.presence_events()
+    );
+
+    manager_a.disconnect();
+    manager_b.disconnect();
+}
+
+/// 两个客户端通过真实中继互发文字消息（§31 / §32）。
+///
+/// 覆盖三段：在线的正常收发与 ack、对方离线时消息先在本地排队、对方回来后自动补发并变成
+/// `delivered`。这段必须走真实中继，才说明「服务器不存内容、靠客户端补发」的约定成立。
+#[tokio::test]
+#[ignore = "需要本地或已部署的 relay，见文件头说明"]
+async fn two_clients_exchange_encrypted_chat_messages() {
+    let Some((relay, secret_text)) = e2e_config() else {
+        eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
+
+        return;
+    };
+
+    let _guard = e2e_lock();
+
+    let sink_a = Arc::new(RecordingSink::default());
+    let sink_b = Arc::new(RecordingSink::default());
+    let history_a = memory_history();
+    let history_b = memory_history();
+    let manager_a = Arc::new(PairManager::new(
+        "e2e-chat-a".into(),
+        sink_a.clone(),
+        Arc::clone(&history_a),
+    ));
+    let manager_b = Arc::new(PairManager::new(
+        "e2e-chat-b".into(),
+        sink_b.clone(),
+        Arc::clone(&history_b),
+    ));
+
+    manager_a.start(&relay, Some(&secret_text)).unwrap();
+    manager_b.start(&relay, Some(&secret_text)).unwrap();
+
+    let connected = wait_for(
+        || {
+            sink_a.last_state() == Some(PairConnectionState::Connected)
+                && sink_b.last_state() == Some(PairConnectionState::Connected)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(
+        connected,
+        "两端没有进入 Connected：A={:?} B={:?} errors={:?}",
+        sink_a.last_state(),
+        sink_b.last_state(),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // A 发、B 入库并回 ack、A 的状态变成 delivered
+    let sent = manager_a.send_chat("你好，吃了吗").unwrap();
+
+    let stored = wait_for(
+        || sink_b.status_events(EVENT_MESSAGE_RECEIVED).len() == 1,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(stored, "B 没有收到文字消息：errors={:?}", sink_b.errors());
+
+    let received = sink_b
+        .status_events(EVENT_MESSAGE_RECEIVED)
+        .into_iter()
+        .next()
+        .unwrap();
+
+    assert_eq!(received["id"], sent.id);
+    assert_eq!(received["text"], "你好，吃了吗");
+    assert_eq!(received["direction"], "incoming");
+
+    let acked = wait_for(
+        || {
+            sink_a
+                .status_events(EVENT_MESSAGE_UPDATED)
+                .iter()
+                .any(|payload| payload["status"] == "delivered")
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(
+        acked,
+        "A 没有等到 ack：{:?}",
+        sink_a.status_events(EVENT_MESSAGE_UPDATED)
+    );
+
+    // §32：B 离线时消息留在本地队列，B 回来后才补发
+    manager_b.disconnect();
+
+    let peer_gone = wait_for(
+        || {
+            sink_a
+                .status_events(EVENT_PEER_CHANGED)
+                .iter()
+                .any(|payload| payload["online"] == false)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(peer_gone, "A 没有察觉 B 离线");
+
+    let queued = manager_a.send_chat("回来叫我").unwrap();
+
+    assert_ne!(queued.status, MessageStatus::Delivered);
+    assert_eq!(
+        sink_b.status_events(EVENT_MESSAGE_RECEIVED).len(),
+        1,
+        "B 离线期间不该收到消息"
+    );
+
+    manager_b.start(&relay, Some(&secret_text)).unwrap();
+
+    let resent = wait_for(
+        || sink_b.status_events(EVENT_MESSAGE_RECEIVED).len() == 2,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(resent, "B 回来后没有收到补发：errors={:?}", sink_b.errors());
+    assert_eq!(
+        sink_b.status_events(EVENT_MESSAGE_RECEIVED)[1]["id"],
+        queued.id
+    );
+
+    let delivered = wait_for(
+        || {
+            history_a
+                .find(&queued.id)
+                .ok()
+                .flatten()
+                .map(|message| message.status)
+                == Some(MessageStatus::Delivered)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(delivered, "补发的消息没有变成 delivered");
+
+    manager_a.disconnect();
+    manager_b.disconnect();
+}
+
+/// 离线积压后的一次性补发（R18）：中继限流是 30 帧/秒，客户端补发必须自己不越界，
+/// 不能出现「连上就被 close 1008、ack 永远收不到」的空转。
+#[tokio::test]
+#[ignore = "需要本地或已部署的 relay，见文件头说明"]
+async fn offline_backlog_is_delivered_without_tripping_the_relay_limit() {
+    /// 40 条会同时跨过客户端的突发额度（20）与中继的突发额度（30）
+    const BACKLOG: usize = 40;
+
+    let Some((relay, secret_text)) = e2e_config() else {
+        eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
+
+        return;
+    };
+
+    let _guard = e2e_lock();
+
+    let sink_a = Arc::new(RecordingSink::default());
+    let sink_b = Arc::new(RecordingSink::default());
+    let history_a = memory_history();
+    let history_b = memory_history();
+    let manager_a = Arc::new(PairManager::new(
+        "e2e-backlog-a".into(),
+        sink_a.clone(),
+        Arc::clone(&history_a),
+    ));
+    let manager_b = Arc::new(PairManager::new(
+        "e2e-backlog-b".into(),
+        sink_b.clone(),
+        Arc::clone(&history_b),
+    ));
+
+    manager_a.start(&relay, Some(&secret_text)).unwrap();
+    manager_b.start(&relay, Some(&secret_text)).unwrap();
+
+    let connected = wait_for(
+        || {
+            sink_a.last_state() == Some(PairConnectionState::Connected)
+                && sink_b.last_state() == Some(PairConnectionState::Connected)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(
+        connected,
+        "两端没有进入 Connected：A={:?} B={:?} errors={:?}",
+        sink_a.last_state(),
+        sink_b.last_state(),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // B 下线，A 攒下 40 条只存在本地的离线消息
+    manager_b.disconnect();
+
+    let peer_gone = wait_for(
+        || {
+            sink_a
+                .status_events(EVENT_PEER_CHANGED)
+                .iter()
+                .any(|payload| payload["online"] == false)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(peer_gone, "A 没有察觉 B 离线");
+
+    let ids: Vec<String> = (0..BACKLOG)
+        .map(|index| manager_a.send_chat(&format!("积压 #{index}")).unwrap().id)
+        .collect();
+
+    assert!(
+        sink_b.status_events(EVENT_MESSAGE_RECEIVED).is_empty(),
+        "B 离线期间不该收到消息"
+    );
+
+    // B 回来：A 补发 40 帧（20 帧突发 + 20 帧按 20/s），仍在中继 30 帧/秒的额度内
+    manager_b.start(&relay, Some(&secret_text)).unwrap();
+
+    let all_arrived = wait_for(
+        || sink_b.status_events(EVENT_MESSAGE_RECEIVED).len() == BACKLOG,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        all_arrived,
+        "B 只收到 {} 条补发：errors={:?}",
+        sink_b.status_events(EVENT_MESSAGE_RECEIVED).len(),
+        sink_b.errors()
+    );
+
+    let received_ids: Vec<String> = sink_b
+        .status_events(EVENT_MESSAGE_RECEIVED)
+        .into_iter()
+        .filter_map(|payload| payload["id"].as_str().map(str::to_string))
+        .collect();
+
+    assert_eq!(received_ids.len(), BACKLOG, "补发里出现了重复或缺失的消息");
+
+    for id in &ids {
+        assert!(received_ids.contains(id), "补发丢了消息 {id}");
+    }
+
+    let all_acked = wait_for(
+        || {
+            ids.iter().all(|id| {
+                history_a
+                    .find(id)
+                    .ok()
+                    .flatten()
+                    .map(|message| message.status)
+                    == Some(MessageStatus::Delivered)
+            })
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert!(
+        all_acked,
+        "补发的消息没有全部变成 delivered：errors={:?}",
+        sink_a.errors()
+    );
+
+    let errors = sink_a.errors();
+
+    assert!(
+        !errors
+            .iter()
+            .any(|message| message.contains("1008") || message.contains("发送频率")),
+        "补发被中继限流踢掉了：{errors:?}"
     );
 
     manager_a.disconnect();
@@ -193,7 +501,11 @@ async fn stays_connected_across_heartbeats() {
     let auth_token = crypto::derive_auth_token(&secret);
 
     let sink = Arc::new(RecordingSink::default());
-    let manager = Arc::new(PairManager::new("e2e-heartbeat".into(), sink.clone()));
+    let manager = Arc::new(PairManager::new(
+        "e2e-heartbeat".into(),
+        sink.clone(),
+        memory_history(),
+    ));
 
     manager.start(&relay, Some(&secret_text)).unwrap();
 
@@ -253,12 +565,14 @@ fn tungstenite_ping() -> tokio_tungstenite::tungstenite::Message {
 /// 这个用例故意指向一个必然拒绝连接的端口，所以不需要真的跑一个 relay。
 #[tokio::test]
 async fn unreachable_relay_enters_reconnecting() {
-    let secret = base64::Engine::encode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        [0u8; 32],
-    );
+    let secret =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [0u8; 32]);
     let sink = Arc::new(RecordingSink::default());
-    let manager = Arc::new(PairManager::new("e2e-reconnect".into(), sink.clone()));
+    let manager = Arc::new(PairManager::new(
+        "e2e-reconnect".into(),
+        sink.clone(),
+        memory_history(),
+    ));
 
     manager.start("http://127.0.0.1:1", Some(&secret)).unwrap();
 
