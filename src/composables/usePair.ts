@@ -83,6 +83,26 @@ export type MessageStatus = 'pending' | 'sent' | 'delivered' | 'failed' | 'recei
 
 export type ExportFormat = 'json' | 'txt' | 'md'
 
+/** 附件类型（§37 / §38 / §44），对应 Rust 侧 `TransferKind` */
+export type TransferKind = 'image' | 'file' | 'voice'
+
+/**
+ * 附件的本机记录（Rust 侧 `AttachmentRecord`，§39）。
+ *
+ * `localPath` 是本机的落盘位置（收到的附件在附件缓存里、发出的附件还在原处），
+ * 永远不会发给对方；`size` / `sha256` 在传输完成前可能还没有。
+ */
+export interface AttachmentRecord {
+  id: string
+  kind: MessageKind
+  originalName?: string
+  mime?: string
+  size?: number
+  sha256?: string
+  localPath?: string
+  createdAt: number
+}
+
 /** 本地库里的一条聊天消息（Rust 侧 `ChatMessage`），`seq` 是分页游标 */
 export interface ChatMessage {
   seq: number
@@ -94,6 +114,8 @@ export interface ChatMessage {
   text?: string
   status: MessageStatus
   attachmentId?: string
+  /** 附件消息带上附件记录（§37），文本消息没有这个字段 */
+  attachment?: AttachmentRecord
   conversationEpoch: number
 }
 
@@ -140,4 +162,90 @@ export function pairHistoryExport(format: ExportFormat, path: string) {
 /** 导出并开始新的记录周期（§36）；`deleteOld` 为真时删除旧周期消息 */
 export function pairHistoryStartNewEpoch(deleteOld?: boolean) {
   return invoke<number>(INVOKE_KEY.PAIR_HISTORY_START_NEW_EPOCH, { deleteOld })
+}
+
+/**
+ * 一次附件传输在 UI 里的状态（Rust 侧 `TransferProgress` / `pair-transfer` 事件）。
+ *
+ * `waiting` 只有接收方会有：文件超过 50 MB 且不是图片 / 语音时先等用户点「接收」（§42）。
+ */
+export type TransferState = 'waiting' | 'sending' | 'receiving' | 'done' | 'failed' | 'canceled'
+
+export interface TransferProgress {
+  transferId: number
+  messageId: string
+  attachmentId: string
+  kind: TransferKind
+  name: string
+  size: number
+  transferred: number
+  /** 0 - 100 */
+  percent: number
+  direction: MessageDirection
+  state: TransferState
+  /** 失败原因之类的补充说明 */
+  message?: string
+}
+
+/** 附件与临时文件的落盘位置（Rust 侧 `TransferPaths`） */
+export interface TransferPaths {
+  root: string
+  attachments: string
+  tmp: string
+  /** 单个附件上限（字节） */
+  maxSize: number
+}
+
+/** §42：附件上限的可选区间（MB），与 Rust 侧的夹紧范围一致 */
+export const ATTACHMENT_MAX_MB = {
+  min: 1,
+  max: 1024,
+  default: 256,
+} as const
+
+export interface SendAttachmentOptions {
+  path: string
+  kind: TransferKind
+  mime?: string
+  /** 把源文件移进本机附件缓存；粘贴的图片和录音用它（§37） */
+  stage?: boolean
+}
+
+export function pairTransferPaths() {
+  return invoke<TransferPaths>(INVOKE_KEY.PAIR_TRANSFER_PATHS)
+}
+
+/** 设置单个附件的上限（MB），返回夹紧之后的字节数（§42） */
+export function pairSetMaxAttachmentMb(mb: number) {
+  return invoke<number>(INVOKE_KEY.PAIR_SET_MAX_ATTACHMENT_MB, { mb })
+}
+
+/** 发送一个附件（§38），返回值是本地已经落库的那条消息 */
+export function pairSendAttachment(options: SendAttachmentOptions) {
+  return invoke<ChatMessage>(INVOKE_KEY.PAIR_SEND_ATTACHMENT, {
+    path: options.path,
+    kind: options.kind,
+    mime: options.mime,
+    stage: options.stage,
+  })
+}
+
+/** 接收方同意接收（§42 的大文件确认） */
+export function pairTransferAccept(messageId: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_TRANSFER_ACCEPT, { messageId })
+}
+
+/** 接收方拒绝接收 */
+export function pairTransferReject(messageId: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_TRANSFER_REJECT, { messageId })
+}
+
+/** 取消一次正在进行的传输 */
+export function pairTransferCancel(messageId: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_TRANSFER_CANCEL, { messageId })
+}
+
+/** 重发一条失败的附件（§43）。对方发来的附件只能请对方重发。 */
+export function pairAttachmentRetry(messageId: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_ATTACHMENT_RETRY, { messageId })
 }

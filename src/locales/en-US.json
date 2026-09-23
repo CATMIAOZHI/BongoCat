@@ -31,10 +31,36 @@
         "inputHint": "Use the \"Chat Input\" shortcut to open the text box",
         "inputKeys": "Enter to send · Shift+Enter for a new line · Esc to close",
         "passThrough": "Pass-through is on, clicks go to the desktop",
-        "textLimit": "{bytes} / 8192 bytes"
+        "textLimit": "{bytes} / 8192 bytes",
+        "attachment": "Attachment",
+        "preview": "View this image",
+        "close": "Close",
+        "pickAttachment": "Send a file",
+        "sendingAttachment": "Sending the attachment...",
+        "imageCopied": "Image copied to the clipboard",
+        "askPeerResend": "Ask your partner to send it again",
+        "attachmentBusy": "The previous one is still sending — try again in a moment"
       },
       "placeholders": {
         "input": "Type a message..."
+      },
+      "buttons": {
+        "accept": "Accept",
+        "reject": "Decline",
+        "open": "Open",
+        "saveAs": "Save as",
+        "cancel": "Cancel",
+        "retry": "Retry",
+        "copyImage": "Copy image"
+      },
+      "transfer": {
+        "waitingPeer": "Waiting for your partner",
+        "waitingAccept": "Waiting for you",
+        "sending": "Sending",
+        "receiving": "Receiving",
+        "done": "Done",
+        "failed": "Transfer failed",
+        "canceled": "Canceled"
       },
       "status": {
         "pending": "Waiting to send",
@@ -200,6 +226,7 @@
           "chatPassThrough": "Chat Pass Through",
           "notificationSound": "New Message Sound",
           "notificationVolume": "Sound Volume",
+          "attachmentLimit": "Attachment Size Limit (MB)",
           "chatHistory": "Chat History",
           "chatHistoryUsage": "Local Storage Usage",
           "chatHistoryProgress": "Cycle {epoch}: {current} / {limit} messages ({percent}%)",
@@ -241,6 +268,7 @@
           "chatPassThrough": "When enabled the chat window lets clicks through; opening the text box temporarily disables it.",
           "notificationSound": "Play a short sound when a message from your partner arrives.",
           "notificationVolume": "Sound volume; 0 means muted.",
+          "attachmentLimit": "Size limit for a single file. Each side uses its own limit, up to 1024 MB.",
           "chatHistory": "Chat history is stored on this device only; export it to keep a copy.",
           "historyLimit": "Used for the progress hint only — reaching the limit never deletes messages automatically.",
           "exportFormat": "JSON is best for backups, TXT / Markdown is easy to read.",

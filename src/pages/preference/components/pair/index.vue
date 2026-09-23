@@ -3,7 +3,7 @@ import { emit } from '@tauri-apps/api/event'
 import { save } from '@tauri-apps/plugin-dialog'
 import { useDebounceFn } from '@vueuse/core'
 import { Alert, Badge, Button, Flex, Input, InputNumber, message, Modal, Select, Slider, Switch, Tag } from 'antdv-next'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type { ExportFormat, HistoryStats } from '@/composables/usePair'
@@ -11,6 +11,7 @@ import type { ExportFormat, HistoryStats } from '@/composables/usePair'
 import ProListItem from '@/components/pro-list-item/index.vue'
 import ProList from '@/components/pro-list/index.vue'
 import {
+  ATTACHMENT_MAX_MB,
   pairConnect,
   pairDeleteSecret,
   pairDisconnect,
@@ -19,6 +20,7 @@ import {
   pairHistoryExport,
   pairHistoryStartNewEpoch,
   pairHistoryStats,
+  pairSetMaxAttachmentMb,
   pairSetSecret,
 } from '@/composables/usePair'
 import { chatExportFileName } from '@/composables/usePairChat'
@@ -84,6 +86,20 @@ async function refreshHistoryStats() {
 
 /** 对方发来的消息也要反映到「保存进度」上，聊天时 2 秒刷新一次就够了 */
 useTauriListen(LISTEN_KEY.PAIR_MESSAGE_RECEIVED, refreshHistoryStatsLater)
+
+/** §42：附件上限存在偏好里，改完同步给 Rust 侧（发送与接收用的是同一份限制） */
+function applyAttachmentLimit(mb: number) {
+  pairSetMaxAttachmentMb(mb).catch((reason) => {
+    message.error(String(reason))
+  })
+}
+
+/** 数字框每敲一下都会改值，别每次都 invoke */
+const applyAttachmentLimitLater = useDebounceFn(applyAttachmentLimit, 400)
+
+watch(() => pairStore.settings.chat.attachmentMaxMb, (value) => {
+  applyAttachmentLimitLater(Number(value))
+})
 
 function pickExportPath() {
   return save({
@@ -174,6 +190,9 @@ onMounted(async () => {
     })
 
   await refreshHistoryStats()
+
+  // 重启后 Rust 侧回到默认上限，把用户设置补回去
+  applyAttachmentLimit(pairStore.settings.chat.attachmentMaxMb)
 })
 
 const status = computed(() => {
@@ -534,6 +553,18 @@ const canPreviewSound = computed(
           {{ $t('pages.preference.pair.buttons.previewSound') }}
         </Button>
       </Flex>
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.attachmentLimit')"
+      :title="$t('pages.preference.pair.labels.attachmentLimit')"
+    >
+      <InputNumber
+        v-model:value="pairStore.settings.chat.attachmentMaxMb"
+        class="w-24"
+        :max="ATTACHMENT_MAX_MB.max"
+        :min="ATTACHMENT_MAX_MB.min"
+      />
     </ProListItem>
   </ProList>
 

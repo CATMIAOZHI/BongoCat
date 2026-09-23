@@ -1,20 +1,43 @@
 <script setup lang="ts">
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { open, save } from '@tauri-apps/plugin-dialog'
+import { copyFile, readFile, writeFile } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
+import { openPath } from '@tauri-apps/plugin-opener'
 import { useEventListener } from '@vueuse/core'
 import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import type { ChatMessage, MessageStatus } from '@/composables/usePair'
+import type { ChatMessage, MessageStatus, SendAttachmentOptions, TransferProgress } from '@/composables/usePair'
 
-import { MESSAGE_TEXT_LIMIT } from '@/composables/usePair'
+import { MESSAGE_TEXT_LIMIT, pairSendAttachment, pairSetMaxAttachmentMb, pairTransferPaths } from '@/composables/usePair'
 import { formatClock, usePairChat, visibleWindow } from '@/composables/usePairChat'
 import { usePairStatus } from '@/composables/usePairStatus'
+import {
+  acceptTransfer,
+  attachmentTitle,
+  canCancel,
+  cancelTransfer,
+  extensionOf,
+  formatFileSize,
+  isTransferActive,
+  localPathOf,
+  needsDecision,
+  pastedImageName,
+  previewableImage,
+  rejectTransfer,
+  retryTransfer,
+  transferKindOfFile,
+  transferLabelKey,
+  usePairTransfer,
+} from '@/composables/usePairTransfer'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
 import { usePairStore } from '@/stores/pair'
+import { join } from '@/utils/path'
 
 /**
  * 桌面聊天气泡窗口（§29 - §32）。
@@ -36,6 +59,7 @@ const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
 const { t } = useI18n()
 const { messages, loading, loadLatest, loadOlder, send, apply } = usePairChat()
+const { transferOf, apply: applyTransfer, reset: resetTransfers } = usePairTransfer()
 const listRef = useTemplateRef<HTMLElement>('list')
 const inputRef = useTemplateRef<HTMLTextAreaElement>('input')
 
@@ -46,7 +70,15 @@ const draft = ref('')
 const sending = ref(false)
 const sendError = ref('')
 const copiedId = ref('')
+const attaching = ref(false)
+const attachmentError = ref('')
+const saving = ref(false)
+/** 打开图片预览时的那条消息（§37） */
+const previewMessage = ref<ChatMessage>()
+/** 一闪而过的提示：复制图片、另存为的结果 */
+const notice = ref('')
 let copiedTimer: ReturnType<typeof setTimeout> | undefined
+let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
 usePairStatus()
 
@@ -227,6 +259,199 @@ async function handleCopy(message: ChatMessage) {
   }
 }
 
+/** 一闪而过的提示：贴在标题栏下面，两三秒后自己消失 */
+function flash(text: string) {
+  notice.value = text
+
+  if (noticeTimer) clearTimeout(noticeTimer)
+
+  noticeTimer = setTimeout(() => {
+    notice.value = ''
+  }, 2500)
+}
+
+/** 附件缩略图 / 语音播放用的 asset 地址；还没落到本机时返回空 */
+function assetSource(item: ChatMessage) {
+  const path = localPathOf(item.attachment)
+
+  return path ? convertFileSrc(path) : void 0
+}
+
+function openPreview(item: ChatMessage) {
+  if (!previewableImage(item)) return
+
+  previewMessage.value = item
+}
+
+function closePreview() {
+  previewMessage.value = void 0
+}
+
+const previewSource = computed(() => {
+  const item = previewMessage.value
+
+  return item ? assetSource(item) : void 0
+})
+
+/** 发一个附件：落库、显示、滚到最新（§38） */
+async function sendAttachment(options: SendAttachmentOptions) {
+  if (attaching.value) return
+
+  attaching.value = true
+  attachmentError.value = ''
+
+  try {
+    apply(await pairSendAttachment(options))
+
+    offset.value = 0
+
+    await scrollToNewest()
+  } catch (reason) {
+    attachmentError.value = String(reason)
+  } finally {
+    attaching.value = false
+  }
+}
+
+/**
+ * §37：粘贴进来的图片先落成临时文件，再交给附件管线。
+ *
+ * `stage` 会让 Rust 把临时文件收进附件缓存，所以临时目录里不会留下副本。
+ * 图片不当文本粘贴，否则输入框里会出现一串二进制乱码。
+ */
+async function handlePaste(event: ClipboardEvent) {
+  const data = event.clipboardData
+
+  if (!data) return
+
+  const item = Array.from(data.items).find(entry => entry.type.startsWith('image/'))
+  const blob = item?.getAsFile()
+
+  if (!blob) return
+
+  event.preventDefault()
+
+  // 上一张还在算校验值时不要再写一个临时文件，否则它会留在临时目录里没人管
+  if (attaching.value) {
+    flash(t('pages.chat.hints.attachmentBusy'))
+
+    return
+  }
+
+  try {
+    const paths = await pairTransferPaths()
+    const path = join(paths.tmp, pastedImageName(blob.type, Date.now()))
+
+    await writeFile(path, new Uint8Array(await blob.arrayBuffer()))
+    await sendAttachment({ path, kind: 'image', mime: blob.type, stage: true })
+  } catch (reason) {
+    attachmentError.value = String(reason)
+  }
+}
+
+/** 从对话框里挑一个文件发送 */
+async function pickAttachment() {
+  if (attaching.value) return
+
+  try {
+    const selected = await open({ directory: false, multiple: false })
+
+    if (typeof selected !== 'string') return
+
+    const name = selected.split(/[\\/]/).pop() ?? selected
+
+    await sendAttachment({ path: selected, kind: transferKindOfFile(name) })
+  } catch (reason) {
+    attachmentError.value = String(reason)
+  }
+}
+
+function handleAccept(item: ChatMessage) {
+  acceptTransfer(item.id).catch(reason => flash(String(reason)))
+}
+
+function handleReject(item: ChatMessage) {
+  rejectTransfer(item.id).catch(reason => flash(String(reason)))
+}
+
+function handleCancel(item: ChatMessage) {
+  cancelTransfer(item.id).catch(reason => flash(String(reason)))
+}
+
+/** §43：失败的附件只能由发出去的那一方重发 */
+function handleRetry(item: ChatMessage) {
+  retryTransfer(item.id).catch(reason => flash(String(reason)))
+}
+
+/** §42：打开必须由用户明确点，绝不自动执行 */
+function handleOpen(item: ChatMessage) {
+  const path = localPathOf(item.attachment)
+
+  if (!path) return
+
+  openPath(path).catch(reason => flash(String(reason)))
+}
+
+async function handleSaveAs(item: ChatMessage) {
+  const path = localPathOf(item.attachment)
+
+  if (!path || saving.value) return
+
+  saving.value = true
+
+  try {
+    const target = await save({ defaultPath: attachmentTitle(item.attachment) ?? 'attachment' })
+
+    if (target) {
+      await copyFile(path, target)
+      closePreview()
+    }
+  } catch (reason) {
+    flash(String(reason))
+  } finally {
+    saving.value = false
+  }
+}
+
+/**
+ * 交给剪贴板的内容：PNG 直接把路径给 Rust，其它格式先在 WebView 里转成 PNG。
+ *
+ * tauri 只编译了 `image-png`，`writeImage(路径)` 对 jpg / webp 这些会解码失败，
+ * 而收进来的图片多半不是 PNG。转不出来时原样返回，让错误照实报给用户。
+ */
+async function clipboardImageInput(item: ChatMessage) {
+  const path = previewableImage(item)
+
+  if (!path) return void 0
+
+  if (extensionOf(path) === 'png') return path
+
+  const bitmap = await createImageBitmap(new Blob([await readFile(path)]))
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height)
+  const context = canvas.getContext('2d')
+
+  if (!context) return path
+
+  context.drawImage(bitmap, 0, 0)
+  bitmap.close()
+
+  return new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer())
+}
+
+/** §37：把收到的图片放进剪贴板 */
+async function handleCopyImage(item: ChatMessage) {
+  try {
+    const input = await clipboardImageInput(item)
+
+    if (!input) return
+
+    await writeImage(input)
+    flash(t('pages.chat.hints.imageCopied'))
+  } catch (reason) {
+    flash(String(reason))
+  }
+}
+
 function handleHide() {
   pairStore.settings.chat.visible = false
 }
@@ -248,6 +473,9 @@ useTauriListen(LISTEN_KEY.CHAT_INPUT_TOGGLE, toggleInput)
 useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
   offset.value = 0
 
+  closePreview()
+  resetTransfers()
+
   void loadLatest().then(scrollToNewest).catch((reason) => {
     error(String(reason))
   })
@@ -263,11 +491,28 @@ useTauriListen<ChatMessage>(LISTEN_KEY.PAIR_MESSAGE_UPDATED, ({ payload }) => {
   apply(payload)
 })
 
+useTauriListen<TransferProgress>(LISTEN_KEY.PAIR_TRANSFER, ({ payload }) => {
+  applyTransfer(payload)
+})
+
 useEventListener('keydown', (event) => {
-  if (event.key === 'Escape') closeInput()
+  if (event.key !== 'Escape') return
+
+  if (previewMessage.value) {
+    closePreview()
+
+    return
+  }
+
+  closeInput()
 })
 
 onMounted(async () => {
+  // §42：附件上限存在偏好里，Rust 侧重启后是默认值，这里把用户设置补回去
+  pairSetMaxAttachmentMb(pairStore.settings.chat.attachmentMaxMb).catch((reason) => {
+    error(String(reason))
+  })
+
   try {
     await loadLatest()
     await scrollToNewest()
@@ -278,7 +523,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="size-screen flex flex-col overflow-hidden bg-black/45 text-white rounded-2xl">
+  <div class="relative size-screen flex flex-col overflow-hidden bg-black/45 text-white rounded-2xl">
     <header
       class="flex shrink-0 cursor-move items-center gap-1.5 px-2.5 py-1.5"
       @mousedown="handleMouseDown"
@@ -302,6 +547,13 @@ onMounted(async () => {
         @click="handleHide"
       />
     </header>
+
+    <p
+      v-if="notice"
+      class="shrink-0 break-all px-2.5 pb-1 text-[9px] color-white/70"
+    >
+      {{ notice }}
+    </p>
 
     <div
       ref="list"
@@ -334,12 +586,147 @@ onMounted(async () => {
             ? 'bg-[#1677ff] rounded-br-sm'
             : 'bg-white/15 rounded-bl-sm'"
         >
-          <p class="whitespace-pre-wrap break-all">
+          <template v-if="item.attachment">
+            <button
+              v-if="previewableImage(item)"
+              class="block cursor-pointer"
+              :title="$t('pages.chat.hints.preview')"
+              @click="openPreview(item)"
+            >
+              <img
+                alt=""
+                class="max-h-40 max-w-full object-cover rounded-md"
+                :src="assetSource(item)"
+              >
+            </button>
+
+            <template v-else>
+              <div class="flex items-center gap-1.5">
+                <span
+                  class="shrink-0 text-[14px]"
+                  :class="item.kind === 'voice' ? 'i-lucide:mic' : 'i-lucide:file'"
+                />
+
+                <span class="min-w-0 truncate">
+                  {{ attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment') }}
+                </span>
+              </div>
+
+              <audio
+                v-if="item.kind === 'voice' && assetSource(item)"
+                class="mt-1 max-w-full w-44"
+                controls
+                :src="assetSource(item)"
+              />
+            </template>
+
+            <div class="mt-1 flex items-center gap-1 text-[9px] color-white/60">
+              <span>{{ formatFileSize(item.attachment.size ?? 0) }}</span>
+            </div>
+
+            <!-- 传输进度（§38）：还没结束才显示 -->
+            <template v-if="transferOf(item.id)">
+              <div class="mt-1 h-1 w-full overflow-hidden bg-white/20 rounded-full">
+                <div
+                  class="h-full bg-white/80"
+                  :style="{ width: `${transferOf(item.id)!.percent}%` }"
+                />
+              </div>
+
+              <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-white/70">
+                <span>{{ $t(`pages.chat.transfer.${transferLabelKey(transferOf(item.id)!)}`) }}</span>
+
+                <span v-if="isTransferActive(transferOf(item.id)!.state)">
+                  {{ formatFileSize(transferOf(item.id)!.transferred) }}
+                  /
+                  {{ formatFileSize(transferOf(item.id)!.size) }}
+                </span>
+              </div>
+
+              <p
+                v-if="transferOf(item.id)!.message"
+                class="mt-0.5 break-all text-[9px]"
+                :class="transferOf(item.id)!.state === 'failed' ? 'color-red-3' : 'color-white/60'"
+              >
+                {{ transferOf(item.id)!.message }}
+              </p>
+
+              <p
+                v-if="item.status === 'failed' && item.direction === 'incoming'"
+                class="mt-0.5 text-[9px] color-white/60"
+              >
+                {{ $t('pages.chat.hints.askPeerResend') }}
+              </p>
+            </template>
+
+            <!-- 接收方：大文件先问一句（§42） -->
+            <div
+              v-if="needsDecision(transferOf(item.id))"
+              class="mt-1 flex items-center gap-2"
+            >
+              <button
+                class="cursor-pointer text-[10px] underline hover:color-white"
+                @click="handleAccept(item)"
+              >
+                {{ $t('pages.chat.buttons.accept') }}
+              </button>
+
+              <button
+                class="cursor-pointer text-[10px] underline hover:color-white"
+                @click="handleReject(item)"
+              >
+                {{ $t('pages.chat.buttons.reject') }}
+              </button>
+            </div>
+
+            <div
+              v-if="localPathOf(item.attachment) || canCancel(transferOf(item.id)) || (item.status === 'failed' && item.direction === 'outgoing')"
+              class="mt-1 flex items-center gap-2"
+            >
+              <button
+                v-if="item.kind !== 'image' && localPathOf(item.attachment)"
+                class="cursor-pointer text-[10px] underline hover:color-white"
+                @click="handleOpen(item)"
+              >
+                {{ $t('pages.chat.buttons.open') }}
+              </button>
+
+              <button
+                v-if="localPathOf(item.attachment)"
+                class="cursor-pointer text-[10px] underline hover:color-white"
+                @click="handleSaveAs(item)"
+              >
+                {{ $t('pages.chat.buttons.saveAs') }}
+              </button>
+
+              <button
+                v-if="canCancel(transferOf(item.id))"
+                class="cursor-pointer text-[10px] underline hover:color-white"
+                @click="handleCancel(item)"
+              >
+                {{ $t('pages.chat.buttons.cancel') }}
+              </button>
+
+              <button
+                v-if="item.status === 'failed' && item.direction === 'outgoing'"
+                class="cursor-pointer text-[10px] underline hover:color-white"
+                @click="handleRetry(item)"
+              >
+                {{ $t('pages.chat.buttons.retry') }}
+              </button>
+            </div>
+          </template>
+
+          <p
+            v-else
+            class="whitespace-pre-wrap break-all"
+          >
             {{ item.text }}
           </p>
 
           <div class="mt-0.5 flex items-center justify-end gap-1 text-[9px] color-white/55">
             <button
+              v-if="item.text"
               class="shrink-0 cursor-pointer text-[10px] opacity-0 transition group-hover:opacity-100 hover:color-white"
               :class="copiedId === item.id ? 'i-lucide:check' : 'i-lucide:copy'"
               :title="$t('pages.chat.hints.copy')"
@@ -370,10 +757,19 @@ onMounted(async () => {
         :placeholder="$t('pages.chat.placeholders.input')"
         @keydown.enter.exact="handleSendKey"
         @keydown.esc.prevent="closeInput"
+        @paste="handlePaste"
       />
 
       <div class="mt-1 flex items-center justify-between gap-2 text-[9px] color-white/45">
-        <span class="min-w-0 truncate">{{ $t('pages.chat.hints.inputKeys') }}</span>
+        <div class="min-w-0 flex items-center gap-1.5">
+          <button
+            class="i-lucide:paperclip shrink-0 cursor-pointer text-[11px] hover:color-white"
+            :title="$t('pages.chat.hints.pickAttachment')"
+            @click="pickAttachment"
+          />
+
+          <span class="truncate">{{ $t('pages.chat.hints.inputKeys') }}</span>
+        </div>
 
         <span
           v-if="showingLimit"
@@ -382,6 +778,20 @@ onMounted(async () => {
           {{ $t('pages.chat.hints.textLimit', { bytes: draftBytes }) }}
         </span>
       </div>
+
+      <p
+        v-if="attaching"
+        class="mt-1 text-[9px] color-white/60"
+      >
+        {{ $t('pages.chat.hints.sendingAttachment') }}
+      </p>
+
+      <p
+        v-if="attachmentError"
+        class="mt-1 break-all text-[9px] color-red-3"
+      >
+        {{ attachmentError }}
+      </p>
 
       <p
         v-if="sendError"
@@ -401,6 +811,52 @@ onMounted(async () => {
       >
         {{ footerHint }}
       </button>
+    </div>
+
+    <!-- 图片预览（§37）：复制图片 / 另存为 -->
+    <div
+      v-if="previewMessage"
+      class="absolute inset-0 z-50 flex flex-col bg-black/85 rounded-2xl"
+    >
+      <header
+        class="flex shrink-0 cursor-move items-center gap-1.5 px-2.5 py-1.5"
+        @mousedown="handleMouseDown"
+      >
+        <span class="min-w-0 flex-1 truncate text-[11px] color-white/55">
+          {{ attachmentTitle(previewMessage.attachment) || $t('pages.chat.hints.attachment') }}
+        </span>
+
+        <button
+          class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-white/60 hover:color-white"
+          :title="$t('pages.chat.hints.close')"
+          @click="closePreview"
+        />
+      </header>
+
+      <div class="min-h-0 flex flex-1 items-center justify-center p-2">
+        <img
+          alt=""
+          class="max-h-full max-w-full object-contain"
+          :src="previewSource"
+        >
+      </div>
+
+      <div class="flex shrink-0 items-center justify-center gap-3 px-2.5 pb-2 text-[10px]">
+        <button
+          class="cursor-pointer underline hover:color-white"
+          @click="handleCopyImage(previewMessage)"
+        >
+          {{ $t('pages.chat.buttons.copyImage') }}
+        </button>
+
+        <button
+          class="cursor-pointer underline hover:color-white"
+          :disabled="saving"
+          @click="handleSaveAs(previewMessage)"
+        >
+          {{ $t('pages.chat.buttons.saveAs') }}
+        </button>
+      </div>
     </div>
   </div>
 </template>

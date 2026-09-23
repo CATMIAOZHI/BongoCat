@@ -19,6 +19,7 @@ export const LISTEN_KEY = {
   PAIR_MESSAGE: 'pair-message',
   PAIR_MESSAGE_RECEIVED: 'pair-message-received',
   PAIR_MESSAGE_UPDATED: 'pair-message-updated',
+  PAIR_TRANSFER: 'pair-transfer',
   PAIR_ERROR: 'pair-error',
   /** 前端之间的应用级事件：偏好窗口按下「聊天输入」快捷键后通知聊天窗口 */
   CHAT_INPUT_TOGGLE: 'chat-input-toggle',
@@ -47,6 +48,13 @@ export const INVOKE_KEY = {
   PAIR_HISTORY_STATS: 'pair_history_stats',
   PAIR_HISTORY_EXPORT: 'pair_history_export',
   PAIR_HISTORY_START_NEW_EPOCH: 'pair_history_start_new_epoch',
+  PAIR_TRANSFER_PATHS: 'pair_transfer_paths',
+  PAIR_SET_MAX_ATTACHMENT_MB: 'pair_set_max_attachment_mb',
+  PAIR_SEND_ATTACHMENT: 'pair_send_attachment',
+  PAIR_TRANSFER_ACCEPT: 'pair_transfer_accept',
+  PAIR_TRANSFER_REJECT: 'pair_transfer_reject',
+  PAIR_TRANSFER_CANCEL: 'pair_transfer_cancel',
+  PAIR_ATTACHMENT_RETRY: 'pair_attachment_retry',
 }
 
 export const LANGUAGE = {

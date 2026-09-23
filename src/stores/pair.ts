@@ -3,6 +3,8 @@ import { reactive, ref } from 'vue'
 
 import type { PresenceState } from '@/composables/usePair'
 
+import { ATTACHMENT_MAX_MB } from '@/composables/usePair'
+
 export type PairConnectionState
   = | 'disabled'
     | 'disconnected'
@@ -100,6 +102,8 @@ export interface PairSettings {
     historyMaxMessages: number
     /** 开始新的记录周期时，是否删除旧周期的消息（默认保留） */
     deleteOldOnReset: boolean
+    /** §42 单个附件的上限（MB），同时约束发送与接收 */
+    attachmentMaxMb: number
   }
 
   privacy: {
@@ -158,6 +162,7 @@ export const usePairStore = defineStore('pair', () => {
       notificationVolume: 50,
       historyMaxMessages: 50_000,
       deleteOldOnReset: false,
+      attachmentMaxMb: ATTACHMENT_MAX_MB.default,
     },
     privacy: {
       shareTypingActivity: true,

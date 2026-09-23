@@ -31,10 +31,36 @@
         "inputHint": "用「聊天输入」快捷键打开输入框",
         "inputKeys": "Enter 发送 · Shift+Enter 换行 · Esc 关闭",
         "passThrough": "聊天窗口开着穿透，点击会点到桌面",
-        "textLimit": "已输入 {bytes} / 8192 字节"
+        "textLimit": "已输入 {bytes} / 8192 字节",
+        "attachment": "附件",
+        "preview": "查看这张图片",
+        "close": "关闭",
+        "pickAttachment": "发送文件",
+        "sendingAttachment": "正在发送附件...",
+        "imageCopied": "图片已复制到剪贴板",
+        "askPeerResend": "需要对方重新发送",
+        "attachmentBusy": "上一张还在发送，稍等一下再试"
       },
       "placeholders": {
         "input": "输入消息..."
+      },
+      "buttons": {
+        "accept": "接收",
+        "reject": "拒绝",
+        "open": "打开",
+        "saveAs": "另存为",
+        "cancel": "取消",
+        "retry": "重试",
+        "copyImage": "复制图片"
+      },
+      "transfer": {
+        "waitingPeer": "等待对方接收",
+        "waitingAccept": "等待你确认",
+        "sending": "发送中",
+        "receiving": "接收中",
+        "done": "已完成",
+        "failed": "传输失败",
+        "canceled": "已取消"
       },
       "status": {
         "pending": "等待发送",
@@ -200,6 +226,7 @@
           "chatPassThrough": "聊天窗口穿透",
           "notificationSound": "新消息提示音",
           "notificationVolume": "提示音量",
+          "attachmentLimit": "附件大小上限（MB）",
           "chatHistory": "聊天记录",
           "chatHistoryUsage": "本地保存进度",
           "chatHistoryProgress": "第 {epoch} 个记录周期：{current} / {limit} 条（{percent}%）",
@@ -241,6 +268,7 @@
           "chatPassThrough": "开启后聊天窗口不挡鼠标；打开输入框时会临时关闭。",
           "notificationSound": "收到对方消息时播一声提示音。",
           "notificationVolume": "提示音音量，0 表示静音。",
+          "attachmentLimit": "单个文件的上限，双方都按自己的设置限制收发；最大 1024 MB。",
           "chatHistory": "聊天记录只保存在本机，导出后可以自己留存。",
           "historyLimit": "只用来提示进度，达到上限也不会自动删除消息。",
           "exportFormat": "JSON 适合备份，TXT / Markdown 适合直接看。",
