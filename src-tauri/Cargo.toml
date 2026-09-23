@@ -65,6 +65,9 @@ tauri-nspanel.workspace = true
 [target."cfg(windows)".dependencies]
 webrtc.workspace = true
 async-trait.workspace = true
+# `DataChannel::send` 收的是 `BytesMut`。这个 crate 本来就在依赖树里（tungstenite），
+# 只是之前没有直接用到。
+bytes = "1"
 
 [features]
 cargo-clippy = []

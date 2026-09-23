@@ -24,11 +24,13 @@ use super::history::{
     ChatMessage, MESSAGE_TEXT_LIMIT, MessageDirection, MessageKind, MessageStatus, NewAttachment,
     NewMessage, PairHistory,
 };
+use super::link;
 use super::protocol::{
     AppEnvelope, ChatAckPayload, ChatTextPayload, FrameHeader, FrameKind, InputStats,
-    MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PetSnapshot, PresencePayload, PresenceState,
-    RecentMessageIds, RelayLimits, ServerFrame, TransferIdPayload, TransferKind,
-    TransferOfferPayload, TransferRejectPayload, TransferVerifiedPayload, message_type, now_millis,
+    MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PairSignalPayload, PetSnapshot, PresencePayload,
+    PresenceState, RecentMessageIds, RelayConfig, RelayLimits, ServerFrame, TransferIdPayload,
+    TransferKind, TransferOfferPayload, TransferRejectPayload, TransferVerifiedPayload,
+    message_type, now_millis,
 };
 use super::secret;
 use super::transfer::{
@@ -109,6 +111,21 @@ pub struct PairStatus {
     pub device_id: String,
     pub relay_url: Option<String>,
     pub last_error: Option<String>,
+    /// P2P 这条腿的状态（R21 / R28）。**只影响显示与 Phase 8c 的切换决策**：中继上的
+    /// 功能（聊天、附件、语音、信令、重连）与它无关，所以它失败时用户不该看到任何降级。
+    pub p2p: P2pState,
+}
+
+/// P2P 这条腿的状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum P2pState {
+    /// 没在协商：对端没声明支持 P2P，或者这一轮还没开始
+    Off,
+    /// 正在协商 / ICE 打洞（10~30 秒，对用户不可见）
+    Connecting,
+    /// DataChannel 可用，可覆盖流可以切过去
+    Connected,
 }
 
 /// 事件出口：真实运行时是 Tauri 的 `AppHandle`，测试里是记录器
@@ -308,6 +325,7 @@ impl PairManager {
                 device_id,
                 relay_url: None,
                 last_error: None,
+                p2p: P2pState::Off,
             }),
             sender: Mutex::new(None),
             pending: Mutex::new(PendingReplaceable::default()),
@@ -418,6 +436,9 @@ impl PairManager {
             status.state = PairConnectionState::Connecting;
             status.relay_url = Some(config.relay_url.clone());
             status.last_error = None;
+            // 新会话还没起腿：上一轮的 `Connected` 必须立刻消失，否则「立即连接」
+            // 之后的十几秒里偏好页会显示「正在连接」+「已直连」
+            status.p2p = P2pState::Off;
         });
 
         tauri::async_runtime::spawn(async move {
@@ -438,6 +459,8 @@ impl PairManager {
             status.peer_name = None;
             status.remote_presence = None;
             status.remote_stats = None;
+            // 会话没了，P2P 那条腿也跟着没了：不复位的话 UI 会一直显示「已直连」
+            status.p2p = P2pState::Off;
         });
     }
 
@@ -774,6 +797,7 @@ impl PairManager {
             status.remote_presence = None;
             status.remote_stats = None;
             status.last_error = Some(message.clone());
+            status.p2p = P2pState::Off;
         });
 
         self.sink.emit(EVENT_ERROR, json!({ "message": message }));
@@ -1172,6 +1196,9 @@ async fn run_session(
         manager.publish(generation, |status| {
             status.state = PairConnectionState::Reconnecting;
             status.peer_online = false;
+            // 腿已经随 `live` 返回被 Drop 掉了，而退避（最长 30 秒）+ 连接与 welcome
+            // 超时（15 + 10 秒）里不会再有任何 P2P 事件：不复位就会「重连中」+「已直连」
+            status.p2p = P2pState::Off;
         });
 
         // 退避期间仍然接收命令：排队，或在用户手动断开时立即退出
@@ -1232,7 +1259,7 @@ async fn read_welcome<S, E>(
     stream: &mut S,
     manager: &Arc<PairManager>,
     generation: u64,
-) -> Result<RelayLimits, PairFailure>
+) -> Result<RelayConfig, PairFailure>
 where
     S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
     E: std::fmt::Display,
@@ -1259,8 +1286,8 @@ where
 
         match message {
             Message::Text(text) => {
-                if let Some(limits) = handle_server_frame(manager, generation, text.as_str())? {
-                    return Ok(limits);
+                if let Some(config) = handle_server_frame(manager, generation, text.as_str())? {
+                    return Ok(config);
                 }
             }
             Message::Close(frame) => {
@@ -1287,11 +1314,12 @@ where
 /// `Message::Close`、入站 `Message::Close` 翻成 `describe_close`、流结束
 /// （`stream.next()` 返回 `None`）也按 `describe_close(None)` 收尾、其余控制帧
 /// 落到 `Ok(_)` 分支忽略——**入站 `Message::Ping` 也走这一支**（tungstenite 0.30
-/// 会把入站 Ping 交给调用方，Pong 才是它内部排队的）。还有一处不在这个 `match`
-/// 里：ticker 发的 WS `Message::Ping`。它**保持不动**——R28 推翻了 R21 的初版写法：
-/// 中继自己会回 Pong（`server-relay/src/relay.rs:322-324`），与对端在线与否无关；
-/// 换成对端回 pong 会让「对端离线」变成「心跳超时」。DC 那条腿将来有自己独立的
-/// 探针（应用级 `pair.ping`），两条腿的标志互不共用。
+/// 会把入站 Ping 交给调用方，Pong 才是它内部排队的）。不在这个 `match` 里的还有两处：
+/// 上面 `read_welcome` 里那套一模一样的（`Message::Text` / 入站 `Message::Close` /
+/// 流结束），以及 ticker 发的 WS `Message::Ping`。ticker 那处**保持不动**——R28 推翻了
+/// R21 的初版写法：中继自己会回 Pong（`server-relay/src/relay.rs:322-324`），与对端
+/// 在线与否无关；换成对端回 pong 会让「对端离线」变成「心跳超时」。DC 那条腿有自己
+/// 独立的探针（应用级 `pair.ping`，8b 已落地），两条腿的标志互不共用。
 async fn live<T, E>(
     manager: &Arc<PairManager>,
     generation: u64,
@@ -1310,12 +1338,12 @@ where
     // 附件分片另有一层额度（R18）：两套都放行才发一块
     let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
 
-    // R20：先读掉 `server.welcome` 再开始补发（额度就在它里面）
-    let limits = match read_welcome(&mut stream, manager, generation).await {
-        Ok(limits) => limits,
+    // R20：先读掉 `server.welcome` 再开始补发（额度与 ICE 广告都在它里面）
+    let config = match read_welcome(&mut stream, manager, generation).await {
+        Ok(config) => config,
         Err(error) => return Outcome::Lost(error),
     };
-    let outbound = limits.outbound();
+    let outbound = config.limits.outbound();
 
     pacer.retune(outbound.frames_per_second, outbound.frames_burst);
     chunk_pacer.retune(outbound.chunks_per_second, outbound.chunks_burst);
@@ -1332,8 +1360,25 @@ where
 
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // R21：P2P 那条腿。能力门控只看对端——腿一起来就先发 hello，只有收到对端的 hello
+    // 才会开始 ICE。信令永远钉在中继上，所以这条腿只做出站 sink 与一条额外的入站分支。
+    let (link, link_events) =
+        link::P2pLink::spawn(manager.device_id().to_string(), config.ice_servers);
+    // `None` = 这条腿结束了，那一支要停掉（`recv()` 会立刻返回 `None`，否则是忙循环）
+    let mut link_events = Some(link_events);
+
+    // 每次（重）连都从 `Off` 开始：上一轮留下的 `Connected` 在腿重新协商成功之前都是假的
+    manager.publish(generation, |status| status.p2p = P2pState::Off);
+
+    // 中继腿的探针：永远是 WS Ping，中继自己回 Pong（R28）。它只由中继入站清除。
     let mut awaiting_pong = false;
     let mut last_inbound = tokio::time::Instant::now();
+
+    // DC 腿的探针：应用级 `pair.ping`，**独立标志**（R28）。共用一个标志会造出
+    // 「中继静默半死、却被 DC 的 pet-state 流量掩盖」的死角。
+    let mut dc_open = false;
+    let mut dc_awaiting_pong = false;
+    let mut dc_last_inbound = tokio::time::Instant::now();
 
     loop {
         // 附件分片走单独一条分支：每次最多发一块，且必须拿到 pacing 令牌（R18）。
@@ -1502,7 +1547,7 @@ where
                             });
                         }
 
-                        match handle_binary(manager, generation, state, &bytes) {
+                        match handle_binary(manager, generation, state, &bytes, Some(&link)) {
                             Err(error) => manager.emit_error(generation, error),
                             Ok(Some((kind, reply))) => {
                                 match state.queue(kind, &reply, false) {
@@ -1533,14 +1578,17 @@ where
                             Err(error) => return Outcome::Lost(error),
                             // R20：正常路径上 welcome 已经被 `read_welcome` 读掉并应用过；
                             // 这里兜住「中继再广告一次额度」的情况（重设是幂等的）
-                            Ok(Some(limits)) => {
-                                let outbound = limits.outbound();
+                            Ok(Some(config)) => {
+                                let outbound = config.limits.outbound();
 
                                 pacer.retune(outbound.frames_per_second, outbound.frames_burst);
                                 chunk_pacer.retune(
                                     outbound.chunks_per_second,
                                     outbound.chunks_burst,
                                 );
+
+                                // `iceServers` 只在会话建立时读一次：协商用的 STUN/TURN 中途
+                                // 换掉会让两侧的候选对不上，要换得等下一轮协商
                             }
                             Ok(None) => {}
                         }
@@ -1554,6 +1602,8 @@ where
                 }
             },
             _ = ticker.tick() => {
+                // 中继腿的探针**保持不动**：WS Ping 由中继自己回 Pong，与对端在线与否
+                // 无关（R28 推翻了 R21 的初版写法）。超时就是整条会话的失败。
                 if awaiting_pong && last_inbound.elapsed() >= heartbeat * 2 {
                     return Outcome::Lost(PairFailure {
                         message: "心跳超时".into(),
@@ -1568,6 +1618,108 @@ where
                         message: error,
                         fatal: false,
                     });
+                }
+
+                // DC 腿的探针：应用级 `pair.ping`、**独立标志**（R28）。它**不过中继的
+                // pacer**——单一 pacer 会把 DC 上的可覆盖流压到中继的 20 帧/秒，和 60Hz
+                // 的目标直接冲突（R23）。
+                if dc_open {
+                    if dc_awaiting_pong && dc_last_inbound.elapsed() >= heartbeat * 2 {
+                        // 只把这条腿判为不可用（Phase 8c 起在这里回落中继）。**绝不返回
+                        // `Outcome::Lost`**：那会让 `run_session` 重连整条会话并
+                        // `abort_transfers`，砍掉正在传的附件（R21 修正 3）。
+                        dc_open = false;
+                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                    } else {
+                        match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
+                        {
+                            Ok(frame) => {
+                                dc_awaiting_pong = true;
+                                link.send(frame);
+                            }
+                            Err(error) => manager.emit_error(generation, error),
+                        }
+                    }
+                }
+            },
+            event = async {
+                match link_events.as_mut() {
+                    Some(events) => events.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    // 这条腿结束了（驱动循环只在会话收摊时退出）。停掉这一支——通道关闭
+                    // 之后 `next()` 会立刻返回 `None`，不处理就是忙循环。
+                    None => link_events = None,
+                    Some(link::P2pEvent::Signal(signal)) => {
+                        // 信令走 kind 8（R21）。**不进 `state.reliable`**：那条队列上限 512，
+                        // 队满时会挤掉最旧的聊天消息并把它退回 `pending`，而信令一轮只有
+                        // 个位数帧，没必要让聊天替它承担这个风险。
+                        if let Ok(payload) = serde_json::to_value(&signal) {
+                            match build_frame(
+                                manager,
+                                state,
+                                FrameKind::Ping,
+                                message_type::SIGNAL,
+                                payload,
+                            ) {
+                                Ok(frame) => {
+                                    pacer.acquire().await;
+
+                                    if let Err(error) =
+                                        send_frame(&mut sink, Message::Binary(frame.into())).await
+                                    {
+                                        return Outcome::Lost(PairFailure {
+                                            message: error,
+                                            fatal: false,
+                                        });
+                                    }
+                                }
+                                Err(error) => manager.emit_error(generation, error),
+                            }
+                        }
+                    }
+                    Some(link::P2pEvent::Negotiating) => {
+                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                    }
+                    Some(link::P2pEvent::ChannelOpen) => {
+                        dc_open = true;
+                        dc_awaiting_pong = false;
+                        dc_last_inbound = tokio::time::Instant::now();
+
+                        manager.publish(generation, |status| status.p2p = P2pState::Connected);
+                    }
+                    Some(link::P2pEvent::ChannelClosed) => {
+                        dc_open = false;
+
+                        // 腿会自己重试，所以是「正在协商」而不是「关闭」
+                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                    }
+                    Some(link::P2pEvent::Inbound(bytes)) => {
+                        // DC 腿的入站（§4.2 / R28）：只清 DC 腿**自己的**标志。**不要**动
+                        // 中继腿的 `awaiting_pong` / `last_inbound`——让 DC 的流量去清中继
+                        // 腿的标志，正是「中继静默半死被掩盖」的成因。
+                        dc_last_inbound = tokio::time::Instant::now();
+                        dc_awaiting_pong = false;
+
+                        if bytes.len() > MAX_BINARY_FRAME_SIZE {
+                            // 超限只丢这一帧：DC 是我们自己的通道，不必像中继那样断线
+                            manager.emit_error(generation, "收到超过上限的帧".into());
+                        } else {
+                            match handle_binary(manager, generation, state, &bytes, Some(&link)) {
+                                Err(error) => manager.emit_error(generation, error),
+                                Ok(Some((kind, reply))) => {
+                                    // 请求从 DC 来、回复也从 DC 回去，否则探针的 pong 会绕
+                                    // 中继，「DC 腿的探针」就名不副实了
+                                    if let Ok(frame) = state.encode(kind, &reply) {
+                                        link.send(frame);
+                                    }
+                                }
+                                Ok(None) => {}
+                            }
+                        }
+                    }
                 }
             },
         }
@@ -2322,6 +2474,22 @@ where
     }
 }
 
+/// 组一条**不走可靠队列**的应用帧（心跳与 P2P 信令）。
+///
+/// 不塞进 `state.reliable` 的理由：那条队列上限 512，队满时会挤掉最旧的聊天消息并把
+/// 它退回 `pending`（`retry_dropped_chat`）。心跳与信令都是低流量，也不该扰动聊天。
+fn build_frame(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    kind: FrameKind,
+    message_type: &str,
+    payload: Value,
+) -> Result<Vec<u8>, String> {
+    let envelope = AppEnvelope::new(message_type, manager.next_envelope_seq(), payload);
+
+    state.encode(kind, &envelope)
+}
+
 type Reply = Option<(FrameKind, AppEnvelope)>;
 
 fn handle_binary(
@@ -2329,6 +2497,7 @@ fn handle_binary(
     generation: u64,
     state: &mut SessionState,
     bytes: &[u8],
+    link: Option<&link::P2pLink>,
 ) -> Result<Reply, String> {
     // 附件分片用 per-transfer 密钥（R17），所以先按明文帧头里的 kind / transferId 选密钥。
     // 帧头是 AEAD 的 associated data，选错密钥只会解密失败，不会绕过认证。
@@ -2371,6 +2540,22 @@ fn handle_binary(
                 envelope.payload.clone(),
             ),
         ))),
+        message_type::SIGNAL => {
+            // R21：P2P 信令交给那条腿，不进 UI、也不产生回复。没有腿（非 Windows 目标）
+            // 或载荷畸形就丢掉——对端本来就不可信。
+            let Some(link) = link else {
+                return Ok(None);
+            };
+
+            let Ok(signal) = serde_json::from_value::<PairSignalPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            link.handle_signal(signal);
+
+            Ok(None)
+        }
         message_type::PRESENCE => {
             // 载荷不合法就丢掉：对端本来就不可信，不能让一条畸形消息把 UI 推进错误状态
             let Ok(payload) = serde_json::from_value::<PresencePayload>(envelope.payload.clone())
@@ -2638,7 +2823,7 @@ fn handle_server_frame(
     manager: &Arc<PairManager>,
     generation: u64,
     text: &str,
-) -> Result<Option<RelayLimits>, PairFailure> {
+) -> Result<Option<RelayConfig>, PairFailure> {
     // R18：text 只用于服务端控制帧，未知或畸形的控制帧按忽略处理。
     // 当成致命错误会让我们在中继新增一条控制帧时反复断线重连。
     let Ok(frame) = serde_json::from_str::<ServerFrame>(text) else {
@@ -2652,6 +2837,7 @@ fn handle_server_frame(
             protocol,
             peer_online,
             limits,
+            ice_servers,
         } => {
             if protocol != PROTOCOL_VERSION {
                 return Err(PairFailure {
@@ -2662,9 +2848,13 @@ fn handle_server_frame(
 
             publish_peer(manager, generation, peer_online);
 
-            // 中继没广告额度（旧中继）时就用 CF 的缺省推导，语义上「这次连接的有效额度」
-            // 永远是确定的，会话层只管照着重设
-            Ok(Some(limits.unwrap_or_else(RelayLimits::cloudflare)))
+            // 中继没广告额度（旧中继）时就用 CF 的缺省推导，语义上「这次连接的有效配置」
+            // 永远是确定的，会话层只管照着用
+            Ok(Some(RelayConfig {
+                limits: limits.unwrap_or_else(RelayLimits::cloudflare),
+                // R21：没广告就是「没有 STUN/TURN，只有 host candidate」，这是隐私缺省
+                ice_servers,
+            }))
         }
         ServerFrame::Peer { online, device_id } => {
             if device_id == manager.device_id() {
@@ -2777,7 +2967,7 @@ mod tests {
             .seal(&FrameHeader::new(kind, 0), &envelope.to_bytes().unwrap())
             .unwrap();
 
-        handle_binary(manager, 0, state, &frame)
+        handle_binary(manager, 0, state, &frame, None)
     }
 
     #[test]
@@ -3816,7 +4006,7 @@ mod tests {
             .seal(&header, bytes)
             .unwrap();
 
-        handle_binary(manager, 0, state, &frame)
+        handle_binary(manager, 0, state, &frame, None)
     }
 
     fn count_part_files(root: &std::path::Path) -> usize {

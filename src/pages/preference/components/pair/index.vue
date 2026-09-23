@@ -208,6 +208,18 @@ const status = computed(() => {
   return { key, color } as { key: ReturnType<typeof pairStatusKey>, color: 'success' | 'warning' | 'processing' | 'error' | 'default' }
 })
 
+/** P2P 这条腿只做显示（R28）：它掉了不影响聊天、附件、语音，所以这里没有按钮 */
+const p2pStatus = computed(() => {
+  const key = pairStore.runtime.p2p
+
+  const color = {
+    connected: 'success',
+    connecting: 'processing',
+  }[key] ?? 'default'
+
+  return { key, color } as { key: typeof key, color: 'success' | 'processing' | 'default' }
+})
+
 const modelOptions = computed(() => {
   return modelStore.models.map((model) => {
     const current = model.id === modelStore.currentModel?.id
@@ -411,6 +423,17 @@ const canPreviewSound = computed(
           {{ $t('pages.preference.pair.buttons.disconnect') }}
         </Button>
       </Flex>
+    </ProListItem>
+
+    <ProListItem
+      v-if="pairStore.settings.enabled"
+      :description="$t('pages.preference.pair.p2p.hint')"
+      :title="$t('pages.preference.pair.p2p.label')"
+    >
+      <Badge
+        :status="p2pStatus.color"
+        :text="$t(`pages.preference.pair.p2p.${p2pStatus.key}`)"
+      />
     </ProListItem>
 
     <ProListItem

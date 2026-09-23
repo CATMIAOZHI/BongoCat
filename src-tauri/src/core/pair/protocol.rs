@@ -105,6 +105,8 @@ impl FrameHeader {
 pub mod message_type {
     pub const PING: &str = "pair.ping";
     pub const PONG: &str = "pair.pong";
+    /// P2P 信令（R21）。走 `FrameKind::Ping`(8)，靠 `type` 与 `pair.ping` 区分。
+    pub const SIGNAL: &str = "pair.signal";
     pub const PRESENCE: &str = "pair.presence";
     pub const PET_STATE: &str = "pair.pet-state";
     pub const STATS: &str = "pair.stats";
@@ -116,6 +118,50 @@ pub mod message_type {
     pub const TRANSFER_COMPLETE: &str = "transfer.complete";
     pub const TRANSFER_VERIFIED: &str = "transfer.verified";
     pub const TRANSFER_CANCEL: &str = "transfer.cancel";
+}
+
+/// P2P 信令的版本（R21）。不认识这个版本就不协商——将来改信令形状时靠它挡住。
+pub const SIGNAL_VERSION: u8 = 1;
+
+/// `pair.signal` 的载荷（R21）。
+///
+/// 走 `FrameKind::Ping`(8)：中继会校验帧 kind，未知值直接 `close 1008`，而 kind 8
+/// 早就在它的已知集合里，所以旧中继照样原样转发。四种消息：
+///
+/// - `hello`：双方各自宣告「我支持 P2P」。**能力门控只看对端**——没收到对端的 hello
+///   就不发起 ICE，否则对面是旧客户端时会白等一轮超时。里面的 `deviceId` 还兼作
+///   glare 的裁决：**字典序小的一方发起 offer**，避免双方同时 offer。
+/// - `offer` / `answer`：`description` 是序列化后的 `RTCSessionDescription`（里面既有
+///   SDP 文本也有类型），不是裸 SDP——只发 SDP 文本会丢掉 offer/answer 的类型。
+/// - `candidate`：ICE candidate，trickle 发送。
+///
+/// 字段名用 camelCase，和协议里其它 JSON 一致；这里逐字段写 `rename` 而不是靠
+/// `rename_all_fields`，免得依赖 serde 的较新版本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum PairSignalPayload {
+    Hello {
+        version: u8,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+    },
+    Offer {
+        description: String,
+    },
+    Answer {
+        description: String,
+    },
+    Candidate {
+        candidate: String,
+        #[serde(rename = "sdpMid", default, skip_serializing_if = "Option::is_none")]
+        sdp_mid: Option<String>,
+        #[serde(
+            rename = "sdpMLineIndex",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        sdp_mline_index: Option<u16>,
+    },
 }
 
 /// 应用层信封（加密前的内容）
@@ -375,6 +421,62 @@ fn quantize(value: f32, step: f32) -> f32 {
     (clamped / step).round() * step
 }
 
+/// 中继可选广告的 ICE 服务器（R21）。
+///
+/// 形状跟 WebRTC 的 `RTCIceServer` 一致：`urls` 可以是单个字符串也可以是字符串数组，
+/// `username` / `credential` 是 TURN 的静态凭据。
+///
+/// 默认**不填**任何公共 STUN——STUN 必然让第三方看到公网 IP，而 README 承诺不收集
+/// 任何用户数据。缺失时只有 host candidate（同局域网可用），这正是隐私默认。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IceServer {
+    #[serde(deserialize_with = "deserialize_ice_urls")]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub credential: String,
+}
+
+/// `urls` 在 WebRTC 里既可以是单个字符串也可以是数组，两种都收
+fn deserialize_ice_urls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(url) => vec![url],
+        OneOrMany::Many(urls) => urls,
+    })
+}
+
+/// 解析中继广告的 ICE 服务器。缺字段、`null`、形状不对都按「没广告」处理；数组里
+/// 坏掉的条目逐条丢掉，好过整份丢掉（与 `deserialize_limits` 的逐字段判定同思路）。
+///
+/// 中继是对方维护的，不能让它把客户端推进一个坏状态；空列表是安全的缺省值。
+fn deserialize_ice_servers<'de, D>(deserializer: D) -> Result<Vec<IceServer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+
+    let Some(Value::Array(entries)) = value else {
+        return Ok(Vec::new());
+    };
+
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value::<IceServer>(entry).ok())
+        .collect())
+}
+
 /// 中继发来的明文控制帧
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -388,6 +490,14 @@ pub enum ServerFrame {
         /// 畸形或不合常理的额度按「没广告」处理（见 `deserialize_limits`）。
         #[serde(default, deserialize_with = "deserialize_limits")]
         limits: Option<RelayLimits>,
+        /// R21：自建中继配了 coturn 才会广告；缺字段 / 畸形都按空处理
+        /// （见 `deserialize_ice_servers`）。
+        #[serde(
+            rename = "iceServers",
+            default,
+            deserialize_with = "deserialize_ice_servers"
+        )]
+        ice_servers: Vec<IceServer>,
     },
     #[serde(rename = "server.peer")]
     Peer {
@@ -467,6 +577,17 @@ const CHUNK_BURST_DENOMINATOR: f64 = 2.0;
 const MAX_ADVERTISED_FRAMES_PER_SECOND: f64 = 240.0;
 const MAX_ADVERTISED_CHUNKS_PER_SECOND: f64 = 240.0;
 const MAX_ADVERTISED_BYTES_PER_SECOND: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// `server.welcome` 带来的运行期配置（R20 / R21）。
+///
+/// 两个字段都可能缺失：旧中继不广告 `limits`（按 CF 缺省推导），也不广告
+/// `iceServers`（只有 host candidate）。会话层拿到的是「这次连接的有效配置」，
+/// 永远是确定的。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelayConfig {
+    pub limits: RelayLimits,
+    pub ice_servers: Vec<IceServer>,
+}
 
 /// 客户端实际使用的出站节奏（见 `RelayLimits::outbound`）
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -657,6 +778,7 @@ mod tests {
                 protocol,
                 peer_online,
                 limits,
+                ..
             } = serde_json::from_str::<ServerFrame>(bad).unwrap()
             else {
                 panic!("应当仍然是 welcome: {bad}");
@@ -752,6 +874,7 @@ mod tests {
                 protocol,
                 peer_online,
                 limits,
+                ..
             } => {
                 assert_eq!(protocol, 1);
                 assert!(peer_online);
@@ -906,5 +1029,120 @@ mod tests {
         assert_eq!(TransferKind::parse("voice"), Ok(TransferKind::Voice));
         assert!(TransferKind::parse("movie").is_err());
         assert_eq!(TransferKind::File.as_str(), "file");
+    }
+
+    /// R21：信令的线上形状。`kind` 是 tag，字段名是 camelCase——两侧都是同一份代码，
+    /// 但字段名写错只会在真机上暴露，所以钉在这里。
+    #[test]
+    fn signal_payloads_round_trip_with_the_wire_shape() {
+        let hello = PairSignalPayload::Hello {
+            version: SIGNAL_VERSION,
+            device_id: "cat-a".to_string(),
+        };
+
+        let json = serde_json::to_value(&hello).unwrap();
+
+        assert_eq!(json["kind"], "hello");
+        assert_eq!(json["version"].as_u64(), Some(SIGNAL_VERSION.into()));
+        assert_eq!(json["deviceId"], "cat-a");
+        assert_eq!(
+            serde_json::from_value::<PairSignalPayload>(json).unwrap(),
+            hello
+        );
+
+        let candidate = PairSignalPayload::Candidate {
+            candidate: "candidate:1 1 udp".to_string(),
+            sdp_mid: Some("0".to_string()),
+            sdp_mline_index: Some(0),
+        };
+
+        let json = serde_json::to_value(&candidate).unwrap();
+
+        assert_eq!(json["kind"], "candidate");
+        assert_eq!(json["sdpMid"], "0");
+        assert_eq!(json["sdpMLineIndex"].as_u64(), Some(0));
+        assert_eq!(
+            serde_json::from_value::<PairSignalPayload>(json).unwrap(),
+            candidate
+        );
+
+        // 不带 sdpMid / sdpMLineIndex 的候选也要能解（两端版本可能不同）
+        assert_eq!(
+            serde_json::from_value::<PairSignalPayload>(
+                serde_json::json!({ "kind": "candidate", "candidate": "candidate:2 1 udp" })
+            )
+            .unwrap(),
+            PairSignalPayload::Candidate {
+                candidate: "candidate:2 1 udp".to_string(),
+                sdp_mid: None,
+                sdp_mline_index: None,
+            }
+        );
+
+        // 未知 kind 直接拒绝：版本漂移时宁可什么都不做，也不要半懂不懂地打洞
+        assert!(
+            serde_json::from_value::<PairSignalPayload>(serde_json::json!({ "kind": "bye" }))
+                .is_err()
+        );
+    }
+
+    /// R21：`server.welcome` 的 `iceServers` 是可选字段，而且中继是对方维护的——畸形
+    /// 输入只能让这一项退回空，不能让整帧解析失败（那会连 `peerOnline` 一起丢掉）。
+    #[test]
+    fn welcome_ice_servers_are_parsed_leniently() {
+        let frame: ServerFrame = serde_json::from_str(
+            r#"{
+                "type": "server.welcome",
+                "protocol": 1,
+                "peerOnline": true,
+                "iceServers": [
+                    { "urls": ["stun:example.test:3478", "turn:example.test:3478"],
+                      "username": "u", "credential": "c" },
+                    { "urls": "stun:other.test:3478" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let ServerFrame::Welcome { ice_servers, .. } = frame else {
+            panic!("应当解析成 server.welcome");
+        };
+
+        assert_eq!(ice_servers.len(), 2);
+        assert_eq!(
+            ice_servers[0].urls,
+            vec![
+                "stun:example.test:3478".to_string(),
+                "turn:example.test:3478".to_string()
+            ]
+        );
+        assert_eq!(ice_servers[0].username, "u");
+        assert_eq!(ice_servers[0].credential, "c");
+        // `urls` 是单个字符串时也要收
+        assert_eq!(
+            ice_servers[1].urls,
+            vec!["stun:other.test:3478".to_string()]
+        );
+        assert_eq!(ice_servers[1].username, "");
+
+        for payload in [
+            // 缺字段
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false }"#,
+            // null
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "iceServers": null }"#,
+            // 形状不对
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "iceServers": "nope" }"#,
+            // 数组里坏掉的那条要单独丢掉，好的那条留下
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false,
+                 "iceServers": [{ "urls": 3 }, { "urls": "stun:ok.test:3478" }] }"#,
+        ] {
+            let frame: ServerFrame = serde_json::from_str(payload).unwrap();
+
+            let ServerFrame::Welcome { ice_servers, .. } = frame else {
+                panic!("应当解析成 server.welcome");
+            };
+
+            assert!(ice_servers.len() <= 1, "畸形条目要丢掉：{ice_servers:?}");
+        }
     }
 }

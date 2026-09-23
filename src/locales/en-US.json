@@ -329,6 +329,13 @@
           "connected": "Connected",
           "peerOffline": "Partner Offline",
           "error": "Failed"
+        },
+        "p2p": {
+          "label": "P2P Channel",
+          "hint": "When hole punching succeeds, pet state and chat travel directly between the two computers instead of through the relay. If it fails everything falls back to the relay unchanged.",
+          "off": "Off",
+          "connecting": "Punching...",
+          "connected": "Direct"
         }
       },
       "about": {

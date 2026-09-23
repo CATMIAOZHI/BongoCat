@@ -7,6 +7,9 @@ pub mod audio;
 pub mod client;
 pub mod crypto;
 pub mod history;
+// P2P 传输的 cfg 中立门面（R24-1）：Windows 上转发到 `p2p`，其它平台是空实现，
+// 这样 `live` 的调用点不必散写 cfg。
+pub mod link;
 pub mod manager;
 // P2P（WebRTC）传输。只在 Windows 上编译：Phase 8 的范围就是 Windows 客户端，
 // 非 Windows 的 release 目标连 webrtc 那棵依赖树都不编译（见 src-tauri/Cargo.toml）。

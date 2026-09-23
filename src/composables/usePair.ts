@@ -18,7 +18,11 @@ export interface PairStatus {
   deviceId: string
   relayUrl?: string
   lastError?: string
+  /** P2P 这条腿的状态（R21 / R28）：只用于显示，掉线不影响中继上的任何功能 */
+  p2p?: P2pState
 }
+
+export type P2pState = 'off' | 'connecting' | 'connected'
 
 export interface PairPresencePayload {
   state: PresenceState

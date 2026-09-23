@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { reactive, ref } from 'vue'
 
-import type { PresenceState } from '@/composables/usePair'
+import type { P2pState, PresenceState } from '@/composables/usePair'
 
 import { ATTACHMENT_MAX_MB } from '@/composables/usePair'
 
@@ -124,6 +124,8 @@ export interface PairSettings {
 /** 连接相关的瞬时状态：不持久化，由 Tauri 事件与 `pair_get_status` 保持一致 */
 export interface PairRuntime {
   connection: PairConnectionState
+  /** P2P 这条腿：`off` / `connecting` / `connected`，纯显示用 */
+  p2p: P2pState
   peerOnline: boolean
   peerName?: string
   remotePresence: RemotePresenceState
@@ -187,6 +189,7 @@ export const usePairStore = defineStore('pair', () => {
 
   const runtime = reactive<PairRuntime>({
     connection: 'disabled',
+    p2p: 'off',
     peerOnline: false,
     peerName: void 0,
     remotePresence: 'offline',

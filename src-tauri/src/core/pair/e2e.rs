@@ -779,3 +779,165 @@ async fn unreachable_relay_enters_reconnecting() {
 
     manager.disconnect();
 }
+
+/// `pair-connection-changed` 里最后一次的 P2P 状态
+fn last_p2p(sink: &RecordingSink) -> Option<String> {
+    let payload = sink.status_events(EVENT_CONNECTION_CHANGED).pop()?;
+
+    payload.get("p2p")?.as_str().map(str::to_string)
+}
+
+/// 某一种连接状态广播出去时的 P2P 状态（取最后一次同状态的那条）
+fn p2p_while(sink: &RecordingSink, state: &str) -> Option<String> {
+    sink.status_events(EVENT_CONNECTION_CHANGED)
+        .iter()
+        .filter(|payload| payload["state"] == state)
+        .filter_map(|payload| payload.get("p2p")?.as_str().map(str::to_string))
+        .last()
+}
+
+/// 两个客户端通过真实中继交换信令并打通 P2P（Phase 8b）。
+///
+/// 两个 `PairManager` 各自连上真实中继，用 `pair.signal` 换 SDP 与 ICE candidate，
+/// 然后靠 host candidate 开出一条 DataChannel。**DC 腿的探针是应用级 `pair.ping`，
+/// pong 从同一条通道回来**：收不到 pong 的话两个心跳之后 `p2p` 会掉回 `connecting`，
+/// 所以「连着几个心跳一直 `connected`」就等于 ping/pong 在 DC 上真的往返了。
+///
+/// 需要 `BONGO_PAIR_HEARTBEAT_SECS` 在 10 秒以内：默认 60 秒时这条用例要等三分钟。
+#[tokio::test]
+#[ignore = "需要本地或已部署的 relay，见文件头说明"]
+async fn two_clients_open_a_p2p_channel_through_the_relay() {
+    let Some((relay, secret_text)) = e2e_config() else {
+        eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
+
+        return;
+    };
+
+    let Some(heartbeat) = std::env::var(super::manager::HEARTBEAT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0 && *value <= 10)
+    else {
+        eprintln!("跳过：这条用例需要 BONGO_PAIR_HEARTBEAT_SECS <= 10");
+
+        return;
+    };
+
+    let _guard = e2e_lock();
+
+    let sink_a = Arc::new(RecordingSink::default());
+    let sink_b = Arc::new(RecordingSink::default());
+    let manager_a = Arc::new(PairManager::new(
+        "e2e-p2p-a".into(),
+        sink_a.clone(),
+        memory_history(),
+        memory_store(),
+    ));
+    let manager_b = Arc::new(PairManager::new(
+        "e2e-p2p-b".into(),
+        sink_b.clone(),
+        memory_history(),
+        memory_store(),
+    ));
+
+    manager_a.start(&relay, Some(&secret_text)).unwrap();
+    manager_b.start(&relay, Some(&secret_text)).unwrap();
+
+    let connected = wait_for(
+        || {
+            sink_a.last_state() == Some(PairConnectionState::Connected)
+                && sink_b.last_state() == Some(PairConnectionState::Connected)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(
+        connected,
+        "两端没有进入 Connected：A={:?} B={:?} errors={:?}",
+        sink_a.last_state(),
+        sink_b.last_state(),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // 打洞要等 ICE：本机两个进程之间是秒级，留 30 秒余量
+    let opened = wait_for(
+        || {
+            last_p2p(&sink_a).as_deref() == Some("connected")
+                && last_p2p(&sink_b).as_deref() == Some("connected")
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        opened,
+        "P2P 没有打通：A={:?} B={:?} errors={:?}",
+        last_p2p(&sink_a),
+        last_p2p(&sink_b),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // 三个心跳：DC 腿的探针超时窗口是两个心跳，跨过它还能保持 `connected` 就说明
+    // pong 真的从 DC 回来了
+    tokio::time::sleep(Duration::from_secs(heartbeat * 3)).await;
+
+    assert_eq!(
+        last_p2p(&sink_a).as_deref(),
+        Some("connected"),
+        "A 的 P2P 腿掉了：errors={:?}",
+        sink_a.errors()
+    );
+    assert_eq!(
+        last_p2p(&sink_b).as_deref(),
+        Some("connected"),
+        "B 的 P2P 腿掉了：errors={:?}",
+        sink_b.errors()
+    );
+
+    // 中继那条腿不受影响：整条会话不该发生重连
+    assert_eq!(sink_a.last_state(), Some(PairConnectionState::Connected));
+    assert_eq!(sink_b.last_state(), Some(PairConnectionState::Connected));
+
+    // 退避期间 `p2p` 必须已经复位（只读审计提出的 P1）：中继腿一掉，腿就被 Drop 了，
+    // 而退避（最长 30 秒）+ 连接与 welcome 超时（15 + 10 秒）里不会再有 P2P 事件。
+    // 触发方式是用**同 deviceId 的第三条连接**把 A 顶掉——中继会给旧连接发
+    // 4002 `REPLACED`，这是本机能真实走到的掉线路径（4002 不是 fatal，所以进重连）。
+    let secret = crypto::decode_pair_secret(&secret_text).unwrap();
+    let auth_token = crypto::derive_auth_token(&secret);
+    let replacement = client::connect(&relay, &auth_token, "e2e-p2p-a")
+        .await
+        .unwrap();
+
+    let replaced = wait_for(
+        || p2p_while(&sink_a, "reconnecting").is_some(),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(
+        replaced,
+        "A 没有被顶替进入重连：{:?}",
+        sink_a.status_events(EVENT_CONNECTION_CHANGED)
+    );
+    assert_eq!(
+        p2p_while(&sink_a, "reconnecting").as_deref(),
+        Some("off"),
+        "退避期间的 `p2p` 没有复位"
+    );
+
+    // 放开那个占位连接，让 A 用同一个 deviceId 重新连上
+    drop(replacement);
+
+    manager_a.disconnect();
+    manager_b.disconnect();
+
+    // 断开之后这条腿的状态要复位：留着上一轮的 `connected` 会让偏好页说谎
+    let reset = wait_for(
+        || last_p2p(&sink_a).as_deref() == Some("off"),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(reset, "断开后 P2P 状态没有复位：{:?}", last_p2p(&sink_a));
+}

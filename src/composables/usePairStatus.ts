@@ -56,6 +56,7 @@ export function usePairStatus() {
 
   const applyStatus = (status: PairStatus) => {
     store.runtime.connection = store.settings.enabled ? translate(status.state) : 'disabled'
+    store.runtime.p2p = store.settings.enabled ? (status.p2p ?? 'off') : 'off'
     store.runtime.peerOnline = status.peerOnline
     store.runtime.peerName = status.peerName ?? void 0
     store.runtime.remotePresence = status.peerOnline
