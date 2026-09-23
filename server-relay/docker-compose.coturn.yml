@@ -1,0 +1,16 @@
+# 可选：STUN/TURN（打洞失败时的兜底）。只有自建中继才需要——Cloudflare 版
+# 目前不广告 `iceServers`。
+#
+# 用法（和主 compose 一起跑，注意 coturn 需要 host 网络才能拿到正确的 UDP 端口）：
+#   docker compose -f docker-compose.yml -f docker-compose.coturn.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.coturn.yml down
+#
+# 起来之后把地址写进主 compose 的 PAIR_ICE_SERVERS（见 README 的「可选：STUN/TURN」）。
+
+services:
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro

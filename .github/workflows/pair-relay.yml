@@ -1,0 +1,49 @@
+name: Pair Relay
+
+# 只跑 server-relay/：它是独立 workspace，与客户端（pnpm + src-tauri）互不影响，
+# 所以可以只在它自己变化时跑，不拖慢客户端的提交。
+on:
+  push:
+    paths:
+      - 'server-relay/**'
+      - '.github/workflows/pair-relay.yml'
+  pull_request:
+    paths:
+      - 'server-relay/**'
+      - '.github/workflows/pair-relay.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # 固定组件而不是吃 runner 镜像自带的那份：clippy 版本漂移会让
+          # `-D warnings` 某天突然变红
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-relay/target
+          key: pair-relay-${{ runner.os }}-${{ hashFiles('server-relay/Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 含 tests/relay.rs：真的起中继、真的连 WebSocket 的线上契约用例
+      - name: Test
+        run: cargo test

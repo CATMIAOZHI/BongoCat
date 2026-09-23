@@ -1,0 +1,6 @@
+# 构建上下文里不需要的东西：编译产物、本地配置（含 Pair Secret）、仓库元数据
+target
+.env
+pair-secret.txt
+.git
+.gitignore

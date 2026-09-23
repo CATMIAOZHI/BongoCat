@@ -1,0 +1,10 @@
+# Caddy 自动申请并续期 Let's Encrypt / ZeroSSL 证书，WebSocket 升级也会被
+# reverse_proxy 自动处理，所以客户端填 https://<域名> 即可（会自动补 /ws）。
+#
+# 域名来自 .env 的 PAIR_DOMAIN。**必须用域名**：客户端用 rustls 的系统根证书
+# 库校验——那份根证书库是编译进客户端的 Mozilla 根库（rustls-tls-webpki-roots），
+# **不看**系统证书存储，所以裸 IP 与自签证书一律连不上。
+
+{$PAIR_DOMAIN} {
+	reverse_proxy relay:8080
+}
