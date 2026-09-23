@@ -3835,6 +3835,52 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// §44 / §45：语音走同一套 transfer，但和图片一样不用用户点「接收」
+    #[test]
+    fn a_voice_offer_starts_receiving_right_away() {
+        let store = TransferStore::new(temp_root("voice"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let payload = vec![7u8; CHUNK_SIZE + 1];
+        let (_, size, sha256) = source_file(&root, &payload);
+
+        let reply = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_for(
+                31,
+                TransferKind::Voice,
+                "voice-20260923-150000.wav",
+                size,
+                &sha256,
+            ),
+        )
+        .unwrap();
+
+        assert!(reply.is_some(), "语音不该等用户确认");
+        assert_eq!(
+            state.transfers.get(&31).unwrap().phase,
+            TransferPhase::Receiving
+        );
+        assert_eq!(count_part_files(&root), 1, "应当立刻开始收分片");
+
+        let message = manager.history.find("m-1").unwrap().unwrap();
+
+        assert_eq!(message.kind, MessageKind::Voice);
+        assert!(
+            !sink
+                .payloads(EVENT_TRANSFER)
+                .iter()
+                .any(|payload| payload["state"] == "waiting"),
+            "语音不该出现“等用户确认”这一步"
+        );
+
+        abort_transfers(&manager, &mut state);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// 同一个 transferId 的 offer 重发不该建第二个会话
     #[test]
     fn a_duplicate_offer_is_ignored() {

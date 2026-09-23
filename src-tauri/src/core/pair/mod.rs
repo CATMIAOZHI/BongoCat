@@ -3,6 +3,7 @@
 //! 网络连接只在 Rust 侧存在一份（[`manager::PairManager`]），所有 WebView 通过
 //! Tauri 事件观察状态；Pair Secret 只进系统凭据库。
 
+pub mod audio;
 pub mod client;
 pub mod crypto;
 pub mod history;
@@ -51,6 +52,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
     }
 
     app.manage(Arc::new(PairManager::new(device_id, sink, history, store)));
+    app.manage(PairRecording::default());
 }
 
 /// pair 功能的落盘根目录：`<配置目录>/pair`（聊天库、附件、临时文件都在这里）
@@ -320,13 +322,54 @@ pub async fn pair_send_attachment(
     mime: Option<String>,
     stage: Option<bool>,
 ) -> Result<ChatMessage, String> {
-    let manager = Arc::clone(&manager);
     let source = std::path::PathBuf::from(path.trim());
 
     if !source.is_file() {
         return Err("找不到这个文件".to_string());
     }
 
+    send_attachment(
+        Arc::clone(&manager),
+        source,
+        kind,
+        mime,
+        stage.unwrap_or(false),
+    )
+    .await
+}
+
+/// 附件发送的公共部分（§38）：算校验值、入库、交给传输管线。
+///
+/// 粘贴的图片（§37）与录好的语音（§44）都走这里；它们的源文件是临时文件，
+/// `stage` 为真时先被收进附件缓存。**失败路径也要把临时文件删掉**：
+/// `stage_copy` 是唯一会删源文件的地方，而超限、读不到、建不了会话都会在它之前
+/// 或之后提前返回，不删就会在 `tmp/` 里攒下没人认领的孤儿文件
+/// （`cleanup_stale_parts` 只认 `.part`）。
+async fn send_attachment(
+    manager: Arc<PairManager>,
+    source: std::path::PathBuf,
+    kind: TransferKind,
+    mime: Option<String>,
+    stage: bool,
+) -> Result<ChatMessage, String> {
+    let result = stage_attachment(Arc::clone(&manager), source.clone(), kind, mime, stage).await;
+
+    if stage && result.is_err() {
+        // 已经成功 `stage_copy` 过的不存在了，删不到是正常的
+        let _ = std::fs::remove_file(&source);
+    }
+
+    result
+}
+
+/// 真正的发送准备工作：算校验值、入库、交给传输管线
+async fn stage_attachment(
+    manager: Arc<PairManager>,
+    source: std::path::PathBuf,
+    kind: TransferKind,
+    mime: Option<String>,
+    stage: bool,
+) -> Result<ChatMessage, String> {
     let original_name = source
         .file_name()
         .and_then(|name| name.to_str())
@@ -342,7 +385,7 @@ pub async fn pair_send_attachment(
         return Err(too_large(max_size));
     }
 
-    let source = if stage.unwrap_or(false) {
+    let source = if stage {
         manager.store().stage_copy(&source, &name)?
     } else {
         source
@@ -415,6 +458,20 @@ fn too_large(max_size: u64) -> String {
     format!("附件超过上限（{} MB）", max_size / (1024 * 1024))
 }
 
+/// 语音超过附件上限时的说明（§42 / §45）。
+///
+/// 提示「还能录几秒」比只说「太大了」有用；但专业声卡可能报出 384kHz 以上的采样率，
+/// 这时 1 MB 连一秒都装不下，按秒取整会算出 0，所以那种情况换一句话。
+fn too_large_for_voice(max_size: u64, secs: u64) -> String {
+    let mb = max_size / (1024 * 1024);
+
+    if secs == 0 {
+        return format!("附件上限是 {mb} MB，这个上限录不了语音，请在设置里调大");
+    }
+
+    format!("附件上限是 {mb} MB，这个上限只能录约 {secs} 秒语音")
+}
+
 /// 接收方同意接收（§42 的大文件确认）
 #[command]
 pub async fn pair_transfer_accept(
@@ -449,4 +506,123 @@ pub async fn pair_attachment_retry(
     message_id: String,
 ) -> Result<(), String> {
     Arc::clone(&manager).retry_attachment(&message_id)
+}
+
+/// 语音录音状态（§44 / §45）。录音本身跑在专用线程里，这里只是一个句柄盒子。
+#[derive(Default)]
+pub struct PairRecording {
+    recorder: Arc<audio::Recorder>,
+}
+
+/// 开始录音（§45 的 Pressed），返回麦克风的原生采样率
+#[command]
+pub async fn pair_start_recording(recording: State<'_, PairRecording>) -> Result<u32, String> {
+    let recorder = Arc::clone(&recording.recorder);
+
+    // 打开麦克风要等设备真的开始录（最多 5 秒），别把异步运行时的工作线程占住
+    tokio::task::spawn_blocking(move || recorder.start())
+        .await
+        .map_err(|error| format!("开始录音失败: {error}"))?
+}
+
+/// 结束录音并发送（§45 的 Released）。
+///
+/// 返回 `None` 表示这次不该发出去：没在录，或者只轻点了一下（< 300 ms）。
+#[command]
+pub async fn pair_stop_recording(
+    manager: State<'_, Arc<PairManager>>,
+    recording: State<'_, PairRecording>,
+) -> Result<Option<ChatMessage>, String> {
+    let Some(recording) = recording.recorder.take() else {
+        return Ok(None);
+    };
+
+    // 收尾最多等一个轮询周期，但 join 是阻塞调用，别占着异步运行时
+    let audio = tokio::task::spawn_blocking(move || recording.finish())
+        .await
+        .map_err(|error| format!("结束录音失败: {error}"))??;
+
+    if audio.is_too_short() {
+        return Ok(None);
+    }
+
+    if audio.truncated {
+        tauri_plugin_log::log::info!("录音到 {} 秒上限，已自动截断", audio::MAX_RECORDING_SECS);
+    }
+
+    let manager = Arc::clone(&manager);
+
+    // §42：先按算出来的长度判断上限，别等写完再发现太大——那会在 tmp/ 里留下
+    // 一个没人认领的 wav（`cleanup_stale_parts` 只认 `.part`）
+    let max_size = manager.max_attachment_size();
+    let size = audio::wav_size(&audio);
+
+    if size > max_size {
+        let secs = audio::wav_limit_secs(max_size, audio.sample_rate);
+
+        return Err(too_large_for_voice(max_size, secs));
+    }
+
+    // 先落到临时目录，再让 `stage_copy` 用 UUID 收进附件缓存（§41 / §42）
+    let path = manager.store().tmp_dir().join(format!(
+        "voice-{}.wav",
+        history::file_stamp(protocol::now_millis())
+    ));
+    let target = path.clone();
+
+    let written = tokio::task::spawn_blocking(move || audio::write_wav(&target, &audio))
+        .await
+        .map_err(|error| format!("保存录音失败: {error}"))?;
+
+    // 落盘之后任何一条出错路径（写失败、发送失败、上限被临时改小）都要把临时文件删掉
+    let message = match written {
+        Ok(()) => {
+            send_attachment(
+                Arc::clone(&manager),
+                path.clone(),
+                TransferKind::Voice,
+                Some("audio/wav".to_string()),
+                true,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+
+    if message.is_err() {
+        // `stage_copy` 成功时已经删过源文件了，这里删不到就是正常的
+        let _ = std::fs::remove_file(&path);
+    }
+
+    Ok(Some(message?))
+}
+
+/// 放弃这次录音（§45 的「可取消」）：不落盘、不发送
+#[command]
+pub async fn pair_cancel_recording(recording: State<'_, PairRecording>) -> Result<(), String> {
+    let Some(recording) = recording.recorder.take() else {
+        return Ok(());
+    };
+
+    // 取消不该因为麦克风出错而失败：结果直接丢掉
+    let _ = tokio::task::spawn_blocking(move || recording.finish()).await;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_limit_message_never_says_zero_seconds() {
+        // 普通麦克风：1 MB 大约 10 秒
+        assert!(too_large_for_voice(1024 * 1024, 10).contains("10 秒"));
+
+        // 专业声卡的极端采样率下按秒取整会变 0，这时不能让人读到「能录 0 秒」
+        let message = too_large_for_voice(1024 * 1024, 0);
+
+        assert!(message.contains("录不了语音"), "{message}");
+        assert!(!message.contains("0 秒"), "{message}");
+    }
 }

@@ -420,6 +420,23 @@ fn render_json(messages: &[ChatMessage], exported_at: i64) -> Result<String, Str
     serde_json::to_string_pretty(&document).map_err(|err| format!("序列化导出内容失败: {err}"))
 }
 
+/// 文件名里的时间戳，形如 `20260923-135501`（UTC）。
+///
+/// 与导出用的是同一套日期换算，免得为了一个文件名再引一个时区库。
+pub(crate) fn file_stamp(millis: i64) -> String {
+    let total_seconds = millis.div_euclid(1000);
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        seconds_of_day / 3600,
+        (seconds_of_day % 3600) / 60,
+        seconds_of_day % 60,
+    )
+}
+
 /// 本地时间戳转成可读时间（导出用，不依赖时区库：按 UTC+8 折算太脆，直接用秒级时间戳的
 /// 本地表示交给调用方？这里用 `chrono` 会多一个依赖，所以只用时间戳本身的日期部分）
 fn format_timestamp(millis: i64) -> String {
