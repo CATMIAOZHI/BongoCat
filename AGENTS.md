@@ -26,9 +26,18 @@
 ## 构建与验证
 
 - 包管理器只用 pnpm（`preinstall` 里有 `only-allow pnpm`），不要用 npm/yarn 安装依赖。
-- 常用命令：`pnpm install`、`pnpm tauri dev`、`pnpm tauri build`（调试加 `--debug`）、`pnpm lint`。
+- 常用命令：`pnpm install`、`pnpm tauri dev`、`pnpm tauri build`（调试加 `--debug`）、`pnpm lint`、`pnpm test`。
 - 前端改动至少跑 `pnpm lint`；涉及 Rust 或打包配置时说明是否真的跑过 `pnpm tauri build` 或 `cargo check`，没验证的要标注。
-- 项目没有自动化测试套件，验证以 lint、构建和实际运行为准；报告里区分静态检查、构建和实际运行三种证据。
+- 前端有 vitest 单测（`pnpm test`，用例在 `src/**/*.spec.ts`，目前覆盖双人联机的纯函数映射），Rust 有 `cargo test --lib` 与 `cargo test --all-targets`。
+- `vite build` 不做类型检查，要单独跑 `node node_modules/typescript/bin/tsc --noEmit`；仓库没装 `vue-tsc`，所以这个检查只覆盖 `.ts`，`.vue` 里的类型问题目前只能靠 review 和实际运行发现。
+- 报告里区分静态检查、构建和实际运行三种证据。
+
+### 本机 pnpm 注意事项
+
+- 本机 `node_modules` 是用工作区内的 store 装的，pnpm 命令要带 `--store-dir .pnpm-store`，否则报 `ERR_PNPM_UNEXPECTED_STORE`。
+- pnpm 11 默认不执行依赖的 build script，`pnpm add` 会打印 `ERR_PNPM_IGNORED_BUILDS` 并以退出码 1 结束；这时依赖其实已经装好，用 `pnpm test`、`eslint`、`vite build` 复核即可。
+- 上面那种情况下 pnpm 会在仓库根目录生成带占位文字（`set this to true or false`）的 `pnpm-workspace.yaml`；它只是提示文件，不要提交。
+- `simple-git-hooks` 的 build script 同样被忽略，`.git/hooks` 里没有装钩子；提交前自己跑一遍 `node node_modules/eslint/bin/eslint.js --fix src` 与 `commitlint` 校验。
 
 ## 提交与发布
 
