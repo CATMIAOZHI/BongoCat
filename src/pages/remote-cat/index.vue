@@ -5,13 +5,15 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { exists } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 
 import type { ModelSize } from '@/composables/useModel'
+import type { ChatMessage } from '@/composables/usePair'
 import type { PetSnapshot } from '@/composables/usePairActivity'
 
 import { useModel } from '@/composables/useModel'
 import { defaultSnapshot, sanitizeSnapshot } from '@/composables/usePairActivity'
+import { playPairMessageSound } from '@/composables/usePairMessageSound'
 import { usePairStatus } from '@/composables/usePairStatus'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
@@ -54,9 +56,12 @@ const backgroundImagePath = ref<string>()
 const remote = ref<PetSnapshot>(defaultSnapshot())
 /** §28：对方回来时的系统提示，只闪一下，不进入聊天记录 */
 const notice = ref('')
+const modelRef = useTemplateRef<HTMLElement>('model')
+const flashRef = useTemplateRef<HTMLElement>('flash')
 let receivedAt = 0
 let decayTimer: ReturnType<typeof setInterval> | undefined
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
+let soundFailed = false
 
 /** 默认和本机用同一个模型（§22），也可以在偏好页里单独指定 */
 function remoteModel() {
@@ -210,6 +215,56 @@ watch(() => pairStore.settings.remoteCat.passThrough, (value) => {
   appWindow.setIgnoreCursorEvents(value)
 }, { immediate: true })
 
+/**
+ * §46 的 Q 弹：给猫咪容器加一段短 CSS 动画，绝不移动原生窗口坐标。
+ *
+ * 动画跑完类名仍然挂着，所以每次都要先摘掉、强制一次重排、再挂回去，
+ * 连续来消息时动画才会一条一条地播（改父子状态的方式做不到重播）。
+ */
+function playBounce() {
+  const element = modelRef.value
+
+  if (!element) return
+
+  element.classList.remove('pair-bounce')
+  element.getBoundingClientRect()
+  element.classList.add('pair-bounce')
+}
+
+/** §46 的粉色闪光：叠在猫咪上的短 overlay，同样不动模型文件 */
+function playFlash() {
+  const element = flashRef.value
+
+  if (!element) return
+
+  element.classList.remove('pair-flash')
+  element.getBoundingClientRect()
+  element.classList.add('pair-flash')
+}
+
+/** §46 的提示音：音量 0 等价静音，播放被系统策略拦下时只记一次日志 */
+function playNotificationSound() {
+  const { notificationSound, notificationVolume } = pairStore.settings.chat
+
+  if (!notificationSound) return
+
+  playPairMessageSound(notificationVolume).catch((reason) => {
+    if (soundFailed) return
+
+    soundFailed = true
+    error(`提示音播放失败（可能被自动播放策略拦下）: ${String(reason)}`)
+  })
+}
+
+function notifyChatMessage() {
+  playBounce()
+  playFlash()
+  playNotificationSound()
+}
+
+// §47：聊天窗口负责把消息加进列表，通知动画只在这里做
+useTauriListen<ChatMessage>(LISTEN_KEY.PAIR_MESSAGE_RECEIVED, notifyChatMessage)
+
 function handleMouseDown() {
   appWindow.startDragging()
 }
@@ -222,6 +277,7 @@ function handleMouseDown() {
     @mousedown="handleMouseDown"
   >
     <div
+      ref="model"
       class="absolute size-full transition-opacity"
       :class="{ 'opacity-50': !isOnline() }"
     >
@@ -233,6 +289,11 @@ function handleMouseDown() {
 
       <canvas id="live2dCanvas" />
     </div>
+
+    <div
+      ref="flash"
+      class="pointer-events-none absolute inset-0 bg-[#ff7ac6] opacity-0"
+    />
 
     <div
       v-if="pairStore.runtime.remotePresence === 'away' && isOnline()"
@@ -304,3 +365,46 @@ function handleMouseDown() {
     </div>
   </div>
 </template>
+
+<style scoped>
+@keyframes pair-cat-bounce {
+  0% {
+    transform: translateY(0) scale(1);
+  }
+
+  25% {
+    transform: translateY(-5%) scale(1.04);
+  }
+
+  60% {
+    transform: translateY(2%) scale(0.98);
+  }
+
+  100% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+.pair-bounce {
+  transform-origin: bottom center;
+  animation: pair-cat-bounce 0.6s ease-out;
+}
+
+@keyframes pair-cat-flash {
+  0% {
+    opacity: 0;
+  }
+
+  20% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
+.pair-flash {
+  animation: pair-cat-flash 0.42s ease-out;
+}
+</style>

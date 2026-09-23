@@ -16,6 +16,34 @@
         "total": "累计 {keyboard} / {mouse}"
       }
     },
+    "chat": {
+      "labels": {
+        "peer": "对方"
+      },
+      "hints": {
+        "loading": "正在读取聊天记录...",
+        "empty": "还没有消息，按快捷键打开输入框吧",
+        "disabled": "还未启用双人联机",
+        "offline": "对方离线",
+        "backToNewest": "回到最新消息",
+        "hide": "隐藏聊天窗口",
+        "copy": "复制这条消息",
+        "inputHint": "用「聊天输入」快捷键打开输入框",
+        "inputKeys": "Enter 发送 · Shift+Enter 换行 · Esc 关闭",
+        "passThrough": "聊天窗口开着穿透，点击会点到桌面",
+        "textLimit": "已输入 {bytes} / 8192 字节"
+      },
+      "placeholders": {
+        "input": "输入消息..."
+      },
+      "status": {
+        "pending": "等待发送",
+        "sent": "已发送",
+        "delivered": "对方已收到",
+        "failed": "发送失败",
+        "received": "已收到"
+      }
+    },
     "preference": {
       "title": "偏好设置",
       "cat": {
@@ -131,6 +159,8 @@
           "passThrough": "窗口穿透",
           "alwaysOnTop": "窗口置顶",
           "visibleRemoteCat": "打开对方猫",
+          "visibleChat": "打开聊天窗口",
+          "toggleChatInput": "聊天输入",
           "toggleAway": "暂离 / 回来"
         },
         "hints": {
@@ -140,6 +170,8 @@
           "passThrough": "切换猫咪窗口是否可穿透。",
           "alwaysOnTop": "切换猫咪窗口是否置顶。",
           "visibleRemoteCat": "切换对方猫咪窗口的显示与隐藏。",
+          "visibleChat": "切换聊天窗口的显示与隐藏。",
+          "toggleChatInput": "打开聊天输入框；再按一次或按 Esc 关闭。",
           "toggleAway": "切换「我暂离」与「我回来啦」。"
         }
       },
@@ -161,6 +193,22 @@
           "opacity": "不透明度",
           "alwaysOnTop": "窗口置顶",
           "passThrough": "窗口穿透",
+          "chatSettings": "聊天",
+          "showChat": "显示聊天窗口",
+          "bubbleCount": "同时显示的气泡数",
+          "chatAlwaysOnTop": "聊天窗口置顶",
+          "chatPassThrough": "聊天窗口穿透",
+          "notificationSound": "新消息提示音",
+          "notificationVolume": "提示音量",
+          "chatHistory": "聊天记录",
+          "chatHistoryUsage": "本地保存进度",
+          "chatHistoryProgress": "第 {epoch} 个记录周期：{current} / {limit} 条（{percent}%）",
+          "chatHistoryTotal": "本地共保存 {total} 条消息",
+          "historyLimit": "保存上限",
+          "exportFormat": "导出格式",
+          "exportChat": "导出聊天记录",
+          "deleteOldOnReset": "新周期开始时删除旧记录",
+          "newEpoch": "开始新的记录周期",
           "privacySettings": "隐私",
           "shareTypingActivity": "分享打字活动",
           "sharePointer": "分享鼠标活动",
@@ -188,6 +236,25 @@
           "remoteModel": "留空就和你自己的猫使用同一个模型；模型只会从本机已安装的模型里选择。",
           "remoteStats": "需要对方也开启「分享输入统计」，否则不会显示。",
           "windowSize": "调整对方猫咪窗口的大小。",
+          "chatWindow": "在桌面上单独显示聊天窗口（气泡）。",
+          "bubbleCount": "聊天窗口同时显示多少条最新消息，滚轮可以往回看更旧的消息。",
+          "chatPassThrough": "开启后聊天窗口不挡鼠标；打开输入框时会临时关闭。",
+          "notificationSound": "收到对方消息时播一声提示音。",
+          "notificationVolume": "提示音音量，0 表示静音。",
+          "chatHistory": "聊天记录只保存在本机，导出后可以自己留存。",
+          "historyLimit": "只用来提示进度，达到上限也不会自动删除消息。",
+          "exportFormat": "JSON 适合备份，TXT / Markdown 适合直接看。",
+          "exportChat": "把本地保存的所有聊天记录导出成一个文件。",
+          "deleteOldOnReset": "关闭时（默认）旧周期的记录会保留在本地，只是不再显示在聊天窗口。",
+          "newEpoch": "导出当前记录后开始新的记录周期，聊天窗口会随之清空。",
+          "historyNear": "本地聊天记录已经接近保存上限，建议导出后开始新的记录周期。",
+          "historyFull": "本地聊天记录已经达到保存上限，请导出后开始新的记录周期。",
+          "chatExported": "已导出 {count} 条消息",
+          "newEpochTitle": "导出并开始新的记录周期？",
+          "newEpochKeepOld": "会先把当前记录导出到你选择的文件，然后开始新的记录周期。旧记录仍然保留在本地。",
+          "newEpochDeleteOld": "会先把当前记录导出到你选择的文件，然后开始新的记录周期，并删除本地旧记录。",
+          "newEpochDone": "已开始第 {epoch} 个记录周期（导出 {count} 条）",
+          "exportCanceled": "没有选择导出位置，已取消",
           "shareTypingActivity": "只同步左右手和输入强度，不会发送实际按键内容。",
           "sharePointer": "只同步鼠标的屏幕比例与左右键状态，不会发送真实坐标。",
           "shareInputStats": "默认关闭。开启后对方能看到你的今日与累计输入次数，内容仍然是纯数字。",
@@ -204,11 +271,22 @@
           "remoteModel": "与本机相同",
           "awayMessage": "去吃饭啦"
         },
+        "options": {
+          "exportFormat": {
+            "json": "JSON（完整备份）",
+            "txt": "TXT（纯文本）",
+            "md": "Markdown"
+          }
+        },
         "buttons": {
           "save": "保存",
           "delete": "删除",
           "connect": "立即连接",
-          "disconnect": "断开"
+          "disconnect": "断开",
+          "export": "导出",
+          "exportAndReset": "导出并开始新周期",
+          "newEpoch": "开始新周期",
+          "previewSound": "试听"
         },
         "status": {
           "disabled": "未启用",

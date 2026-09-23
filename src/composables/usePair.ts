@@ -71,3 +71,73 @@ export function pairSendPetState(snapshot: PetSnapshot) {
 export function pairSendStats(stats: PairStatsPayload) {
   return invoke<void>(INVOKE_KEY.PAIR_SEND_STATS, { stats })
 }
+
+/** §31：单条文本消息的 UTF-8 上限，与 Rust 侧 `MESSAGE_TEXT_LIMIT` 一致 */
+export const MESSAGE_TEXT_LIMIT = 8 * 1024
+
+export type MessageDirection = 'incoming' | 'outgoing'
+
+export type MessageKind = 'text' | 'image' | 'file' | 'voice'
+
+export type MessageStatus = 'pending' | 'sent' | 'delivered' | 'failed' | 'received'
+
+export type ExportFormat = 'json' | 'txt' | 'md'
+
+/** 本地库里的一条聊天消息（Rust 侧 `ChatMessage`），`seq` 是分页游标 */
+export interface ChatMessage {
+  seq: number
+  id: string
+  direction: MessageDirection
+  kind: MessageKind
+  /** 毫秒时间戳 */
+  createdAt: number
+  text?: string
+  status: MessageStatus
+  attachmentId?: string
+  conversationEpoch: number
+}
+
+/** 一页历史（§34）：`messages` 按时间升序，`hasMore` 表示还能往前翻 */
+export interface HistoryPage {
+  messages: ChatMessage[]
+  hasMore: boolean
+  epoch: number
+}
+
+/** §36 的本地保存进度 */
+export interface HistoryStats {
+  epoch: number
+  current: number
+  total: number
+}
+
+export interface ExportSummary {
+  path: string
+  format: ExportFormat
+  messages: number
+  exportedAt: number
+}
+
+/** 发一条文本消息（§31），返回值是本地已经落库的那一行 */
+export function pairSendChat(text: string) {
+  return invoke<ChatMessage>(INVOKE_KEY.PAIR_SEND_CHAT, { text })
+}
+
+/** 读一页历史；`before` 是游标（比它更旧的），不传就是最新一页 */
+export function pairHistoryList(before?: number, limit?: number) {
+  return invoke<HistoryPage>(INVOKE_KEY.PAIR_HISTORY_LIST, { before, limit })
+}
+
+export function pairHistoryStats() {
+  return invoke<HistoryStats>(INVOKE_KEY.PAIR_HISTORY_STATS)
+}
+
+/** 导出到用户选定的路径（§35） */
+export function pairHistoryExport(format: ExportFormat, path: string) {
+  return invoke<ExportSummary>(INVOKE_KEY.PAIR_HISTORY_EXPORT, { format, path })
+}
+
+/** 导出并开始新的记录周期（§36）；`deleteOld` 为真时删除旧周期消息 */
+export function pairHistoryStartNewEpoch(deleteOld?: boolean) {
+  return invoke<number>(INVOKE_KEY.PAIR_HISTORY_START_NEW_EPOCH, { deleteOld })
+}

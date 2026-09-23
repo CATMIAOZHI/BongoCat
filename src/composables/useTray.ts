@@ -42,6 +42,7 @@ export function useTray() {
   watch([
     () => pairStore.settings.enabled,
     () => pairStore.settings.remoteCat.visible,
+    () => pairStore.settings.chat.visible,
     () => pairStore.settings.presence,
     () => pairStore.runtime.connection,
     () => pairStore.runtime.peerOnline,

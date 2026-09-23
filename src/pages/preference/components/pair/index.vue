@@ -1,7 +1,12 @@
 <script setup lang="ts">
-import { Badge, Button, Flex, Input, InputNumber, message, Select, Slider, Switch, Tag } from 'antdv-next'
+import { emit } from '@tauri-apps/api/event'
+import { save } from '@tauri-apps/plugin-dialog'
+import { useDebounceFn } from '@vueuse/core'
+import { Alert, Badge, Button, Flex, Input, InputNumber, message, Modal, Select, Slider, Switch, Tag } from 'antdv-next'
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+
+import type { ExportFormat, HistoryStats } from '@/composables/usePair'
 
 import ProListItem from '@/components/pro-list-item/index.vue'
 import ProList from '@/components/pro-list/index.vue'
@@ -11,8 +16,15 @@ import {
   pairDisconnect,
   pairGetSecretFingerprint,
   pairHasSecret,
+  pairHistoryExport,
+  pairHistoryStartNewEpoch,
+  pairHistoryStats,
   pairSetSecret,
 } from '@/composables/usePair'
+import { chatExportFileName } from '@/composables/usePairChat'
+import { playPairMessageSound } from '@/composables/usePairMessageSound'
+import { useTauriListen } from '@/composables/useTauriListen'
+import { LISTEN_KEY } from '@/constants'
 import { useModelStore } from '@/stores/model'
 import { pairStatusKey, usePairStore } from '@/stores/pair'
 
@@ -21,6 +33,124 @@ const modelStore = useModelStore()
 const { t } = useI18n()
 const secretInput = ref('')
 const saving = ref(false)
+const exportFormat = ref<ExportFormat>('json')
+const exporting = ref(false)
+const historyStats = ref<HistoryStats>({ epoch: 1, current: 0, total: 0 })
+
+/** §36：保存上限只用来提示进度，达到上限也不会自动删消息 */
+const historyLimit = computed(() => {
+  const value = Math.round(Number(pairStore.settings.chat.historyMaxMessages))
+
+  return Math.max(1, Number.isFinite(value) ? value : 50_000)
+})
+
+const historyPercent = computed(() => {
+  return Math.min(100, Math.round(historyStats.value.current / historyLimit.value * 100))
+})
+
+const historyWarning = computed(() => {
+  if (historyStats.value.current >= historyLimit.value) return 'full'
+  if (historyStats.value.current >= historyLimit.value * 0.9) return 'near'
+
+  return ''
+})
+
+const exportFormatOptions = computed(() => {
+  return (['json', 'txt', 'md'] as const).map(format => ({
+    label: t(`pages.preference.pair.options.exportFormat.${format}`),
+    value: format,
+  }))
+})
+
+const exportFilters = computed(() => {
+  const name = {
+    json: 'JSON',
+    txt: 'Text',
+    md: 'Markdown',
+  }[exportFormat.value]
+
+  return [{ name, extensions: [exportFormat.value] }]
+})
+
+const refreshHistoryStatsLater = useDebounceFn(refreshHistoryStats, 2000)
+
+async function refreshHistoryStats() {
+  try {
+    historyStats.value = await pairHistoryStats()
+  } catch (reason) {
+    message.error(String(reason))
+  }
+}
+
+/** 对方发来的消息也要反映到「保存进度」上，聊天时 2 秒刷新一次就够了 */
+useTauriListen(LISTEN_KEY.PAIR_MESSAGE_RECEIVED, refreshHistoryStatsLater)
+
+function pickExportPath() {
+  return save({
+    defaultPath: chatExportFileName(exportFormat.value, Date.now()),
+    filters: exportFilters.value,
+  })
+}
+
+async function handleExportHistory() {
+  exporting.value = true
+
+  try {
+    const path = await pickExportPath()
+
+    if (!path) return
+
+    const summary = await pairHistoryExport(exportFormat.value, path)
+
+    message.success(t('pages.preference.pair.hints.chatExported', { count: summary.messages }))
+
+    await refreshHistoryStats()
+  } catch (reason) {
+    message.error(String(reason))
+  } finally {
+    exporting.value = false
+  }
+}
+
+/**
+ * §36：导出并开始新的记录周期。
+ *
+ * 先把当前周期导出成文件，导出成功后周期号才 +1；旧记录保留还是删除由用户在
+ * 「删除旧记录」开关里决定，任何情况下都不会静默删掉聊天记录。
+ */
+function handleStartNewEpoch() {
+  Modal.confirm({
+    title: t('pages.preference.pair.hints.newEpochTitle'),
+    content: pairStore.settings.chat.deleteOldOnReset
+      ? t('pages.preference.pair.hints.newEpochDeleteOld')
+      : t('pages.preference.pair.hints.newEpochKeepOld'),
+    okText: t('pages.preference.pair.buttons.exportAndReset'),
+    async onOk() {
+      try {
+        const path = await pickExportPath()
+
+        if (!path) {
+          message.info(t('pages.preference.pair.hints.exportCanceled'))
+
+          return
+        }
+
+        const summary = await pairHistoryExport(exportFormat.value, path)
+        const epoch = await pairHistoryStartNewEpoch(pairStore.settings.chat.deleteOldOnReset)
+
+        message.success(t('pages.preference.pair.hints.newEpochDone', {
+          epoch,
+          count: summary.messages,
+        }))
+
+        await emit(LISTEN_KEY.CHAT_HISTORY_RESET)
+        await refreshHistoryStats()
+      } catch (reason) {
+        message.error(String(reason))
+      }
+    },
+  })
+}
 
 // 连接状态由偏好窗口根组件统一订阅（§49 / §50），secret 的「存过没有」只存在于
 // 系统凭据库，页面重新挂载时要重新拉一次，否则重启后看不到「已配置」与删除入口
@@ -42,6 +172,8 @@ onMounted(async () => {
     .catch((reason) => {
       message.error(String(reason))
     })
+
+  await refreshHistoryStats()
 })
 
 const status = computed(() => {
@@ -135,6 +267,20 @@ async function handleDisconnect() {
 function handlePresenceChange(away: boolean) {
   pairStore.settings.presence = away ? 'away' : 'active'
 }
+
+/** §46：偏好页里点一下就能听到提示音，不用等对方发消息（这里的点击也解掉自动播放限制） */
+function handlePreviewSound() {
+  playPairMessageSound(pairStore.settings.chat.notificationVolume).catch(reason =>
+    message.error(String(reason)),
+  )
+}
+
+/** 声音关掉或音量为 0 时点了也不会有声，直接禁用「试听」 */
+const canPreviewSound = computed(
+  () =>
+    pairStore.settings.chat.notificationSound
+    && pairStore.settings.chat.notificationVolume > 0,
+)
 </script>
 
 <template>
@@ -321,6 +467,163 @@ function handlePresenceChange(away: boolean) {
 
     <ProListItem :title="$t('pages.preference.pair.labels.passThrough')">
       <Switch v-model:checked="pairStore.settings.remoteCat.passThrough" />
+    </ProListItem>
+  </ProList>
+
+  <ProList :title="$t('pages.preference.pair.labels.chatSettings')">
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.chatWindow')"
+      :title="$t('pages.preference.pair.labels.showChat')"
+    >
+      <Switch v-model:checked="pairStore.settings.chat.visible" />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.bubbleCount')"
+      :title="$t('pages.preference.pair.labels.bubbleCount')"
+    >
+      <InputNumber
+        v-model:value="pairStore.settings.chat.bubbleCount"
+        class="w-20"
+        :max="20"
+        :min="1"
+      />
+    </ProListItem>
+
+    <ProListItem :title="$t('pages.preference.pair.labels.chatAlwaysOnTop')">
+      <Switch v-model:checked="pairStore.settings.chat.alwaysOnTop" />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.chatPassThrough')"
+      :title="$t('pages.preference.pair.labels.chatPassThrough')"
+    >
+      <Switch v-model:checked="pairStore.settings.chat.passThrough" />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.notificationSound')"
+      :title="$t('pages.preference.pair.labels.notificationSound')"
+    >
+      <Switch v-model:checked="pairStore.settings.chat.notificationSound" />
+    </ProListItem>
+
+    <ProListItem :title="$t('pages.preference.pair.labels.notificationVolume')">
+      <Flex
+        align="center"
+        gap="small"
+      >
+        <Slider
+          v-model:value="pairStore.settings.chat.notificationVolume"
+          class="w-40 m-0!"
+          :disabled="!pairStore.settings.chat.notificationSound"
+          :max="100"
+          :min="0"
+          :tooltip="{
+            formatter(value) {
+              return `${value}%`
+            },
+          }"
+        />
+
+        <Button
+          :disabled="!canPreviewSound"
+          size="small"
+          @click="handlePreviewSound"
+        >
+          {{ $t('pages.preference.pair.buttons.previewSound') }}
+        </Button>
+      </Flex>
+    </ProListItem>
+  </ProList>
+
+  <ProList :title="$t('pages.preference.pair.labels.chatHistory')">
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.chatHistory')"
+      :title="$t('pages.preference.pair.labels.chatHistoryUsage')"
+      vertical
+    >
+      <span>
+        {{ $t('pages.preference.pair.labels.chatHistoryProgress', {
+          epoch: historyStats.epoch,
+          current: historyStats.current,
+          limit: historyLimit,
+          percent: historyPercent,
+        }) }}
+      </span>
+
+      <span class="text-3 color-text-tertiary">
+        {{ $t('pages.preference.pair.labels.chatHistoryTotal', { total: historyStats.total }) }}
+      </span>
+    </ProListItem>
+
+    <ProListItem
+      v-if="historyWarning"
+      vertical
+    >
+      <Alert
+        class="w-full"
+        :message="historyWarning === 'full'
+          ? $t('pages.preference.pair.hints.historyFull')
+          : $t('pages.preference.pair.hints.historyNear')"
+        show-icon
+        :type="historyWarning === 'full' ? 'error' : 'warning'"
+      />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.historyLimit')"
+      :title="$t('pages.preference.pair.labels.historyLimit')"
+    >
+      <InputNumber
+        v-model:value="pairStore.settings.chat.historyMaxMessages"
+        class="w-28"
+        :max="500000"
+        :min="1000"
+        :step="1000"
+      />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.exportFormat')"
+      :title="$t('pages.preference.pair.labels.exportFormat')"
+    >
+      <Select
+        v-model:value="exportFormat"
+        class="w-32"
+        :options="exportFormatOptions"
+      />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.exportChat')"
+      :title="$t('pages.preference.pair.labels.exportChat')"
+    >
+      <Button
+        :loading="exporting"
+        @click="handleExportHistory"
+      >
+        {{ $t('pages.preference.pair.buttons.export') }}
+      </Button>
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.deleteOldOnReset')"
+      :title="$t('pages.preference.pair.labels.deleteOldOnReset')"
+    >
+      <Switch v-model:checked="pairStore.settings.chat.deleteOldOnReset" />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.newEpoch')"
+      :title="$t('pages.preference.pair.labels.newEpoch')"
+    >
+      <Button
+        danger
+        @click="handleStartNewEpoch"
+      >
+        {{ $t('pages.preference.pair.buttons.newEpoch') }}
+      </Button>
     </ProListItem>
   </ProList>
 

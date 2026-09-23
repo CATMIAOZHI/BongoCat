@@ -96,6 +96,10 @@ export interface PairSettings {
     bubbleCount: number
     notificationSound: boolean
     notificationVolume: number
+    /** §36 的本地保存上限，只用于提示进度，绝不静默删除消息 */
+    historyMaxMessages: number
+    /** 开始新的记录周期时，是否删除旧周期的消息（默认保留） */
+    deleteOldOnReset: boolean
   }
 
   privacy: {
@@ -152,6 +156,8 @@ export const usePairStore = defineStore('pair', () => {
       bubbleCount: 5,
       notificationSound: true,
       notificationVolume: 50,
+      historyMaxMessages: 50_000,
+      deleteOldOnReset: false,
     },
     privacy: {
       shareTypingActivity: true,

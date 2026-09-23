@@ -1,11 +1,10 @@
 import { CheckMenuItem, MenuItem, PredefinedMenuItem, Submenu } from '@tauri-apps/api/menu'
-import { error } from '@tauri-apps/plugin-log'
 import { exit, relaunch } from '@tauri-apps/plugin-process'
 import { range } from 'es-toolkit'
 import { useI18n } from 'vue-i18n'
 
 import { WINDOW_LABEL } from '@/constants'
-import { isWindowVisible, showWindow, toggleWindowVisibleByLabel } from '@/plugins/window'
+import { showWindow } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
 import { pairStatusKey, usePairStore } from '@/stores/pair'
 import { isMac } from '@/utils/platform'
@@ -64,8 +63,6 @@ export function useAppMenu() {
   }
 
   const getBaseMenu = async () => {
-    const chatVisible = await isWindowVisible(WINDOW_LABEL.CHAT).catch(() => false)
-
     return await Promise.all([
       MenuItem.new({
         text: t('composables.useAppMenu.labels.preference'),
@@ -100,9 +97,10 @@ export function useAppMenu() {
           ]
         : []),
       MenuItem.new({
-        text: chatVisible ? t('composables.useAppMenu.labels.hideChat') : t('composables.useAppMenu.labels.showChat'),
+        // 和对方猫一样以 store 里的开关为准：窗口真正显示/隐藏由聊天页面跟随开关执行
+        text: pairStore.settings.chat.visible ? t('composables.useAppMenu.labels.hideChat') : t('composables.useAppMenu.labels.showChat'),
         action: () => {
-          toggleWindowVisibleByLabel(WINDOW_LABEL.CHAT, true).catch(reason => error(String(reason)))
+          pairStore.settings.chat.visible = !pairStore.settings.chat.visible
         },
       }),
       PredefinedMenuItem.new({ item: 'Separator' }),

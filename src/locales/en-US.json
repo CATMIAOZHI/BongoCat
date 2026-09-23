@@ -16,6 +16,34 @@
         "total": "Total {keyboard} / {mouse}"
       }
     },
+    "chat": {
+      "labels": {
+        "peer": "Partner"
+      },
+      "hints": {
+        "loading": "Loading chat history...",
+        "empty": "No messages yet — use the shortcut to start typing",
+        "disabled": "Duo mode is not enabled yet",
+        "offline": "Your partner is offline",
+        "backToNewest": "Back to the newest message",
+        "hide": "Hide the chat window",
+        "copy": "Copy this message",
+        "inputHint": "Use the \"Chat Input\" shortcut to open the text box",
+        "inputKeys": "Enter to send · Shift+Enter for a new line · Esc to close",
+        "passThrough": "Pass-through is on, clicks go to the desktop",
+        "textLimit": "{bytes} / 8192 bytes"
+      },
+      "placeholders": {
+        "input": "Type a message..."
+      },
+      "status": {
+        "pending": "Waiting to send",
+        "sent": "Sent",
+        "delivered": "Received by your partner",
+        "failed": "Failed to send",
+        "received": "Received"
+      }
+    },
     "preference": {
       "title": "Preferences",
       "cat": {
@@ -131,6 +159,8 @@
           "passThrough": "Pass Through",
           "alwaysOnTop": "Always on Top",
           "visibleRemoteCat": "Toggle Remote Cat",
+          "visibleChat": "Toggle Chat Window",
+          "toggleChatInput": "Chat Input",
           "toggleAway": "Away / Back"
         },
         "hints": {
@@ -140,6 +170,8 @@
           "passThrough": "Toggle whether the cat window is pass-through.",
           "alwaysOnTop": "Toggle whether the cat window stays on top.",
           "visibleRemoteCat": "Toggle the visibility of the remote cat window.",
+          "visibleChat": "Toggle the visibility of the chat window.",
+          "toggleChatInput": "Open the chat text box; press again or hit Esc to close it.",
           "toggleAway": "Switch between \"away\" and \"back\"."
         }
       },
@@ -161,6 +193,22 @@
           "opacity": "Opacity",
           "alwaysOnTop": "Always on Top",
           "passThrough": "Pass Through",
+          "chatSettings": "Chat",
+          "showChat": "Show Chat Window",
+          "bubbleCount": "Visible Bubbles",
+          "chatAlwaysOnTop": "Chat Always on Top",
+          "chatPassThrough": "Chat Pass Through",
+          "notificationSound": "New Message Sound",
+          "notificationVolume": "Sound Volume",
+          "chatHistory": "Chat History",
+          "chatHistoryUsage": "Local Storage Usage",
+          "chatHistoryProgress": "Cycle {epoch}: {current} / {limit} messages ({percent}%)",
+          "chatHistoryTotal": "{total} messages stored locally",
+          "historyLimit": "Storage Limit",
+          "exportFormat": "Export Format",
+          "exportChat": "Export Chat History",
+          "deleteOldOnReset": "Delete Old Records on Reset",
+          "newEpoch": "Start a New Cycle",
           "privacySettings": "Privacy",
           "shareTypingActivity": "Share Typing Activity",
           "sharePointer": "Share Mouse Activity",
@@ -188,6 +236,25 @@
           "remoteModel": "Leave empty to use the same model as your own cat. Only models installed locally can be chosen.",
           "remoteStats": "Requires your partner to enable \"Share Input Stats\" as well.",
           "windowSize": "Resize the remote cat window.",
+          "chatWindow": "Show the chat window (bubbles) on the desktop.",
+          "bubbleCount": "How many of the newest messages the chat window shows at once; use the wheel to look further back.",
+          "chatPassThrough": "When enabled the chat window lets clicks through; opening the text box temporarily disables it.",
+          "notificationSound": "Play a short sound when a message from your partner arrives.",
+          "notificationVolume": "Sound volume; 0 means muted.",
+          "chatHistory": "Chat history is stored on this device only; export it to keep a copy.",
+          "historyLimit": "Used for the progress hint only — reaching the limit never deletes messages automatically.",
+          "exportFormat": "JSON is best for backups, TXT / Markdown is easy to read.",
+          "exportChat": "Export all locally stored chat messages into one file.",
+          "deleteOldOnReset": "When off (default) the previous cycle's records stay on this device, they just stop showing in the chat window.",
+          "newEpoch": "Export the current records and start a new cycle; the chat window is cleared accordingly.",
+          "historyNear": "Local chat history is close to the storage limit. Consider exporting and starting a new cycle.",
+          "historyFull": "Local chat history reached the storage limit. Please export and start a new cycle.",
+          "chatExported": "Exported {count} messages",
+          "newEpochTitle": "Export and start a new cycle?",
+          "newEpochKeepOld": "The current records are exported to the file you pick, then a new cycle starts. Old records stay on this device.",
+          "newEpochDeleteOld": "The current records are exported to the file you pick, then a new cycle starts and the local old records are deleted.",
+          "newEpochDone": "Started cycle {epoch} ({count} messages exported)",
+          "exportCanceled": "No export location chosen, canceled",
           "shareTypingActivity": "Only the hand side and typing intensity are shared, never the actual keys.",
           "sharePointer": "Only the pointer's screen ratio and button state are shared, never real coordinates.",
           "shareInputStats": "Off by default. When enabled, your partner sees today's and total input counts — still just numbers.",
@@ -204,11 +271,22 @@
           "remoteModel": "Same as mine",
           "awayMessage": "Going for a meal"
         },
+        "options": {
+          "exportFormat": {
+            "json": "JSON (full backup)",
+            "txt": "TXT (plain text)",
+            "md": "Markdown"
+          }
+        },
         "buttons": {
           "save": "Save",
           "delete": "Delete",
           "connect": "Connect",
-          "disconnect": "Disconnect"
+          "disconnect": "Disconnect",
+          "export": "Export",
+          "exportAndReset": "Export and Start New Cycle",
+          "newEpoch": "Start New Cycle",
+          "previewSound": "Preview"
         },
         "status": {
           "disabled": "Disabled",
