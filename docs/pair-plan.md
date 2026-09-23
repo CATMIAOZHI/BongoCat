@@ -38,7 +38,7 @@
 >
 > **平台事实（已核实，2026-09-23）**
 > - Cloudflare WebSocket 单帧上限自 2025-10-31 起为 32 MiB（此前 1 MiB），超限由平台自动 `close 1009`。注意：这管的是 Worker / DO **收到**方向、且按整帧计（含帧头与 nonce/tag）；客户端接收方向的上限未核实，**不要**写进文档或依赖它。512 KiB 分片继续保留。
-> - Durable Object 免费额度：每天 10 万次请求 + 13,000 GB-s/天；超限是「该类型后续操作失败」，relay 直接不可用，所以 R4 / R5 / R6 是硬要求而非优化项。计费折算：**收到的 WebSocket 消息按 20 条 = 1 次请求计**，另加「打开一次 WebSocket 也算 1 次请求」（文档未写明 20:1 换算是否只对入站消息生效，Phase 2 联调时对着 Cloudflare 面板计数器实测一次再定频率参数）。
+> - Durable Object 免费额度：每天 10 万次请求 + 13,000 GB-s/天；超限是「该类型后续操作失败」，relay 直接不可用。计费折算：**收到的 WebSocket 消息按 20 条 = 1 次请求计**，另加「打开一次 WebSocket 也算 1 次请求」，出站不计费。按 3Hz 连续活动估算约 1.3 万次请求/天，额度仍有余量，所以 R4 / R5 / R6 主要作为性能、电量与体验要求保留（不是额度红线）。换算细节 Phase 2 联调时对着 Cloudflare 面板计数器实测一次再定频率参数。
 
 ## 0. 任务目标
 
@@ -2603,7 +2603,7 @@ Application frame 则全部 binary + E2EE。
 
 # 63. Server 限制
 
-> ⚠️ 已被 R8 覆盖：`text/control <= 32 KiB`、`binary <= 1 MiB` 的口径按「含 14 字节帧头 + nonce/tag 的整帧」计算。
+> ⚠️ 已被 R8 覆盖：`text/control <= 32 KiB`、`binary <= 1 MiB` 的口径按「含 14 字节明文帧头 + nonce/tag 的整帧」计算（该口径属于 R8 的一部分）。
 
 应用层主动限制：
 
@@ -2624,7 +2624,7 @@ close 1009
 
 # 64. Server Rate Guard
 
-> ⚠️ 已被 R8 覆盖：DO 可以读取 14 字节明文帧头（kind / transferId / seq），因此能按帧类型分桶限流；但帧头由客户端自报，属「防误用」而非安全边界。密文帧头必须作为 AEAD associated data 参与认证。
+> ⚠️ 已被 R8 覆盖：DO 可以读取 14 字节明文帧头（kind / transferId / seq），因此能按帧类型分桶限流；但帧头由客户端自报，属「防误用」而非安全边界。该明文帧头必须作为 AEAD 的 associated data 参与认证。
 
 做非常轻量保护。
 
