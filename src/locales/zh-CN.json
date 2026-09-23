@@ -3,7 +3,10 @@
     "main": {
       "hints": {
         "redrawing": "重绘中...",
-        "switching": "切换中..."
+        "switching": "切换中...",
+        "recording": "录音中 {seconds}s / {limit}s",
+        "cancelRecording": "取消这次录音",
+        "recordingTooShort": "按得太短，没有发送"
       }
     },
     "remoteCat": {
@@ -33,6 +36,7 @@
         "passThrough": "聊天窗口开着穿透，点击会点到桌面",
         "textLimit": "已输入 {bytes} / 8192 字节",
         "attachment": "附件",
+        "voice": "语音",
         "preview": "查看这张图片",
         "close": "关闭",
         "pickAttachment": "发送文件",
@@ -187,6 +191,7 @@
           "visibleRemoteCat": "打开对方猫",
           "visibleChat": "打开聊天窗口",
           "toggleChatInput": "聊天输入",
+          "pushToTalk": "按住说话",
           "toggleAway": "暂离 / 回来"
         },
         "hints": {
@@ -198,6 +203,7 @@
           "visibleRemoteCat": "切换对方猫咪窗口的显示与隐藏。",
           "visibleChat": "切换聊天窗口的显示与隐藏。",
           "toggleChatInput": "打开聊天输入框；再按一次或按 Esc 关闭。",
+          "pushToTalk": "按住开始录音，松开发送；最长 60 秒，轻点不发送。",
           "toggleAway": "切换「我暂离」与「我回来啦」。"
         }
       },

@@ -249,3 +249,25 @@ export function pairTransferCancel(messageId: string) {
 export function pairAttachmentRetry(messageId: string) {
   return invoke<void>(INVOKE_KEY.PAIR_ATTACHMENT_RETRY, { messageId })
 }
+
+/** §45：单条语音的上限（秒），与 Rust 侧 `MAX_RECORDING_SECS` 一致 */
+export const RECORDING_LIMIT_SECS = 60
+
+/** §45 的按住说话：按下开始录，返回麦克风的原生采样率 */
+export function pairStartRecording() {
+  return invoke<number>(INVOKE_KEY.PAIR_START_RECORDING)
+}
+
+/**
+ * §45 的按住说话：松开发送。
+ *
+ * 返回 `null` 表示这次没发出去：没在录，或者只轻点了一下（< 300 ms）。
+ */
+export function pairStopRecording() {
+  return invoke<ChatMessage | null>(INVOKE_KEY.PAIR_STOP_RECORDING)
+}
+
+/** §45 的「可取消」：这次录音直接丢掉，不发送 */
+export function pairCancelRecording() {
+  return invoke<void>(INVOKE_KEY.PAIR_CANCEL_RECORDING)
+}

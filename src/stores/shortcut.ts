@@ -7,6 +7,7 @@ export type HotKey
     | 'visibleRemoteCat'
     | 'visibleChat'
     | 'toggleChatInput'
+    | 'pushToTalk'
     | 'mirrorMode'
     | 'penetrable'
     | 'alwaysOnTop'
@@ -18,6 +19,7 @@ export const useShortcutStore = defineStore('shortcut', () => {
   const visibleRemoteCat = ref('')
   const visibleChat = ref('')
   const toggleChatInput = ref('')
+  const pushToTalk = ref('')
   const mirrorMode = ref('')
   const penetrable = ref('')
   const alwaysOnTop = ref('')
@@ -29,6 +31,7 @@ export const useShortcutStore = defineStore('shortcut', () => {
     visibleRemoteCat,
     visibleChat,
     toggleChatInput,
+    pushToTalk,
     mirrorMode,
     penetrable,
     alwaysOnTop,

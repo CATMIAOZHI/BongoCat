@@ -3,7 +3,10 @@
     "main": {
       "hints": {
         "redrawing": "Redrawing...",
-        "switching": "Switching..."
+        "switching": "Switching...",
+        "recording": "Recording {seconds}s / {limit}s",
+        "cancelRecording": "Discard this recording",
+        "recordingTooShort": "Too short, nothing was sent"
       }
     },
     "remoteCat": {
@@ -33,6 +36,7 @@
         "passThrough": "Pass-through is on, clicks go to the desktop",
         "textLimit": "{bytes} / 8192 bytes",
         "attachment": "Attachment",
+        "voice": "Voice message",
         "preview": "View this image",
         "close": "Close",
         "pickAttachment": "Send a file",
@@ -187,6 +191,7 @@
           "visibleRemoteCat": "Toggle Remote Cat",
           "visibleChat": "Toggle Chat Window",
           "toggleChatInput": "Chat Input",
+          "pushToTalk": "Push to Talk",
           "toggleAway": "Away / Back"
         },
         "hints": {
@@ -198,6 +203,7 @@
           "visibleRemoteCat": "Toggle the visibility of the remote cat window.",
           "visibleChat": "Toggle the visibility of the chat window.",
           "toggleChatInput": "Open the chat text box; press again or hit Esc to close it.",
+          "pushToTalk": "Hold to record, release to send. Up to 60 seconds; a quick tap sends nothing.",
           "toggleAway": "Switch between \"away\" and \"back\"."
         }
       },

@@ -136,6 +136,13 @@ useKeyPress(toggleAway, () => {
     </ProListItem>
 
     <ProListItem
+      :description="$t('pages.preference.shortcut.hints.pushToTalk')"
+      :title="$t('pages.preference.shortcut.labels.pushToTalk')"
+    >
+      <Shortcut v-model="shortcutStore.pushToTalk" />
+    </ProListItem>
+
+    <ProListItem
       :description="$t('pages.preference.shortcut.hints.toggleAway')"
       :title="$t('pages.preference.shortcut.labels.toggleAway')"
     >

@@ -10,18 +10,23 @@ import { exists, readDir } from '@tauri-apps/plugin-fs'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
 import { round } from 'es-toolkit'
 import { nth } from 'es-toolkit/compat'
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { useAppMenu } from '@/composables/useAppMenu'
 import { useDevice } from '@/composables/useDevice'
 import { useGamepad } from '@/composables/useGamepad'
+import { useKeyStateShortcut } from '@/composables/useKeyStateShortcut'
 import { useModel } from '@/composables/useModel'
+import { RECORDING_LIMIT_SECS } from '@/composables/usePair'
+import { usePairVoiceRecorder } from '@/composables/usePairVoice'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
 import { hideWindow, setAlwaysOnTop, setTaskbarVisibility, showWindow } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
 import { useGeneralStore } from '@/stores/general.ts'
 import { useModelStore } from '@/stores/model'
+import { useShortcutStore } from '@/stores/shortcut'
 import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
@@ -35,9 +40,35 @@ const catStore = useCatStore()
 const { getBaseMenu, getExitMenu } = useAppMenu()
 const modelStore = useModelStore()
 const generalStore = useGeneralStore()
+const shortcutStore = useShortcutStore()
+const { pushToTalk } = storeToRefs(shortcutStore)
+const {
+  recording,
+  seconds: recordingSeconds,
+  error: recordingError,
+  skipped: recordingSkipped,
+  press: pressToTalk,
+  release: releaseToTalk,
+  cancel: cancelRecording,
+} = usePairVoiceRecorder()
 const resizing = ref(false)
 const backgroundImagePath = ref<string>()
 const { stickActive } = useGamepad()
+
+/** 录音提示、失败原因与「太短没发出去」共用一块位置 */
+const showVoiceOverlay = computed(() => {
+  return recording.value || Boolean(recordingError.value) || recordingSkipped.value
+})
+
+/**
+ * §45 的按住说话。
+ *
+ * 注册放在猫咪窗口：它是唯一一直活着、用户也一直看得见的窗口，录音提示与
+ * 「取消」都挂在这里，按下与松开就都在同一个窗口里处理（不用跨窗口发事件）。
+ */
+useKeyStateShortcut(pushToTalk, (pressed) => {
+  pressed ? pressToTalk() : releaseToTalk()
+})
 
 onMounted(startListening)
 
@@ -211,6 +242,43 @@ function handleMouseMove(event: MouseEvent) {
       <span class="text-center text-[10vw] text-[#fff]">
         {{ resizing ? $t('pages.main.hints.redrawing') : $t('pages.main.hints.switching') }}
       </span>
+    </div>
+
+    <div
+      v-show="showVoiceOverlay"
+      class="flex flex-col items-center justify-end gap-1 pb-[4%]"
+    >
+      <div
+        v-if="recording"
+        class="pointer-events-auto flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+        @mousedown.stop
+      >
+        <span class="i-lucide:mic size-[1.1em] animate-pulse text-[#ff7875]" />
+
+        <span>
+          {{ $t('pages.main.hints.recording', { seconds: recordingSeconds, limit: RECORDING_LIMIT_SECS }) }}
+        </span>
+
+        <span
+          class="i-lucide:circle-x size-[1.2em] cursor-pointer hover:text-[#ff7875]"
+          :title="$t('pages.main.hints.cancelRecording')"
+          @click="cancelRecording"
+        />
+      </div>
+
+      <div
+        v-else-if="recordingError"
+        class="bg-[#d4380d]/85 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+      >
+        {{ recordingError }}
+      </div>
+
+      <div
+        v-else
+        class="bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+      >
+        {{ $t('pages.main.hints.recordingTooShort') }}
+      </div>
     </div>
   </div>
 </template>

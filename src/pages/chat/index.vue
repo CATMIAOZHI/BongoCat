@@ -608,7 +608,9 @@ onMounted(async () => {
                 />
 
                 <span class="min-w-0 truncate">
-                  {{ attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment') }}
+                  {{ item.kind === 'voice'
+                    ? $t('pages.chat.hints.voice')
+                    : (attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment')) }}
                 </span>
               </div>
 

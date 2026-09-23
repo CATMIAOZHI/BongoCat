@@ -55,6 +55,9 @@ export const INVOKE_KEY = {
   PAIR_TRANSFER_REJECT: 'pair_transfer_reject',
   PAIR_TRANSFER_CANCEL: 'pair_transfer_cancel',
   PAIR_ATTACHMENT_RETRY: 'pair_attachment_retry',
+  PAIR_START_RECORDING: 'pair_start_recording',
+  PAIR_STOP_RECORDING: 'pair_stop_recording',
+  PAIR_CANCEL_RECORDING: 'pair_cancel_recording',
 }
 
 export const LANGUAGE = {
