@@ -1,0 +1,25 @@
+[package]
+name = "bongocat-pair-relay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Self-hosted BongoCat pair relay: one instance serves exactly one pair"
+
+# 这个 crate 独立于仓库根目录的 workspace（根 workspace 只包含 src-tauri）。
+# 没有这张表时，cargo 会因为「目录在工作区里但不是成员」而拒绝编译。
+[workspace]
+
+[dependencies]
+base64 = "0.23.1"
+futures-util = "0.3.34"
+hkdf = "0.13.0"
+rand = "0.10.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+tokio-tungstenite = "0.30.0"
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]`（把虚拟时钟直接推到定时器）需要 test-util
+tokio = { version = "1.53.1", features = ["test-util"] }
