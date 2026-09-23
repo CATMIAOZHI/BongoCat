@@ -1,0 +1,25 @@
+{
+  "name": "bongocat-pair-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fixed two-person relay for BongoCat pair mode (Cloudflare Worker + Durable Object)",
+  "packageManager": "pnpm@11.17.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types",
+    "pair:generate": "node scripts/generate-pair.mjs",
+    "pair:selftest": "node scripts/pair-selftest.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@vitest/runner": "^4.1.11",
+    "@vitest/snapshot": "^4.1.11",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.136.1"
+  }
+}

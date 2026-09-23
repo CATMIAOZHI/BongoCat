@@ -1,0 +1,4 @@
+# pnpm 11 起构建脚本许可配置放在这里（旧的 package.json `pnpm` 字段已不再读取）
+allowBuilds:
+  esbuild: true
+  workerd: true

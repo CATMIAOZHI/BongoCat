@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bongocat-pair-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // 一个部署实例对应一对用户，所以固定挂在同一个 Durable Object 上，不需要 room id
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAIR",
+        "class_name": "PairDurableObject"
+      }
+    ]
+  },
+  // 即使不使用数据库也选择 SQLite 后端（Free 计划支持的 Durable Object 类型）
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PairDurableObject"]
+    }
+  ]
+}
