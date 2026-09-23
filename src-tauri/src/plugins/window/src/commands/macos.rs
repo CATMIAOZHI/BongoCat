@@ -13,6 +13,9 @@ fn is_main_window<R: Runtime>(window: &WebviewWindow<R>) -> bool {
     window.label() == MAIN_WINDOW_LABEL
 }
 
+/// macOS 通过 NSPanel 层级控制置顶，没有保持线程，这里是空实现
+pub fn stop_topmost_keep_alive(_label: &str) {}
+
 fn set_macos_panel<R: Runtime>(
     app_handle: &AppHandle<R>,
     window: &WebviewWindow<R>,

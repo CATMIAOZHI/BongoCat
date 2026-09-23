@@ -33,6 +33,37 @@
         "minWidth": 800,
         "minHeight": 600,
         "skipTaskbar": true
+      },
+      {
+        "label": "remote-cat",
+        "url": "index.html/#/remote-cat",
+        "visible": false,
+        "title": "BongoCat",
+        "shadow": false,
+        "alwaysOnTop": true,
+        "transparent": true,
+        "decorations": false,
+        "acceptFirstMouse": true,
+        "skipTaskbar": true,
+        "maximizable": false
+      },
+      {
+        "label": "chat",
+        "url": "index.html/#/chat",
+        "visible": false,
+        "title": "BongoCat Chat",
+        "shadow": false,
+        "alwaysOnTop": true,
+        "transparent": true,
+        "decorations": false,
+        "resizable": true,
+        "acceptFirstMouse": true,
+        "skipTaskbar": true,
+        "width": 320,
+        "height": 420,
+        "minWidth": 240,
+        "minHeight": 160,
+        "maximizable": false
       }
     ],
     "security": {

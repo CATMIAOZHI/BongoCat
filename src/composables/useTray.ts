@@ -17,6 +17,7 @@ import { GITHUB_LINK, LISTEN_KEY } from '../constants'
 import { showWindow } from '../plugins/window'
 import { isMac } from '../utils/platform'
 import { useAppMenu } from './useAppMenu'
+import { useTauriListen } from './useTauriListen'
 
 const TRAY_ID = 'BONGO_CAT_TRAY'
 
@@ -33,6 +34,9 @@ export function useTray() {
   watchDebounced([() => catStore.window.scale, () => catStore.window.opacity], () => {
     updateTrayMenu()
   }, { debounce: 200 })
+
+  // 对方猫 / 聊天窗口的显示状态变化后需要重建托盘菜单，否则条目文案会停留在旧方向
+  useTauriListen(LISTEN_KEY.WINDOW_VISIBILITY_CHANGED, updateTrayMenu)
 
   const getTrayById = () => {
     return TrayIcon.getById(TRAY_ID)

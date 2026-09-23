@@ -2,17 +2,23 @@ import type { RouteRecordRaw } from 'vue-router'
 
 import { createRouter, createWebHashHistory } from 'vue-router'
 
-import Main from '../pages/main/index.vue'
-import Preference from '../pages/preference/index.vue'
-
+// 每个窗口都是独立的 WebView；按路由懒加载可让聊天窗口不必加载 Live2D / pixi.js
 const routes: Readonly<RouteRecordRaw[]> = [
   {
     path: '/',
-    component: Main,
+    component: () => import('../pages/main/index.vue'),
   },
   {
     path: '/preference',
-    component: Preference,
+    component: () => import('../pages/preference/index.vue'),
+  },
+  {
+    path: '/remote-cat',
+    component: () => import('../pages/remote-cat/index.vue'),
+  },
+  {
+    path: '/chat',
+    component: () => import('../pages/chat/index.vue'),
   },
 ]
 

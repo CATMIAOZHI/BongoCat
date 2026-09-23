@@ -17,6 +17,17 @@ export type WindowState = Record<string, Partial<PhysicalPosition & PhysicalSize
 const appWindow = getCurrentWebviewWindow()
 const { label } = appWindow
 
+/** 这些窗口贴在桌面上作为浮层，位置与尺寸都按 label 独立保存 */
+const OVERLAY_WINDOW_LABELS: string[] = [
+  WINDOW_LABEL.MAIN,
+  WINDOW_LABEL.REMOTE_CAT,
+  WINDOW_LABEL.CHAT,
+]
+
+export function isOverlayWindow(label: string) {
+  return OVERLAY_WINDOW_LABELS.includes(label)
+}
+
 export function useWindowState() {
   const appStore = useAppStore()
   const catStore = useCatStore()
@@ -30,8 +41,18 @@ export function useWindowState() {
     appWindow.onScaleChanged(clampToMonitor)
   })
 
+  const shouldKeepInScreen = () => {
+    if (!isOverlayWindow(label)) return false
+
+    if (label === WINDOW_LABEL.MAIN) return catStore.window.keepInScreen
+
+    // 对方猫 / 聊天窗口后续会读取各自在 pair store 里的 keepInScreen 设置；
+    // 在 Pair 功能落地前，这两类浮层窗口允许贴边或跨屏，不强制拉回屏幕内
+    return false
+  }
+
   const clampToMonitor = useDebounceFn(async () => {
-    if (label !== WINDOW_LABEL.MAIN || !catStore.window.keepInScreen) return
+    if (!shouldKeepInScreen()) return
 
     const monitor = await getCursorMonitor()
 

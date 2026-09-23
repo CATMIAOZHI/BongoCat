@@ -1,7 +1,9 @@
-use tauri::{AppHandle, Manager, async_runtime::spawn};
+use tauri::{AppHandle, Manager, Runtime, async_runtime::spawn, command};
 
 pub static MAIN_WINDOW_LABEL: &str = "main";
 pub static PREFERENCE_WINDOW_LABEL: &str = "preference";
+pub static REMOTE_CAT_WINDOW_LABEL: &str = "remote-cat";
+pub static CHAT_WINDOW_LABEL: &str = "chat";
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -27,6 +29,65 @@ pub fn show_main_window(app_handle: &AppHandle) {
 
 pub fn show_preference_window(app_handle: &AppHandle) {
     show_window_by_label(app_handle, PREFERENCE_WINDOW_LABEL);
+}
+
+/// 按窗口 label 显示窗口，供任意窗口切换其它窗口（例如主窗口显示对方猫/聊天窗口）
+#[command]
+pub async fn show_window_label<R: Runtime>(
+    app_handle: AppHandle<R>,
+    label: String,
+    focus: Option<bool>,
+) -> Result<(), String> {
+    let Some(window) = app_handle.get_webview_window(&label) else {
+        return Err(format!("window not found: {label}"));
+    };
+
+    let focus = focus.unwrap_or(false);
+
+    if label == MAIN_WINDOW_LABEL {
+        show_window(app_handle.clone(), window).await;
+    } else {
+        let _ = window.show();
+        let _ = window.unminimize();
+
+        if focus {
+            let _ = window.set_focus();
+        }
+    }
+
+    Ok(())
+}
+
+/// 按窗口 label 隐藏窗口
+#[command]
+pub async fn hide_window_label<R: Runtime>(
+    app_handle: AppHandle<R>,
+    label: String,
+) -> Result<(), String> {
+    let Some(window) = app_handle.get_webview_window(&label) else {
+        return Err(format!("window not found: {label}"));
+    };
+
+    if label == MAIN_WINDOW_LABEL {
+        hide_window(app_handle.clone(), window).await;
+    } else {
+        let _ = window.hide();
+    }
+
+    Ok(())
+}
+
+/// 读取窗口当前是否可见
+#[command]
+pub async fn is_window_visible<R: Runtime>(
+    app_handle: AppHandle<R>,
+    label: String,
+) -> Result<bool, String> {
+    let Some(window) = app_handle.get_webview_window(&label) else {
+        return Err(format!("window not found: {label}"));
+    };
+
+    window.is_visible().map_err(|err| err.to_string())
 }
 
 fn show_window_by_label(app_handle: &AppHandle, label: &str) {

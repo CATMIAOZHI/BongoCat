@@ -2,4 +2,12 @@
 
 [default]
 description = "Default permissions for the plugin"
-permissions = ["allow-show-window", "allow-hide-window", "allow-set-always-on-top", "allow-set-taskbar-visibility"]
+permissions = [
+    "allow-show-window",
+    "allow-hide-window",
+    "allow-set-always-on-top",
+    "allow-set-taskbar-visibility",
+    "allow-show-window-label",
+    "allow-hide-window-label",
+    "allow-is-window-visible",
+]

@@ -68,6 +68,9 @@ pub fn run() {
 
                 api.prevent_close();
             }
+            WindowEvent::Destroyed => {
+                tauri_plugin_custom_window::stop_topmost_keep_alive(window.label());
+            }
             _ => {}
         })
         .build(tauri::generate_context!())
