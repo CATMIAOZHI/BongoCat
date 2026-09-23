@@ -27,8 +27,8 @@ use super::history::{
 use super::protocol::{
     AppEnvelope, ChatAckPayload, ChatTextPayload, FrameHeader, FrameKind, InputStats,
     MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PetSnapshot, PresencePayload, PresenceState,
-    RecentMessageIds, ServerFrame, TransferIdPayload, TransferKind, TransferOfferPayload,
-    TransferRejectPayload, TransferVerifiedPayload, message_type, now_millis,
+    RecentMessageIds, RelayLimits, ServerFrame, TransferIdPayload, TransferKind,
+    TransferOfferPayload, TransferRejectPayload, TransferVerifiedPayload, message_type, now_millis,
 };
 use super::secret;
 use super::transfer::{
@@ -79,6 +79,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 单次写入的时限。对端不读数据时 `send` 会一直等待；有了它，卡住的 socket 会在
 /// 十几秒内被判定为断开并进入重连，disconnect 与心跳也都还能继续工作。
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// 等中继握手后的第一帧（`server.welcome`）的上限：它本该立刻到达
+const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1036,6 +1038,25 @@ impl Pacer {
 
         Duration::from_secs_f64((1.0 - self.tokens) / self.rate)
     }
+
+    /// 换一套额度（R20）：中继在 `server.welcome` 里广告了自己的限流上限时按它重设。
+    ///
+    /// 先把当前令牌补满再夹到新容量以内，这样缩容之后不会留下「超过容量」的怪状态，
+    /// 一次离线补发也不会因为这次调整被拉爆。
+    fn retune(&mut self, rate: f64, burst: f64) {
+        self.refill_now();
+        self.rate = if rate.is_finite() && rate > 0.0 {
+            rate
+        } else {
+            self.rate
+        };
+        self.burst = if burst.is_finite() && burst >= 1.0 {
+            burst
+        } else {
+            self.burst
+        };
+        self.tokens = self.tokens.min(self.burst);
+    }
 }
 
 enum Outcome {
@@ -1203,6 +1224,54 @@ async fn run_session(
     });
 }
 
+/// 等中继握手后的第一帧：`server.welcome`（CF 版与自建版都保证它最先发）。
+///
+/// R20：在拿到它之前**不能补发任何东西**——那时还不知道中继广告的额度，用缺省的
+/// 20/20 先冲一批就可能撞穿一个更小的自建额度、被 `close 1008` 踢掉。
+async fn read_welcome<S, E>(
+    stream: &mut S,
+    manager: &Arc<PairManager>,
+    generation: u64,
+) -> Result<RelayLimits, PairFailure>
+where
+    S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let deadline = tokio::time::Instant::now() + WELCOME_TIMEOUT;
+
+    loop {
+        let message = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(error))) => {
+                return Err(PairFailure {
+                    message: format!("连接错误: {error}"),
+                    fatal: false,
+                });
+            }
+            Ok(None) => return Err(describe_close(None)),
+            Err(_) => {
+                return Err(PairFailure {
+                    message: "等待中继握手超时".to_string(),
+                    fatal: false,
+                });
+            }
+        };
+
+        match message {
+            Message::Text(text) => {
+                if let Some(limits) = handle_server_frame(manager, generation, text.as_str())? {
+                    return Ok(limits);
+                }
+            }
+            Message::Close(frame) => {
+                return Err(describe_close(frame.map(|frame| frame.code.into())));
+            }
+            // welcome 之前不该有别的帧；真收到就忽略（不丢数据，主循环接着处理后面的）
+            _ => {}
+        }
+    }
+}
+
 async fn live(
     manager: &Arc<PairManager>,
     generation: u64,
@@ -1214,6 +1283,16 @@ async fn live(
     let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
     // 附件分片另有一层额度（R18）：两套都放行才发一块
     let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+
+    // R20：先读掉 `server.welcome` 再开始补发（额度就在它里面）
+    let limits = match read_welcome(&mut stream, manager, generation).await {
+        Ok(limits) => limits,
+        Err(error) => return Outcome::Lost(error),
+    };
+    let outbound = limits.outbound();
+
+    pacer.retune(outbound.frames_per_second, outbound.frames_burst);
+    chunk_pacer.retune(outbound.chunks_per_second, outbound.chunks_burst);
 
     if let Err(error) = flush(&mut sink, state, &mut pacer).await {
         return Outcome::Lost(PairFailure {
@@ -1424,8 +1503,20 @@ async fn live(
                         }
                     }
                     Ok(Message::Text(text)) => {
-                        if let Err(error) = handle_server_frame(manager, generation, text.as_str()) {
-                            return Outcome::Lost(error);
+                        match handle_server_frame(manager, generation, text.as_str()) {
+                            Err(error) => return Outcome::Lost(error),
+                            // R20：正常路径上 welcome 已经被 `read_welcome` 读掉并应用过；
+                            // 这里兜住「中继再广告一次额度」的情况（重设是幂等的）
+                            Ok(Some(limits)) => {
+                                let outbound = limits.outbound();
+
+                                pacer.retune(outbound.frames_per_second, outbound.frames_burst);
+                                chunk_pacer.retune(
+                                    outbound.chunks_per_second,
+                                    outbound.chunks_burst,
+                                );
+                            }
+                            Ok(None) => {}
                         }
                     }
                     Ok(Message::Close(frame)) => {
@@ -2521,19 +2612,20 @@ fn handle_server_frame(
     manager: &Arc<PairManager>,
     generation: u64,
     text: &str,
-) -> Result<(), PairFailure> {
+) -> Result<Option<RelayLimits>, PairFailure> {
     // R18：text 只用于服务端控制帧，未知或畸形的控制帧按忽略处理。
     // 当成致命错误会让我们在中继新增一条控制帧时反复断线重连。
     let Ok(frame) = serde_json::from_str::<ServerFrame>(text) else {
         tauri_plugin_log::log::warn!("忽略无法解析的中继控制帧");
 
-        return Ok(());
+        return Ok(None);
     };
 
     match frame {
         ServerFrame::Welcome {
             protocol,
             peer_online,
+            limits,
         } => {
             if protocol != PROTOCOL_VERSION {
                 return Err(PairFailure {
@@ -2544,21 +2636,23 @@ fn handle_server_frame(
 
             publish_peer(manager, generation, peer_online);
 
-            Ok(())
+            // 中继没广告额度（旧中继）时就用 CF 的缺省推导，语义上「这次连接的有效额度」
+            // 永远是确定的，会话层只管照着重设
+            Ok(Some(limits.unwrap_or_else(RelayLimits::cloudflare)))
         }
         ServerFrame::Peer { online, device_id } => {
             if device_id == manager.device_id() {
-                return Ok(());
+                return Ok(None);
             }
 
             publish_peer(manager, generation, online);
 
-            Ok(())
+            Ok(None)
         }
         ServerFrame::Error { code, message } => {
             manager.emit_error(generation, format!("中继错误 {code}: {message}"));
 
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -3230,6 +3324,61 @@ mod tests {
         // 分片这一路要和中继的分片桶留出余量：贴死之后任何到达间隔抖动都会扣穿它
         assert!(OUTBOUND_CHUNK_BURST < RELAY_CHUNKS_PER_SECOND);
         assert!(OUTBOUND_CHUNKS_PER_SECOND < RELAY_CHUNKS_PER_SECOND);
+    }
+
+    /// R20：缺省的四元组必须就是 CF 广告值的推导结果，否则「不改行为」的承诺会漂
+    #[test]
+    fn the_default_pacing_is_the_cloudflare_derivation() {
+        let derived = RelayLimits::cloudflare().outbound();
+
+        assert_eq!(derived.frames_per_second, OUTBOUND_FRAMES_PER_SECOND);
+        assert_eq!(derived.frames_burst, OUTBOUND_BURST);
+        assert_eq!(derived.chunks_per_second, OUTBOUND_CHUNKS_PER_SECOND);
+        assert_eq!(derived.chunks_burst, OUTBOUND_CHUNK_BURST);
+    }
+
+    /// R20：中继广告更高额度时客户端跟着放大，但仍然留余量
+    #[test]
+    fn retuning_the_pacer_follows_the_advertised_limits() {
+        let mut frame = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let outbound = RelayLimits {
+            frames_per_second: 90.0,
+            ..RelayLimits::cloudflare()
+        }
+        .outbound();
+
+        frame.retune(outbound.frames_per_second, outbound.frames_burst);
+
+        assert_eq!(frame.rate, 60.0);
+        assert_eq!(frame.burst, 60.0);
+        assert!(frame.tokens <= frame.burst);
+    }
+
+    /// 缩容时不能留着超过容量的令牌，否则一次补发就能把中继的桶扣穿
+    #[test]
+    fn retuning_downwards_clamps_the_buffered_tokens() {
+        let mut frame = Pacer::new(20.0, 20.0);
+
+        frame.tokens = 20.0;
+        frame.retune(2.0, 2.0);
+
+        assert_eq!(frame.rate, 2.0);
+        assert_eq!(frame.burst, 2.0);
+        assert!(frame.tokens <= 2.0, "缩容后不该留下超过容量的令牌");
+    }
+
+    /// 离谱的额度（0 / NaN）不该把 Pacer 弄坏：按原样保留
+    #[test]
+    fn retuning_ignores_insane_values() {
+        let mut frame = Pacer::new(20.0, 20.0);
+
+        frame.retune(0.0, 0.0);
+        assert_eq!(frame.rate, 20.0);
+        assert_eq!(frame.burst, 20.0);
+
+        frame.retune(f64::NAN, f64::NAN);
+        assert_eq!(frame.rate, 20.0);
+        assert_eq!(frame.burst, 20.0);
     }
 
     /// 单看「突发 < 中继上限」还不够：真正的不变量是**任意时刻累计放行量**都不超过中继的

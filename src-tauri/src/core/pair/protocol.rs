@@ -384,6 +384,10 @@ pub enum ServerFrame {
         protocol: u8,
         #[serde(rename = "peerOnline")]
         peer_online: bool,
+        /// R20：自建中继会广告自己的限流额度；旧中继没有这个字段，
+        /// 畸形或不合常理的额度按「没广告」处理（见 `deserialize_limits`）。
+        #[serde(default, deserialize_with = "deserialize_limits")]
+        limits: Option<RelayLimits>,
     },
     #[serde(rename = "server.peer")]
     Peer {
@@ -393,6 +397,125 @@ pub enum ServerFrame {
     },
     #[serde(rename = "server.error")]
     Error { code: String, message: String },
+}
+
+/// 中继在 `server.welcome` 里广告的限流额度（R20）。
+///
+/// 旧中继（例如已经部署的 Cloudflare 版）不带这个字段，所以它永远是可选的；
+/// 缺失时按 CF 的缺省值 30 / 20 / 12 MiB 推导客户端自己的出站额度。
+///
+/// 三个维度**各自独立**判定：某一个字段坏掉只让它退回缺省，不会把另外两个一起丢掉。
+/// 超过上限的值会被夹住——中继是对方维护的，一个出错或恶意的中继不该能把客户端的
+/// 出站速率推到任意高。
+///
+/// 客户端目前只消费 `framesPerSecond` 与 `chunksPerSecond`：`bytesPerSecond` 是中继
+/// 自己的字节桶（保护它不被大帧打爆），而客户端的字节速率由「分片大小 × 分片速率」
+/// 决定，本来就低于它。
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayLimits {
+    pub frames_per_second: f64,
+    pub chunks_per_second: f64,
+    pub bytes_per_second: f64,
+}
+
+impl RelayLimits {
+    /// CF 版（也是旧中继）的缺省额度：没有广告值时用它
+    pub const fn cloudflare() -> Self {
+        Self {
+            frames_per_second: 30.0,
+            chunks_per_second: 20.0,
+            bytes_per_second: 12.0 * 1024.0 * 1024.0,
+        }
+    }
+
+    /// 客户端自己的出站额度。
+    ///
+    /// R20：**不 1:1 取用**广告值，而是按今天的比例留出余量——帧取 2/3
+    /// （CF 30 → 20）、分片取 3/4（20 → 15）、分片突发取 1/2（20 → 10）。
+    /// 贴死上限时，任何到达间隔抖动都会把中继的令牌桶扣穿、被 `close 1008`。
+    pub fn outbound(self) -> OutboundLimits {
+        // 先乘后除：30 * 2 / 3 正好是 20，不会因为浮点误差变成 19.999…
+        let frames_per_second =
+            self.frames_per_second * FRAME_RATE_NUMERATOR / FRAME_RATE_DENOMINATOR;
+        let chunks_per_second =
+            self.chunks_per_second * CHUNK_RATE_NUMERATOR / CHUNK_RATE_DENOMINATOR;
+
+        OutboundLimits {
+            // 下限 1/秒：广告值再离谱也不能推成 0（0 会让等待时长除零、永远发不出帧）
+            frames_per_second: frames_per_second.max(1.0),
+            frames_burst: frames_per_second.max(1.0),
+            chunks_per_second: chunks_per_second.max(1.0),
+            chunks_burst: (self.chunks_per_second * CHUNK_BURST_NUMERATOR
+                / CHUNK_BURST_DENOMINATOR)
+                .max(1.0),
+        }
+    }
+}
+
+/// 帧额度取广告值的 2/3（CF 30 → 20）
+const FRAME_RATE_NUMERATOR: f64 = 2.0;
+const FRAME_RATE_DENOMINATOR: f64 = 3.0;
+/// 分片额度取广告值的 3/4（CF 20 → 15）
+const CHUNK_RATE_NUMERATOR: f64 = 3.0;
+const CHUNK_RATE_DENOMINATOR: f64 = 4.0;
+/// 分片突发取广告值的 1/2（CF 20 → 10）
+const CHUNK_BURST_NUMERATOR: f64 = 1.0;
+const CHUNK_BURST_DENOMINATOR: f64 = 2.0;
+
+/// 采信广告值的上限：再高也不认（中继是对方维护的，不能被它推成任意速率）
+const MAX_ADVERTISED_FRAMES_PER_SECOND: f64 = 240.0;
+const MAX_ADVERTISED_CHUNKS_PER_SECOND: f64 = 240.0;
+const MAX_ADVERTISED_BYTES_PER_SECOND: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// 客户端实际使用的出站节奏（见 `RelayLimits::outbound`）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutboundLimits {
+    pub frames_per_second: f64,
+    pub frames_burst: f64,
+    pub chunks_per_second: f64,
+    pub chunks_burst: f64,
+}
+
+/// 容忍畸形的 `limits`：先当普通 JSON 读出来，解析失败或不合理就当作「没广告」。
+///
+/// 直接用 `Option<RelayLimits>` 的话，一个坏字段（例如 `framesPerSecond: "x"`）会让
+/// 整条 `server.welcome` 变成「无法解析」，连 `peerOnline` 一起丢掉。
+fn deserialize_limits<'de, D>(deserializer: D) -> Result<Option<RelayLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let fallback = RelayLimits::cloudflare();
+
+    Ok(Some(RelayLimits {
+        frames_per_second: advertised(
+            object.get("framesPerSecond"),
+            fallback.frames_per_second,
+            MAX_ADVERTISED_FRAMES_PER_SECOND,
+        ),
+        chunks_per_second: advertised(
+            object.get("chunksPerSecond"),
+            fallback.chunks_per_second,
+            MAX_ADVERTISED_CHUNKS_PER_SECOND,
+        ),
+        bytes_per_second: advertised(
+            object.get("bytesPerSecond"),
+            fallback.bytes_per_second,
+            MAX_ADVERTISED_BYTES_PER_SECOND,
+        ),
+    }))
+}
+
+/// 取一个维度：缺失 / 非数字 / 非正的有限数都退回缺省，超过上限就夹住
+fn advertised(value: Option<&Value>, fallback: f64, max: f64) -> f64 {
+    match value.and_then(Value::as_f64) {
+        Some(value) if value.is_finite() && value > 0.0 => value.min(max),
+        _ => fallback,
+    }
 }
 
 /// 最近处理过的消息 id，用于丢弃重连/重发带来的重复消息
@@ -483,6 +606,138 @@ mod tests {
         assert_eq!(parsed.payload["state"], "away");
     }
 
+    /// R20：自建中继会广告限流额度；旧中继没有这个字段；坏值不影响其余字段
+    #[test]
+    fn welcome_limits_are_optional_and_tolerant() {
+        let advertised: ServerFrame = serde_json::from_str(
+            r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":{"framesPerSecond":60,"chunksPerSecond":20,"bytesPerSecond":12582912}}"#,
+        )
+        .unwrap();
+
+        let ServerFrame::Welcome {
+            limits: Some(limits),
+            ..
+        } = advertised
+        else {
+            panic!("应当解析出 limits");
+        };
+
+        assert_eq!(limits.frames_per_second, 60.0);
+        assert_eq!(limits.chunks_per_second, 20.0);
+        assert_eq!(limits.bytes_per_second, 12.0 * 1024.0 * 1024.0);
+
+        // 畸形的字段不能让整条 welcome 解析失败，也不能影响 peerOnline；坏字段只让它
+        // 自己退回缺省，不会连带丢掉另外两个维度
+        let defaults = RelayLimits::cloudflare();
+
+        for (bad, frames, chunks, bytes) in [
+            // 只有 framesPerSecond 坏掉：另外两维照常保留
+            (
+                r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":{"framesPerSecond":"x"}}"#,
+                defaults.frames_per_second,
+                defaults.chunks_per_second,
+                defaults.bytes_per_second,
+            ),
+            // framesPerSecond 是 0（非正）→ 退回缺省；bytesPerSecond 是 1 → 照常保留
+            (
+                r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":{"framesPerSecond":0,"chunksPerSecond":20,"bytesPerSecond":1}}"#,
+                defaults.frames_per_second,
+                20.0,
+                1.0,
+            ),
+            // 空对象：三维全部退回缺省
+            (
+                r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":{}}"#,
+                defaults.frames_per_second,
+                defaults.chunks_per_second,
+                defaults.bytes_per_second,
+            ),
+        ] {
+            let ServerFrame::Welcome {
+                protocol,
+                peer_online,
+                limits,
+            } = serde_json::from_str::<ServerFrame>(bad).unwrap()
+            else {
+                panic!("应当仍然是 welcome: {bad}");
+            };
+
+            assert_eq!(protocol, 1, "{bad}");
+            assert!(peer_online, "{bad}");
+
+            let limits = limits.unwrap_or_else(|| panic!("坏字段应当退回缺省: {bad}"));
+
+            assert_eq!(limits.frames_per_second, frames, "{bad}");
+            assert_eq!(limits.chunks_per_second, chunks, "{bad}");
+            assert_eq!(limits.bytes_per_second, bytes, "{bad}");
+        }
+
+        // 整个字段缺失 / 为 null / 根本不是对象，才是「没广告」
+        for missing in [
+            r#"{"type":"server.welcome","protocol":1,"peerOnline":true}"#,
+            r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":null}"#,
+            r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":"nope"}"#,
+        ] {
+            let ServerFrame::Welcome { limits, .. } =
+                serde_json::from_str::<ServerFrame>(missing).unwrap()
+            else {
+                panic!("应当仍然是 welcome: {missing}");
+            };
+
+            assert!(limits.is_none(), "应当按「没广告」处理: {missing}");
+        }
+
+        // 广告值有上限：出错或恶意的中继不能把客户端速率推到任意高
+        let ServerFrame::Welcome {
+            limits: Some(capped),
+            ..
+        } = serde_json::from_str(
+            r#"{"type":"server.welcome","protocol":1,"peerOnline":true,"limits":{"framesPerSecond":1e9,"chunksPerSecond":1e9,"bytesPerSecond":1e12}}"#,
+        )
+        .unwrap()
+        else {
+            panic!("应当解析出 limits");
+        };
+
+        assert_eq!(capped.frames_per_second, MAX_ADVERTISED_FRAMES_PER_SECOND);
+        assert_eq!(capped.chunks_per_second, MAX_ADVERTISED_CHUNKS_PER_SECOND);
+        assert_eq!(capped.bytes_per_second, MAX_ADVERTISED_BYTES_PER_SECOND);
+    }
+
+    /// R20：客户端不 1:1 取用广告值，按今天的比例留余量
+    #[test]
+    fn outbound_limits_keep_a_margin_below_the_advertised_values() {
+        let cloudflare = RelayLimits::cloudflare().outbound();
+
+        // 缺省推导必须与改造前完全一致：帧 20/20、分片 15/10
+        assert_eq!(cloudflare.frames_per_second, 20.0);
+        assert_eq!(cloudflare.frames_burst, 20.0);
+        assert_eq!(cloudflare.chunks_per_second, 15.0);
+        assert_eq!(cloudflare.chunks_burst, 10.0);
+
+        // 自建中继广告 90 帧/秒时，客户端上限正好是 60（Phase 9a 的 60Hz 目标）
+        let raised = RelayLimits {
+            frames_per_second: 90.0,
+            ..RelayLimits::cloudflare()
+        }
+        .outbound();
+
+        assert_eq!(raised.frames_per_second, 60.0);
+        assert!(raised.frames_per_second < 90.0, "必须给中继留出余量");
+
+        // 离谱的小值不能推成 0（否则等待时长会除零）
+        let tiny = RelayLimits {
+            frames_per_second: 1.0,
+            chunks_per_second: 1.0,
+            bytes_per_second: 1.0,
+        }
+        .outbound();
+
+        assert!(tiny.frames_per_second >= 1.0);
+        assert!(tiny.chunks_per_second >= 1.0);
+        assert!(tiny.chunks_burst >= 1.0);
+    }
+
     #[test]
     fn parses_server_control_frames() {
         let welcome: ServerFrame =
@@ -496,9 +751,12 @@ mod tests {
             ServerFrame::Welcome {
                 protocol,
                 peer_online,
+                limits,
             } => {
                 assert_eq!(protocol, 1);
                 assert!(peer_online);
+                // 旧中继不带 limits
+                assert!(limits.is_none());
             }
             _ => panic!("expected welcome"),
         }
