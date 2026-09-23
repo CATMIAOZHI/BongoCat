@@ -179,6 +179,22 @@
 >    - **空闲不会被主动踢**：自建侧 `stale_after` 的缺省是 `DEFAULT_STALE_AFTER_MS = 120_000`（`server-relay/src/protocol.rs:47`，运行期字段叫 `stale_after`），CF 侧是 `STALE_AFTER_MS = 120 * 1000`（`server-cloudflare/src/protocol.ts:68`）；但**只在 `admit()` 里判定一次**（`relay.rs:375` / `pair.ts:65-69`），没有后台清理任务。所以 DC 活跃期间完全不发 WS Ping 也不会被 4004 顶替。
 >    - **`touch()` 只在 Binary 帧上调用**（`relay.rs:307`；`pair.ts:169` 同理），WS Ping/Pong 既不计桶也不刷新 `last_seen`。所以「应用级心跳会顺带刷新 `last_seen`」是初版唯一真实的好处，但代价是上面那个致命误判，不划算；今天空闲超过 120 秒后重连会拿到 4004 而不是 4002，这是**既有行为**，本次不改。
 
+> **R29（Phase 8b 落地：`pair.signal` + ICE + `pet-state` DataChannel）—— 提交 `f3427cc`**
+>
+> 1. **信令走 `FrameKind::Ping`(8)**：`protocol.rs` 新增 `message_type::SIGNAL = "pair.signal"`、`SIGNAL_VERSION = 1` 与 `PairSignalPayload`（`#[serde(tag = "kind", rename_all = "lowercase")]` 的 `hello` / `offer` / `answer` / `candidate`，字段 camelCase）。`hello` 带 `version` 与 `deviceId`；`offer` / `answer` 的 `description` 是**序列化后的 `RTCSessionDescription`**（含 SDP 文本与类型，不是裸 SDP）。不新增帧 kind（R21 修正 1）：kind 8 早在中继的已知集合里，旧中继照样转发。
+> 2. **ICE 服务器由中继广告**：`ServerFrame::Welcome` 加 `iceServers`（`#[serde(rename = "iceServers", default, deserialize_with = "deserialize_ice_servers")]`；`urls` 单串与数组都收，缺字段 / `null` / 畸形按空处理，数组里坏条目逐条丢）；`read_welcome` 与 `handle_server_frame` 的返回类型从 `RelayLimits` 变成 `RelayConfig { limits, ice_servers }`。**`iceServers` 只在会话建立时读一次**：中途换 STUN/TURN 会让两侧候选对不上，要换得等下一轮协商。空列表是隐私缺省——只有 host candidate，不填任何公共 STUN。
+> 3. **`p2p.rs`（Windows only，约 630 行）**：`P2pLink`（input 侧）与 `P2pEvents`（事件流）分开，因为 `live` 的 `select!` 要一边 `&mut` 轮询事件、一边 `&` 发信令；内部是 `drive()` 驱动循环 + `Leg`（一轮协商）+ `Handler`（PeerConnection 回调）+ `pump()`（DataChannel 泵）。**glare 裁决：deviceId 字典序小的一方发起 offer**，两边算出的结论一致；`hello` 每次收到都重开一轮；没有 `hello` 时收到 `Offer` 也照接（能力门控只挡「我们主动发起」，不挡「对方已经发起了」）；candidate 在远端描述设好之前先缓冲；失败后只有发起方隔 5 秒重试；`Disconnected` 不算失败（只有 `Failed` / `Closed` 算）。**ICE 显式绑 `0.0.0.0:0`**——绑回环收不到真实 host candidate，显式绑是为了让 `PeerConnectionBuilder::<SocketAddr>` 的泛型可推断。对 webrtc 的 `Result` **一处 `unwrap` / `expect` 都没有**（release 是 `panic = "abort"`，一次 panic 会带走整个 App）。
+> 4. **`link.rs` 是 cfg 中立门面**：Windows 上 `pub use super::p2p::{P2pEvent, P2pLink}`，其它平台给一份**同签名**的 stub（`next()` 用 `pending()`）。`release.yml` 仍然为 macOS / Linux 出包，那些目标不该因为 P2P 编不过。**注意谁来抓签名漂移**：`client-ci.yml` 的 rust job 只有 `windows-latest`，stub 那一支在 CI 上从不编译；真正能发现漂移的是本机在非 Windows 目标上的 `cargo check`，以及打 `v*` 标签时 `release.yml` 的 macOS / ubuntu 任务。
+> 5. **心跳按 R28 拆成两条腿的探针（本次落地）**：中继腿的 ticker 分支**一行没改**（WS `Message::Ping`，中继自己回 Pong）；DC 腿在同一个 ticker 分支里发应用级 `pair.ping`，**独立标志** `dc_open` / `dc_awaiting_pong` / `dc_last_inbound`，超时**只置 `dc_open = false` 并把 `p2p` 置回 `Connecting`，绝不返回 `Outcome::Lost`**（否则 `abort_transfers` 会砍掉在途附件）。DC 入站只清 **DC 腿自己的**标志。DC 帧**不吃中继 pacer**（单一 pacer 会把 DC 上的可覆盖流压到 20 帧/秒，与 60Hz 冲突，R23）；**DC 侧**只有信令这条出站要走中继的 `pacer.acquire()`（中继帧与分片照旧各自过），且信令**不进 `state.reliable`**（那条队列上限 512，队满会挤掉最旧的聊天消息并把它退回 `pending`）。
+> 6. **`build_frame()`**：心跳与信令这类低流量应用帧不塞进可靠队列，直接组帧发送。`handle_binary` 多一个 `Option<&link::P2pLink>` 参数，`pair.signal` 分支把载荷交给那条腿——**没有腿（非 Windows 目标）或载荷畸形就安静丢掉，也不产生回复**。
+> 7. **`p2p` 状态与它的复位点**：`PairStatus` 加 `p2p: off | connecting | connected`（`P2pState`，`rename_all = "lowercase"`）；偏好页「连接状态」下面加**一行只读状态**，不写进 remote-cat / 主界面，也不新增事件常量。`PairStatus` 是长期存活的，所以**腿不在的每一段窗口都必须显式复位**，共 5 处：`start()`（连着的时候点「立即连接」/换中继，新会话还没起腿）、`disconnect()`、`fail_hard()`、`run_session` 的 `Reconnecting`（腿已随 `live` 返回被 Drop，而退避 30 秒 + 连接/welcome 超时 15+10 秒里不会再有 P2P 事件）、`live` 起腿之后（每次重连从 `Off` 开始）。漏掉 `Reconnecting` 那处是只读审计抓到的 P1：「重连中」+「已直连」会并存——单轮退避最长 36 秒（30 秒 × 1.2 的抖动）加上连接与 welcome 超时 15 + 10 秒，而中继一直不可达时这个假状态会一轮一轮地挂下去，直到 `disconnect()` / `fail_hard()` / 下一次 `live` 起腿才复位。`run_session` 结尾那处 publish 是**空操作**（能走到它的只有 `Command::Disconnect`，而它必然先加过 generation），所以没有在那里写复位。
+> 8. **验证**：
+>    - `cargo test --lib` = **107 passed / 7 ignored / 0 failed**（新增 `two_legs_negotiate_and_open_the_channel`：两条腿在同一进程里互喂信令，打通并双向收发；另有 `signal_payloads_round_trip_with_the_wire_shape` 与 `welcome_ice_servers_are_parsed_leniently`）。
+>    - **真中继 e2e 6/6**（`127.0.0.1:8798`、心跳 2 秒）：新增 `two_clients_open_a_p2p_channel_through_the_relay`——两个 `PairManager` 连真实中继、换信令、开 DataChannel，**跨过 3 个心跳后两边仍是 `connected`**（DC 腿的探针超时窗口是两个心跳，所以这条断言等于证明 ping/pong 真的在 DC 上往返）；随后用**同 deviceId 的第三条连接**把 A 顶掉（中继给旧连接 4002 `REPLACED`，不是 fatal），断言那条 `state == "reconnecting"` 的广播里 `p2p` 已经复位成 `off`，最后断言手动断开后也复位成 `off`。原有 5 条继续全绿。
+>    - 前端：`tsc --noEmit`、`pnpm test`（51 条）、`pnpm lint` 全过。
+>    - **`Reconnecting` 那条断言做过红→绿**：临时删掉复位行重编，断言报 `left: Some("connected") / right: Some("off")`；恢复后绿。
+> 9. **仍未做**：8c 的切换与回落（可覆盖流切到 DC、DC 掉线回落中继、附件分片走 `reliable` 通道）；**真机双端（两台机器、真实 NAT）的打洞验收仍是人工项**——本轮的 e2e 是同一台机器上的两个进程，只能证明「信令 → ICE → DataChannel → 探针往返」这条链路成立，证明不了跨 NAT 的可达率。
+
 ---
 
 # 1. 目标与非目标
@@ -369,6 +385,7 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 
 - 交付：`pair.signal` 应用类型、能力门控、`p2p.rs`（PeerConnection 生命周期）、`pet-state` 通道；**心跳拆成两条腿的探针**（中继腿保持 WS Ping 不变，DC 腿用应用级 `pair.ping`，两个独立标志——见 R28）；
 - 验证：真机双端打通 P2P，能看到 DC open、ping/pong 往返；中继腿的行为不变（e2e 的 `stays_connected_across_heartbeats` 仍绿）。
+- **已落地（`f3427cc`）**：见 R29。同一台机器上两个进程的真中继 e2e 已经覆盖「信令 → ICE → DataChannel → DC 腿探针往返」，以及两条腿的探针互不干扰；**真机双端（两台机器、真实 NAT）的打洞验收仍是人工项**。
 
 ## Phase 8c：切换与回落
 
@@ -398,6 +415,8 @@ feat(pair): add the webrtc p2p transport with relay fallback
 feat(pair): pace outbound frames by the advertised transport limits
 perf(pair): raise the pet state ceiling and interpolate remotely
 ```
+
+实际落地时，8b 把上面第 4、5 两条合成了一个提交（`f3427cc`，`feat(pair): add webrtc signaling and the p2p link`）：信令与 P2P 传输同属一次交付。第 5 条标题里的「relay fallback」指的是切换与回落，那半属于 8c，届时单独落。
 
 ---
 
