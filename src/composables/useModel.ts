@@ -1,5 +1,3 @@
-import type { PhysicalPosition } from '@tauri-apps/api/dpi'
-
 import { LogicalSize } from '@tauri-apps/api/dpi'
 import { resolveResource, sep } from '@tauri-apps/api/path'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
@@ -10,7 +8,6 @@ import { ref } from 'vue'
 
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
-import { getCursorMonitor } from '@/utils/monitor'
 import { isMac } from '@/utils/platform'
 
 import live2d from '../utils/live2d'
@@ -169,16 +166,13 @@ export function useModel() {
     live2d.setParameterValue(id, pressed)
   }
 
-  async function handleMouseMove(cursorPoint: PhysicalPosition) {
-    const monitor = await getCursorMonitor(cursorPoint)
-
-    if (!monitor) return
-
-    const { size, position } = monitor
-
-    const xRatio = (cursorPoint.x - position.x) / size.width
-    const yRatio = (cursorPoint.y - position.y) / size.height
-
+  /**
+   * 鼠标参数只认屏幕比例（R12）。
+   *
+   * 本机路径由 `useDevice` 算好比例后调用，远端猫直接用网络收到的比例调用，
+   * 两边共用同一段参数映射，远端猫不需要伪造一个本机 `PhysicalPosition`。
+   */
+  function handleMouseRatio(xRatio: number, yRatio: number) {
     for (const id of [
       'ParamMouseX',
       'ParamMouseY',
@@ -240,7 +234,7 @@ export function useModel() {
     handleResize,
     handleKeyChange,
     handleMouseChange,
-    handleMouseMove,
+    handleMouseRatio,
     handleAxisChange,
   }
 }

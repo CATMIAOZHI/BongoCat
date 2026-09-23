@@ -16,6 +16,33 @@ use super::protocol::PROTOCOL_VERSION;
 
 pub type PairSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// 连接失败的原因。
+///
+/// `fatal` 表示「重试也不会好」——Pair Secret 不对、协议版本不对、地址路径写错、
+/// 或者配额位已被占满。中继侧一旦给出这类答案，继续按 1/2/5/10/30 秒退避重连
+/// 只会刷日志，所以 manager 会停在 `Error` 状态等用户处理。
+#[derive(Debug, Clone)]
+pub struct PairFailure {
+    pub message: String,
+    pub fatal: bool,
+}
+
+impl PairFailure {
+    fn transient(message: String) -> Self {
+        Self {
+            message,
+            fatal: false,
+        }
+    }
+
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            fatal: true,
+        }
+    }
+}
+
 /// 把用户填的地址补全成 `/ws` 升级地址。
 ///
 /// 用户填的通常是部署输出里的 `https://<worker>.workers.dev`，但 WebSocket 客户端
@@ -49,21 +76,21 @@ pub async fn connect(
     relay_url: &str,
     auth_token: &str,
     device_id: &str,
-) -> Result<PairSocket, String> {
-    let url = build_upgrade_url(relay_url)?;
+) -> Result<PairSocket, PairFailure> {
+    let url = build_upgrade_url(relay_url).map_err(PairFailure::fatal)?;
 
     let mut request = url
         .into_client_request()
-        .map_err(|err| format!("Relay URL 不合法: {err}"))?;
+        .map_err(|err| PairFailure::fatal(format!("Relay URL 不合法: {err}")))?;
 
     {
         let headers = request.headers_mut();
         let authorization = HeaderValue::from_str(&format!("Bearer {auth_token}"))
-            .map_err(|_| "Pair Secret 含非法字符".to_string())?;
+            .map_err(|_| PairFailure::fatal("Pair Secret 含非法字符".to_string()))?;
         let client = HeaderValue::from_str(device_id)
-            .map_err(|_| "deviceId 含非法字符".to_string())?;
+            .map_err(|_| PairFailure::fatal("deviceId 含非法字符".to_string()))?;
         let protocol = HeaderValue::from_str(&PROTOCOL_VERSION.to_string())
-            .map_err(|_| "协议版本不合法".to_string())?;
+            .map_err(|_| PairFailure::fatal("协议版本不合法".to_string()))?;
 
         headers.insert("authorization", authorization);
         headers.insert("x-bongo-client", client);
@@ -91,22 +118,22 @@ pub async fn next_message(socket: &mut PairSocket) -> Option<Result<Message, WsE
     socket.next().await
 }
 
-fn describe_connect_error(error: WsError) -> String {
+fn describe_connect_error(error: WsError) -> PairFailure {
     match error {
         WsError::Http(response) => {
             let status = response.status();
 
             match status.as_u16() {
-                401 => "鉴权失败：Pair Secret 与部署时的值不一致".to_string(),
-                426 => "协议版本不匹配：中继需要 protocol 1".to_string(),
-                400 => "deviceId 被中继拒绝".to_string(),
-                404 => "Relay URL 路径不对：应该指向 /ws".to_string(),
-                _ => format!("中继返回 HTTP {}", status.as_u16()),
+                401 => PairFailure::fatal("鉴权失败：Pair Secret 与部署时的值不一致".to_string()),
+                426 => PairFailure::fatal("协议版本不匹配：中继需要 protocol 1".to_string()),
+                400 => PairFailure::fatal("deviceId 被中继拒绝".to_string()),
+                404 => PairFailure::fatal("Relay URL 路径不对：应该指向 /ws".to_string()),
+                _ => PairFailure::transient(format!("中继返回 HTTP {}", status.as_u16())),
             }
         }
-        WsError::Url(err) => format!("Relay URL 不合法: {err}"),
-        WsError::Io(err) => format!("连接失败: {err}"),
-        other => format!("连接失败: {other}"),
+        WsError::Url(err) => PairFailure::fatal(format!("Relay URL 不合法: {err}")),
+        WsError::Io(err) => PairFailure::transient(format!("连接失败: {err}")),
+        other => PairFailure::transient(format!("连接失败: {other}")),
     }
 }
 

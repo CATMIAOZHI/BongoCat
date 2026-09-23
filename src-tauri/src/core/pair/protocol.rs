@@ -106,6 +106,8 @@ pub mod message_type {
     pub const PING: &str = "pair.ping";
     pub const PONG: &str = "pair.pong";
     pub const PRESENCE: &str = "pair.presence";
+    pub const PET_STATE: &str = "pair.pet-state";
+    pub const STATS: &str = "pair.stats";
 }
 
 /// 应用层信封（加密前的内容）
@@ -166,6 +168,113 @@ pub struct PresencePayload {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+}
+
+/// 键盘活动：只有「哪只手 + 强度」，永远不含具体键名（见 docs/pair-plan.md 的 §17 / §18 与 R2 / R3）
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetKeyboardState {
+    pub active: bool,
+    pub left_hand: bool,
+    pub right_hand: bool,
+    /// 0..1，发送前量化到 0.2
+    pub intensity: f32,
+}
+
+/// 鼠标活动：位置是屏幕比例（0..1），永远不含真实像素坐标
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetPointerState {
+    pub active: bool,
+    /// 0..1 屏幕比例，发送前量化到 0.02
+    pub x: f32,
+    pub y: f32,
+    /// 0..1 归一化移动速度
+    pub speed: f32,
+    pub left_down: bool,
+    pub right_down: bool,
+}
+
+/// 远端宠物快照（§16）。这是唯一通过网络传输的「活动」结构。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetSnapshot {
+    pub keyboard: PetKeyboardState,
+    pub pointer: PetPointerState,
+}
+
+impl Default for PetSnapshot {
+    fn default() -> Self {
+        Self {
+            keyboard: PetKeyboardState {
+                active: false,
+                left_hand: false,
+                right_hand: false,
+                intensity: 0.0,
+            },
+            pointer: PetPointerState {
+                active: false,
+                x: 0.5,
+                y: 0.5,
+                speed: 0.0,
+                left_down: false,
+                right_down: false,
+            },
+        }
+    }
+}
+
+impl PetSnapshot {
+    /// 收发两侧都跑一遍：NaN → 0，越界裁到 0..1，并按 R4 的量化步长取整。
+    ///
+    /// 对端是本该受信任的配对方，但这层仍然必要：它保证 UI 只会拿到有界的、
+    /// 量化过的值（不会有真实比例的高精度信息，也不会有能让动画炸掉的 NaN）。
+    pub fn sanitized(self) -> Self {
+        Self {
+            keyboard: PetKeyboardState {
+                active: self.keyboard.active,
+                left_hand: self.keyboard.left_hand,
+                right_hand: self.keyboard.right_hand,
+                intensity: quantize(self.keyboard.intensity, 0.2),
+            },
+            pointer: PetPointerState {
+                active: self.pointer.active,
+                x: quantize(self.pointer.x, 0.02),
+                y: quantize(self.pointer.y, 0.02),
+                speed: quantize(self.pointer.speed, 0.05),
+                left_down: self.pointer.left_down,
+                right_down: self.pointer.right_down,
+            },
+        }
+    }
+}
+
+/// 输入统计（§24 / §25）。
+///
+/// 计数值是「键盘按下次数」与「鼠标按键按下次数」，按物理键名去重（R7），
+/// 不包含任何按键内容。`share` 是相对 §25 的示例载荷多出来的一个布尔：关闭分享时
+/// 对端仍然需要知道「对方现在不分享统计」，否则会一直显示上一次的旧数字。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputStats {
+    /// 本地日期 yyyy-mm-dd，由拥有本地时区的前端提供
+    pub date: String,
+    pub today_keyboard: u64,
+    pub today_mouse: u64,
+    pub total_keyboard: u64,
+    pub total_mouse: u64,
+    pub share: bool,
+}
+
+/// 裁到 0..1 并量化到 step 的整数倍
+fn quantize(value: f32, step: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+
+    let clamped = value.clamp(0.0, 1.0);
+
+    (clamped / step).round() * step
 }
 
 /// 中继发来的明文控制帧
@@ -303,5 +412,102 @@ mod tests {
             }
             _ => panic!("expected peer frame"),
         }
+    }
+
+    #[test]
+    fn pet_snapshot_hides_key_names_and_pixels() {
+        let snapshot = PetSnapshot {
+            keyboard: PetKeyboardState {
+                active: true,
+                left_hand: true,
+                right_hand: false,
+                intensity: 0.6,
+            },
+            pointer: PetPointerState {
+                active: true,
+                x: 0.34,
+                y: 0.66,
+                speed: 0.15,
+                left_down: true,
+                right_down: false,
+            },
+        };
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+
+        // 只能出现布尔与 0..1 的比例，没有任何键名或像素坐标
+        assert!(json.contains(r#""leftHand":true"#));
+        assert!(!json.contains("KeyA"));
+        assert!(!json.contains("KeyboardPress"));
+
+        for number in [snapshot.keyboard.intensity, snapshot.pointer.x, snapshot.pointer.y] {
+            assert!((0.0..=1.0).contains(&number));
+        }
+    }
+
+    #[test]
+    fn pet_snapshot_sanitizes_and_quantizes() {
+        let messy = PetSnapshot {
+            keyboard: PetKeyboardState {
+                active: true,
+                left_hand: true,
+                right_hand: true,
+                intensity: f32::NAN,
+            },
+            pointer: PetPointerState {
+                active: true,
+                x: 1.5,
+                y: -3.0,
+                speed: 0.53,
+                left_down: true,
+                right_down: true,
+            },
+        };
+
+        let clean = messy.sanitized();
+
+        assert_eq!(clean.keyboard.intensity, 0.0);
+        assert_eq!(clean.pointer.x, 1.0);
+        assert_eq!(clean.pointer.y, 0.0);
+        // 0.53 量化到 0.05 的整数倍
+        assert_eq!(clean.pointer.speed, 0.55);
+        assert!(clean.keyboard.active && clean.pointer.left_down);
+    }
+
+    #[test]
+    fn pet_snapshot_round_trip_through_envelope() {
+        let snapshot = PetSnapshot::default();
+        let envelope = AppEnvelope::new(
+            message_type::PET_STATE,
+            3,
+            serde_json::to_value(snapshot).unwrap(),
+        );
+
+        let parsed = AppEnvelope::from_bytes(&envelope.to_bytes().unwrap()).unwrap();
+        let decoded: PetSnapshot = serde_json::from_value(parsed.payload).unwrap();
+
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn input_stats_uses_camel_case_on_the_wire() {
+        let stats = InputStats {
+            date: "2026-09-23".into(),
+            today_keyboard: 12,
+            today_mouse: 3,
+            total_keyboard: 4567,
+            total_mouse: 89,
+            share: true,
+        };
+
+        let json = serde_json::to_string(&stats).unwrap();
+
+        assert!(json.contains(r#""todayKeyboard":12"#));
+        assert!(json.contains(r#""totalMouse":89"#));
+        assert!(json.contains(r#""share":true"#));
+
+        let decoded: InputStats = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, stats);
     }
 }

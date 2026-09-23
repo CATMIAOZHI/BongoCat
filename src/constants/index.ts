@@ -11,6 +11,13 @@ export const LISTEN_KEY = {
   START_MOTION: 'start-motion',
   SET_EXPRESSION: 'set-expression',
   WINDOW_VISIBILITY_CHANGED: 'window-visibility-changed',
+  PAIR_CONNECTION_CHANGED: 'pair-connection-changed',
+  PAIR_PEER_CHANGED: 'pair-peer-changed',
+  PAIR_PRESENCE: 'pair-presence',
+  PAIR_PET_STATE: 'pair-pet-state',
+  PAIR_STATS: 'pair-stats',
+  PAIR_MESSAGE: 'pair-message',
+  PAIR_ERROR: 'pair-error',
 }
 
 export const INVOKE_KEY = {
@@ -18,6 +25,17 @@ export const INVOKE_KEY = {
   START_DEVICE_LISTENING: 'start_device_listening',
   START_GAMEPAD_LISTING: 'start_gamepad_listing',
   STOP_GAMEPAD_LISTING: 'stop_gamepad_listing',
+  PAIR_GET_STATUS: 'pair_get_status',
+  PAIR_GET_DEVICE_ID: 'pair_get_device_id',
+  PAIR_SET_SECRET: 'pair_set_secret',
+  PAIR_HAS_SECRET: 'pair_has_secret',
+  PAIR_GET_SECRET_FINGERPRINT: 'pair_get_secret_fingerprint',
+  PAIR_DELETE_SECRET: 'pair_delete_secret',
+  PAIR_CONNECT: 'pair_connect',
+  PAIR_DISCONNECT: 'pair_disconnect',
+  PAIR_SEND_PRESENCE: 'pair_send_presence',
+  PAIR_SEND_PET_STATE: 'pair_send_pet_state',
+  PAIR_SEND_STATS: 'pair_send_stats',
 }
 
 export const LANGUAGE = {

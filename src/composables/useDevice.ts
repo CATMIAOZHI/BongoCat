@@ -9,10 +9,12 @@ import { useAppStore } from '@/stores/app'
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { inBetween } from '@/utils/is'
+import { getCursorMonitor } from '@/utils/monitor'
 import { isMac, isWindows } from '@/utils/platform'
 
 import { INVOKE_KEY, LISTEN_KEY, WINDOW_LABEL } from '../constants'
 import { useModel } from './useModel'
+import { usePairState } from './usePairState'
 import { useTauriListen } from './useTauriListen'
 
 interface MouseButtonEvent {
@@ -48,7 +50,9 @@ export function useDevice() {
   const latestCursorPoint = ref<CursorPoint>()
   const smoothedCursorPoint = ref<CursorPoint>()
   const scaleFactor = ref(1)
-  const { handlePress, handleRelease, handleMouseChange, handleMouseMove } = useModel()
+  const { handlePress, handleRelease, handleMouseChange, handleMouseRatio } = useModel()
+  // 本地输入同时喂给联机同步：远程猫只关心「哪只手 + 强度 + 比例」，永远拿不到键名
+  const pairState = usePairState()
 
   const tickerCallback = (ticker: Ticker) => {
     const destination = latestCursorPoint.value
@@ -160,7 +164,18 @@ export function useDevice() {
     const x = cursorPoint.x * scaleFactor.value
     const y = cursorPoint.y * scaleFactor.value
 
-    handleMouseMove(new PhysicalPosition(x, y))
+    // R12：屏幕比例只在这里算一次，本地渲染与联机同步共用同一个值
+    const point = new PhysicalPosition(x, y)
+    const monitor = await getCursorMonitor(point)
+
+    if (monitor) {
+      const { size, position } = monitor
+      const xRatio = (point.x - position.x) / size.width
+      const yRatio = (point.y - position.y) / size.height
+
+      handleMouseRatio(xRatio, yRatio)
+      pairState.handlePointerRatio(xRatio, yRatio)
+    }
 
     if (!catStore.window.hideOnHover) return
 
@@ -187,6 +202,9 @@ export function useDevice() {
     const { kind, value } = payload
 
     if (kind === 'KeyboardPress' || kind === 'KeyboardRelease') {
+      // R2：左右手判定必须用 rdev 的原始键名，不能先过 getSupportedKey 的归一化
+      pairState.handleKeyboard(value, kind === 'KeyboardPress')
+
       const nextValue = getSupportedKey(value)
 
       if (!nextValue) return
@@ -210,10 +228,16 @@ export function useDevice() {
 
     switch (kind) {
       case 'MousePress':
+        pairState.handleMouseButton(value, true)
+
         return handleMouseChange(value)
       case 'MouseRelease':
+        pairState.handleMouseButton(value, false)
+
         return handleMouseChange(value, false)
       case 'MouseMove':
+        pairState.handlePointerMove(value)
+
         return latestCursorPoint.value = value
     }
   })

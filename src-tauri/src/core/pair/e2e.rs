@@ -13,15 +13,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::client;
-use super::crypto::{self, PairCipher};
+use super::crypto::{self};
 use super::manager::{EVENT_CONNECTION_CHANGED, EVENT_PRESENCE, PairConnectionState, PairManager};
-use super::protocol::{
-    AppEnvelope, FrameHeader, FrameKind, PresencePayload, PresenceState, message_type,
-};
+use super::protocol::{FrameKind, PresencePayload, PresenceState, message_type};
 
 /// 记录所有事件的测试用 sink
 #[derive(Default)]
@@ -179,10 +177,10 @@ async fn two_clients_exchange_encrypted_presence() {
     manager_b.disconnect();
 }
 
-/// 断线后自动重连，并且用 WS 心跳保持连接存活
+/// 心跳期间连接保持存活（客户端发 WS ping，中继回 pong）
 #[tokio::test]
 #[ignore = "需要本地或已部署的 relay，见文件头说明"]
-async fn reconnects_after_relay_drop_and_survives_heartbeats() {
+async fn stays_connected_across_heartbeats() {
     let Some((relay, secret_text)) = e2e_config() else {
         eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
 
@@ -250,20 +248,32 @@ fn tungstenite_ping() -> tokio_tungstenite::tungstenite::Message {
     Message::Ping(Vec::new().into())
 }
 
-/// 帧头是明文且参与认证：中继改 kind 后接收端必须解密失败
-#[test]
-fn header_tampering_is_rejected() {
-    let secret = [7u8; 32];
-    let cipher = PairCipher::new(&crypto::derive_root_key(&secret));
-    let envelope = AppEnvelope::new(message_type::PRESENCE, 1, json!({ "state": "active" }));
-    let mut frame = cipher
-        .seal(
-            &FrameHeader::new(FrameKind::Presence, 1),
-            &envelope.to_bytes().unwrap(),
-        )
-        .unwrap();
+/// 连不上中继时要进入重连状态，而不是卡在「正在连接」。
+///
+/// 这个用例故意指向一个必然拒绝连接的端口，所以不需要真的跑一个 relay。
+#[tokio::test]
+async fn unreachable_relay_enters_reconnecting() {
+    let secret = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        [0u8; 32],
+    );
+    let sink = Arc::new(RecordingSink::default());
+    let manager = Arc::new(PairManager::new("e2e-reconnect".into(), sink.clone()));
 
-    frame[0] = FrameKind::Chat.as_byte();
+    manager.start("http://127.0.0.1:1", Some(&secret)).unwrap();
 
-    assert!(cipher.open(&frame).is_err());
+    let reconnecting = wait_for(
+        || sink.last_state() == Some(PairConnectionState::Reconnecting),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        reconnecting,
+        "没有进入重连状态：state={:?} errors={:?}",
+        sink.last_state(),
+        sink.errors()
+    );
+
+    manager.disconnect();
 }

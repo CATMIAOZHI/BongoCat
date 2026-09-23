@@ -7,10 +7,12 @@ import { useI18n } from 'vue-i18n'
 import { WINDOW_LABEL } from '@/constants'
 import { isWindowVisible, showWindow, toggleWindowVisibleByLabel } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
+import { pairStatusKey, usePairStore } from '@/stores/pair'
 import { isMac } from '@/utils/platform'
 
 export function useAppMenu() {
   const catStore = useCatStore()
+  const pairStore = usePairStore()
   const { t } = useI18n()
 
   const getScaleMenuItems = async () => {
@@ -62,7 +64,6 @@ export function useAppMenu() {
   }
 
   const getBaseMenu = async () => {
-    const remoteCatVisible = await isWindowVisible(WINDOW_LABEL.REMOTE_CAT).catch(() => false)
     const chatVisible = await isWindowVisible(WINDOW_LABEL.CHAT).catch(() => false)
 
     return await Promise.all([
@@ -78,11 +79,26 @@ export function useAppMenu() {
         },
       }),
       MenuItem.new({
-        text: remoteCatVisible ? t('composables.useAppMenu.labels.hideRemoteCat') : t('composables.useAppMenu.labels.showRemoteCat'),
+        text: pairStore.settings.remoteCat.visible ? t('composables.useAppMenu.labels.hideRemoteCat') : t('composables.useAppMenu.labels.showRemoteCat'),
         action: () => {
-          toggleWindowVisibleByLabel(WINDOW_LABEL.REMOTE_CAT).catch(reason => error(String(reason)))
+          pairStore.settings.remoteCat.visible = !pairStore.settings.remoteCat.visible
         },
       }),
+      // §53：右键菜单里给出暂离入口与当前连接状态，完整配置仍然只在偏好页
+      MenuItem.new({
+        text: pairStore.settings.presence === 'away' ? t('composables.useAppMenu.labels.backToActive') : t('composables.useAppMenu.labels.stepAway'),
+        action: () => {
+          pairStore.settings.presence = pairStore.settings.presence === 'away' ? 'active' : 'away'
+        },
+      }),
+      ...(pairStore.settings.enabled
+        ? [
+            MenuItem.new({
+              text: t(`pages.preference.pair.status.${pairStatusKey(pairStore.runtime.connection)}`),
+              enabled: false,
+            }),
+          ]
+        : []),
       MenuItem.new({
         text: chatVisible ? t('composables.useAppMenu.labels.hideChat') : t('composables.useAppMenu.labels.showChat'),
         action: () => {

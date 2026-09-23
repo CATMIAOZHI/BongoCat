@@ -5,6 +5,7 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import UpdateApp from '@/components/update-app/index.vue'
+import { usePairStatus } from '@/composables/usePairStatus'
 import { useTray } from '@/composables/useTray'
 import { useAppStore } from '@/stores/app'
 import { useGeneralStore } from '@/stores/general'
@@ -15,9 +16,13 @@ import About from './components/about/index.vue'
 import Cat from './components/cat/index.vue'
 import General from './components/general/index.vue'
 import Model from './components/model/index.vue'
+import Pair from './components/pair/index.vue'
 import Shortcut from './components/shortcut/index.vue'
 
 useTray()
+// 托盘菜单由这个窗口创建，菜单里要显示联机连接状态（§53）。`runtime` 不持久化，
+// 所以必须在窗口根组件先订阅一次，而不是等用户切到「双人联机」页才去拉状态
+usePairStatus()
 const appStore = useAppStore()
 const current = ref(0)
 const { t } = useI18n()
@@ -53,6 +58,12 @@ const menus = computed(() => [
     label: t('pages.preference.shortcut.title'),
     icon: 'i-solar:keyboard-bold',
     component: Shortcut,
+  },
+  {
+    key: 'pair',
+    label: t('pages.preference.pair.title'),
+    icon: 'i-solar:users-group-rounded-bold',
+    component: Pair,
   },
   {
     key: 'about',

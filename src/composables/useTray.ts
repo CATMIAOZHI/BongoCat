@@ -12,6 +12,7 @@ import { useI18n } from 'vue-i18n'
 
 import { useCatStore } from '@/stores/cat'
 import { useGeneralStore } from '@/stores/general'
+import { usePairStore } from '@/stores/pair'
 
 import { GITHUB_LINK, LISTEN_KEY } from '../constants'
 import { showWindow } from '../plugins/window'
@@ -24,6 +25,7 @@ const TRAY_ID = 'BONGO_CAT_TRAY'
 export function useTray() {
   const catStore = useCatStore()
   const generalStore = useGeneralStore()
+  const pairStore = usePairStore()
   const { getBaseMenu, getExitMenu } = useAppMenu()
   const { t } = useI18n()
 
@@ -35,8 +37,17 @@ export function useTray() {
     updateTrayMenu()
   }, { debounce: 200 })
 
-  // 对方猫 / 聊天窗口的显示状态变化后需要重建托盘菜单，否则条目文案会停留在旧方向
-  useTauriListen(LISTEN_KEY.WINDOW_VISIBILITY_CHANGED, updateTrayMenu)
+  // §53：托盘菜单里有「显示/隐藏对方猫」、暂离/回来和连接状态，这些值变化后要重建菜单，
+  // 否则文案会停在打开偏好页那一刻的状态
+  watch([
+    () => pairStore.settings.enabled,
+    () => pairStore.settings.remoteCat.visible,
+    () => pairStore.settings.presence,
+    () => pairStore.runtime.connection,
+    () => pairStore.runtime.peerOnline,
+  ], () => {
+    updateTrayMenu()
+  })
 
   const getTrayById = () => {
     return TrayIcon.getById(TRAY_ID)
@@ -105,6 +116,10 @@ export function useTray() {
 
     tray.setMenu(menu)
   }
+
+  // 对方猫 / 聊天窗口的显示状态变化后需要重建托盘菜单，否则条目文案会停留在旧方向
+  // 必须放在 `updateTrayMenu` 定义之后：这里直接传函数引用，放在前面会触发 TDZ
+  useTauriListen(LISTEN_KEY.WINDOW_VISIBILITY_CHANGED, updateTrayMenu)
 
   watch(() => generalStore.app.trayVisible, async (visible) => {
     const tray = await getTrayById() ?? await createTray()

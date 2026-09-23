@@ -16,7 +16,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand::Rng as _;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 use super::protocol::{FRAME_HEADER_SIZE, FrameHeader, NONCE_SIZE};
 
@@ -62,6 +62,22 @@ pub fn decode_pair_secret(text: &str) -> Result<[u8; PAIR_SECRET_BYTES], String>
     bytes
         .try_into()
         .map_err(|_| format!("Pair Secret 应为 {PAIR_SECRET_BYTES} 字节，实际 {length} 字节"))
+}
+
+/// R17 的核对指纹：`sha256(原始 secret 字节)` 的 hex 前 16 位，每两位之间加一个空格。
+///
+/// 用途只是「双方肉眼核对填的是同一个 secret」——它不是密钥材料，也不是从 secret
+/// 反推 secret 的途径，所以可以显示在设置页；真正的 token 与根密钥仍然只在 Rust
+/// 内部派生、永不回显。
+pub fn secret_fingerprint(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
+    let digest = Sha256::digest(secret);
+
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub struct PairCipher {
@@ -249,5 +265,18 @@ mod tests {
             URL_SAFE_NO_PAD.encode(derive_root_key(&raw)),
             "am2bbPWK0R-fwuEky_8ZcFXCysV2gSD_UV6ONiWMsQk"
         );
+    }
+
+    /// 指纹会显示给用户手工核对，格式必须固定：8 组两位小写 hex，空格分隔
+    #[test]
+    fn secret_fingerprint_is_stable() {
+        let raw = secret([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+
+        assert_eq!(secret_fingerprint(&raw), "63 0d cd 29 66 c4 33 66");
+        assert_ne!(secret_fingerprint(&raw), secret_fingerprint(&secret([0xff; 32])));
     }
 }

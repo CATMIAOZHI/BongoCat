@@ -8,11 +8,13 @@ import { useKeyPress } from '@/composables/useKeyPress'
 import { WINDOW_LABEL } from '@/constants'
 import { toggleWindowVisible } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
+import { usePairStore } from '@/stores/pair'
 import { useShortcutStore } from '@/stores/shortcut.ts'
 
 const shortcutStore = useShortcutStore()
-const { visibleCat, visiblePreference, mirrorMode, penetrable, alwaysOnTop } = storeToRefs(shortcutStore)
+const { visibleCat, visiblePreference, visibleRemoteCat, mirrorMode, penetrable, alwaysOnTop, toggleAway } = storeToRefs(shortcutStore)
 const catStore = useCatStore()
+const pairStore = usePairStore()
 
 useKeyPress(visibleCat, () => {
   catStore.window.visible = !catStore.window.visible
@@ -32,6 +34,15 @@ useKeyPress(penetrable, () => {
 
 useKeyPress(alwaysOnTop, () => {
   catStore.window.alwaysOnTop = !catStore.window.alwaysOnTop
+})
+
+useKeyPress(visibleRemoteCat, () => {
+  pairStore.settings.remoteCat.visible = !pairStore.settings.remoteCat.visible
+})
+
+// 暂离的发送由猫咪窗口统一负责（它一直活着，也负责自动回来）
+useKeyPress(toggleAway, () => {
+  pairStore.settings.presence = pairStore.settings.presence === 'away' ? 'active' : 'away'
 })
 </script>
 
@@ -70,6 +81,20 @@ useKeyPress(alwaysOnTop, () => {
       :title="$t('pages.preference.shortcut.labels.alwaysOnTop')"
     >
       <Shortcut v-model="shortcutStore.alwaysOnTop" />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.shortcut.hints.visibleRemoteCat')"
+      :title="$t('pages.preference.shortcut.labels.visibleRemoteCat')"
+    >
+      <Shortcut v-model="shortcutStore.visibleRemoteCat" />
+    </ProListItem>
+
+    <ProListItem
+      :description="$t('pages.preference.shortcut.hints.toggleAway')"
+      :title="$t('pages.preference.shortcut.labels.toggleAway')"
+    >
+      <Shortcut v-model="shortcutStore.toggleAway" />
     </ProListItem>
   </ProList>
 </template>

@@ -25,9 +25,7 @@ pub fn run() {
 
             setup::default(&app_handle, main_window.clone(), preference_window.clone());
 
-            if let Err(error) = core::pair::setup(&app_handle) {
-                tauri_plugin_log::log::error!("联机模块初始化失败: {error}");
-            }
+            core::pair::setup(&app_handle);
 
             Ok(())
         })
@@ -40,11 +38,14 @@ pub fn run() {
             core::pair::pair_get_device_id,
             core::pair::pair_set_secret,
             core::pair::pair_has_secret,
+            core::pair::pair_get_secret_fingerprint,
             core::pair::pair_delete_secret,
             core::pair::pair_connect,
             core::pair::pair_disconnect,
             core::pair::pair_send_ping,
-            core::pair::pair_send_presence
+            core::pair::pair_send_presence,
+            core::pair::pair_send_pet_state,
+            core::pair::pair_send_stats
         ])
         .plugin(tauri_plugin_admin_status::init())
         .plugin(tauri_plugin_custom_window::init())

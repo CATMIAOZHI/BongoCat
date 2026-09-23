@@ -6,6 +6,16 @@
         "switching": "Switching..."
       }
     },
+    "remoteCat": {
+      "hints": {
+        "away": "Your partner stepped away",
+        "peerBack": "Your partner is back",
+        "offline": "Your partner is offline",
+        "disabled": "Duo mode is not enabled yet",
+        "today": "Today {keyboard} / {mouse}",
+        "total": "Total {keyboard} / {mouse}"
+      }
+    },
     "preference": {
       "title": "Preferences",
       "cat": {
@@ -119,14 +129,94 @@
           "togglePreferences": "Toggle Preferences",
           "mirrorMode": "Mirror Mode",
           "passThrough": "Pass Through",
-          "alwaysOnTop": "Always on Top"
+          "alwaysOnTop": "Always on Top",
+          "visibleRemoteCat": "Toggle Remote Cat",
+          "toggleAway": "Away / Back"
         },
         "hints": {
           "toggleCat": "Toggle the visibility of the cat window.",
           "togglePreferences": "Toggle the visibility of the preferences window.",
           "mirrorMode": "Toggle the cat's mirror mode.",
           "passThrough": "Toggle whether the cat window is pass-through.",
-          "alwaysOnTop": "Toggle whether the cat window stays on top."
+          "alwaysOnTop": "Toggle whether the cat window stays on top.",
+          "visibleRemoteCat": "Toggle the visibility of the remote cat window.",
+          "toggleAway": "Switch between \"away\" and \"back\"."
+        }
+      },
+      "pair": {
+        "title": "Duo Mode",
+        "labels": {
+          "connectionSettings": "Connection",
+          "enabled": "Enable Duo Mode",
+          "relayUrl": "Relay URL",
+          "pairSecret": "Pair Secret",
+          "autoConnect": "Auto Connect",
+          "status": "Connection Status",
+          "lastError": "Last Error",
+          "remoteCatSettings": "Remote Cat",
+          "showRemoteCat": "Show Remote Cat",
+          "remoteModel": "Remote Cat Model",
+          "remoteStats": "Show Partner's Input Stats",
+          "windowSize": "Window Size",
+          "opacity": "Opacity",
+          "alwaysOnTop": "Always on Top",
+          "passThrough": "Pass Through",
+          "privacySettings": "Privacy",
+          "shareTypingActivity": "Share Typing Activity",
+          "sharePointer": "Share Mouse Activity",
+          "shareInputStats": "Share Input Stats",
+          "pauseActivitySync": "Pause Activity Sync",
+          "statsSettings": "Input Stats",
+          "myInput": "My Input",
+          "todayInput": "Today: {keyboard} keys / {mouse} clicks",
+          "totalInput": "Total: {keyboard} keys / {mouse} clicks",
+          "awaySettings": "Away",
+          "presence": "I'm Away",
+          "autoReturn": "Auto Return",
+          "awayMessage": "Away Sign Text",
+          "sendSystemNotice": "Show Partner Status Notice"
+        },
+        "hints": {
+          "enabled": "Turning this off disconnects immediately and stops all data sharing.",
+          "relayUrl": "Use your own Cloudflare Worker address, for example https://xxx.workers.dev.",
+          "pairSecret": "Both sides must use the same Pair Secret. It is stored in the system credential vault only, never in the settings file, and never shown in plain text.",
+          "secretConfigured": "Configured",
+          "secretSaved": "Saved",
+          "fingerprint": "Verification fingerprint (must match on both sides):",
+          "autoConnect": "Connect automatically when the app starts.",
+          "remoteCat": "Show your partner's cat in a separate desktop window.",
+          "remoteModel": "Leave empty to use the same model as your own cat. Only models installed locally can be chosen.",
+          "remoteStats": "Requires your partner to enable \"Share Input Stats\" as well.",
+          "windowSize": "Resize the remote cat window.",
+          "shareTypingActivity": "Only the hand side and typing intensity are shared, never the actual keys.",
+          "sharePointer": "Only the pointer's screen ratio and button state are shared, never real coordinates.",
+          "shareInputStats": "Off by default. When enabled, your partner sees today's and total input counts — still just numbers.",
+          "pauseActivitySync": "Temporarily stop sending typing and mouse activity. Chat and presence stay available.",
+          "stats": "Stats are stored locally; they are only sent when \"Share Input Stats\" is enabled.",
+          "autoReturn": "Typing, clicking or moving the mouse noticeably ends the away state.",
+          "awayMessage": "This text is shown above your cat for your partner while you are away.",
+          "sendSystemNotice": "Show a short notice on the remote cat window when your partner leaves or returns.",
+          "presence": "Your partner will see that you stepped away."
+        },
+        "placeholders": {
+          "relayUrl": "https://xxx.workers.dev",
+          "pairSecret": "Paste Pair Secret",
+          "remoteModel": "Same as mine",
+          "awayMessage": "Going for a meal"
+        },
+        "buttons": {
+          "save": "Save",
+          "delete": "Delete",
+          "connect": "Connect",
+          "disconnect": "Disconnect"
+        },
+        "status": {
+          "disabled": "Disabled",
+          "disconnected": "Disconnected",
+          "connecting": "Connecting...",
+          "connected": "Connected",
+          "peerOffline": "Partner Offline",
+          "error": "Failed"
         }
       },
       "about": {
@@ -184,6 +274,8 @@
         "showRemoteCat": "Show Remote Cat",
         "hideChat": "Hide Chat",
         "showChat": "Show Chat",
+        "stepAway": "I'm Away",
+        "backToActive": "I'm Back",
         "passThrough": "Pass Through",
         "windowSize": "Window Size",
         "opacity": "Opacity",
