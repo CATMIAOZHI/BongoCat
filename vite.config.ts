@@ -32,8 +32,10 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore watching `src-tauri`
-      ignored: ['**/src-tauri/**'],
+      // 3. tell vite to ignore watching `src-tauri` and Rust build output
+      // `target/` 在仓库根目录（Cargo workspace），Rust 重编会替换里面的 dll，
+      // 不忽略的话 vite 的 watcher 会 EBUSY 崩掉整个 `tauri dev`
+      ignored: ['**/src-tauri/**', '**/target/**'],
     },
   },
 }))
