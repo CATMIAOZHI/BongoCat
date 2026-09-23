@@ -1,0 +1,84 @@
+name: Client CI
+
+# 客户端（Vue + src-tauri）的编译与测试门禁。仓库此前只有 release.yml，它只在打
+# `v*` tag 时 `pnpm tauri build`，会编译但一条测试都不跑；Phase 8 要动会话主循环和
+# 传输层，没有 PR 级的门禁很难受（R24-2）。server-relay/ 那一份在 pair-relay.yml。
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'tsconfig*.json'
+      - 'vitest.config.ts'
+      - 'vite.config.ts'
+      - '.github/workflows/client-ci.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'tsconfig*.json'
+      - 'vitest.config.ts'
+      - 'vite.config.ts'
+      - '.github/workflows/client-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  rust:
+    # 放 Windows runner：release.yml 的 ubuntu 任务要先装 libwebkit2gtk-4.1-dev /
+    # libappindicator3-dev / librsvg2-dev / libudev-dev / patchelf / libasound2-dev
+    # 才编得过 cpal / rdev / gilrs，Windows 一个系统依赖都不用装。而且 #[cfg(windows)]
+    # 的 P2P 代码只在 Windows 编译，放 Linux 等于它根本没有门禁。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # tauri lib 的 target 目录很大，用专门的 rust-cache 而不是裸 actions/cache
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      # 不跑 cargo fmt --check：仓库里有既有的 rustfmt 差异，它现在一定是红的，
+      # 先把「测试能过」这件事挡住比顺手格式化整个仓库重要。
+      - name: Test
+        run: cargo test --lib
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # pnpm 11 默认不跑依赖的 build script，`--frozen-lockfile` 会因为
+      # ERR_PNPM_IGNORED_BUILDS 直接退出 1（本机复现过）。显式关掉那个严格模式：
+      # 被跳过的 esbuild / @parcel/watcher / simple-git-hooks 不影响 vitest 与 tsc。
+      - name: Install
+        run: pnpm install --frozen-lockfile --config.strict-dep-builds=false
+
+      - name: Test
+        run: pnpm test
+
+      # vite build 不做类型检查，仓库也没装 vue-tsc，所以单独跑一次 tsc（只覆盖 .ts）
+      - name: Typecheck
+        run: node node_modules/typescript/bin/tsc --noEmit
