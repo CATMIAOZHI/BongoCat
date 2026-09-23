@@ -22,7 +22,7 @@
 >
 > **R9（§11 / §59 双人限制）** 明确写「双人限制是体验约束，不是安全边界」：持有同一 `PAIR_AUTH_TOKEN` 的人可以复用已有 deviceId 顶掉对方。陈旧连接按「最后活动时间」判断是否可被替换（阈值取 2 倍心跳 = 120 秒），最后活动时间最多每 10 秒写一次 attachment，避免高频写。
 >
-> **R10（§9 / §10 / §65 密钥流程）** `PAIR_SECRET` 与 `PAIR_AUTH_TOKEN` 都不进 stdout、shell history 或普通日志；`wrangler secret put` 用管道喂 stdin。secret 落盘必须显式 opt-in（例如 `--write`）+ 警告 + 提供删除命令，并把产物加入 `.gitignore`。§10 表述修正为：不知道 `PAIR_SECRET` 的是 Cloudflare 平台，部署者本人（用户 A）知道。
+> **R10（§9 / §10 / §65 密钥流程）** `PAIR_AUTH_TOKEN` 不进 stdout、shell history 或普通日志——只经 stdin 管道喂 `wrangler secret put`，verbose / debug / 报错输出都不得回显它；`PAIR_SECRET` 只在生成时**刻意打印一次**交给对方（须带警告），并且**不得作为命令行参数或任何会进入 shell history 的形式传递**（打印本身不进 history，复制粘贴进命令才进）。secret 落盘必须显式 opt-in（例如 `--write`）+ 警告 + 提供删除命令，并把产物加入 `.gitignore`。§10 表述修正为：不知道 `PAIR_SECRET` 的是 Cloudflare 平台，部署者本人（用户 A）知道。
 >
 > **R11（§21 / §22 对方猫渲染）** remote-cat 不复用会写共享 store 的加载路径（`modelStore.currentMotions` / `currentExpressions` / `shortcuts` / `catStore.window.scale` 会经 tauri-pinia 跨窗口持久化并污染主窗口），改为「只加载渲染、不写共享 store」。也**不能**用 `modelStore.pressedKeys` 渲染按键图（那是本地按键），远端键盘图形必须跟随远端快照。模型来自 `pair.remoteCat.modelId`。
 >
@@ -36,7 +36,23 @@
 >
 > **R16（§44 / §45 语音）** 改用 `cpal`（Windows 走 WASAPI，纯 Rust）录音 + `hound` 写 16-bit PCM WAV，按设备原生采样率录、立体声降混为单声道、**不做朴素重采样**（避免混叠）；60 秒约 5.8 MB，走同一 transfer 管线（约 12 个 512KiB chunk）。播放用 `<audio>` + 已启用的 asset protocol。Opus 编码留作后续优化（前置条件：cmake 3.x + VS 桌面 C++ 工作负载）。这样也去掉了「WebView2 麦克风权限」这个未验证依赖。
 >
+> **R17（§10 / §12 / §40 派生参数）** `AUTH_TOKEN` 与业务密钥必须跨语言一致，以下参数固化为实现契约（对应 `server-cloudflare/scripts/generate-pair.mjs` 与 `src-tauri/src/core/pair/crypto.rs`）：
+>
+> - KDF：HKDF-SHA256；**salt 为空**（RFC 5869 的「无 salt」与「HashLen 个零字节」等价，因此 Node WebCrypto 的 `salt: new Uint8Array(0)` 与 Rust 的 `Hkdf::new(None, ikm)` 结果相同）；输出 32 字节。
+> - info：`bongocat-pair-auth-v1` → `PAIR_AUTH_TOKEN`；`bongocat-pair-e2ee-v1` → `E2EE_ROOT_KEY`；`bongocat-pair-transfer-v1` → 每个 transfer 的会话密钥。
+> - `PAIR_SECRET` 的文本形态 = `base64url(32 原始字节)`（无填充）；**客户端必须先 base64url 解码，再把原始字节当 IKM**（直接拿 ASCII 文本当 IKM 是最常见的错误）。
+> - `PAIR_AUTH_TOKEN` 的文本形态 = base64url 无填充的 32 字节（43 字符），比较时区分大小写。
+> - per-transfer 密钥：`HKDF-SHA256(ikm = E2EE_ROOT_KEY, salt = 空, info = "bongocat-pair-transfer-v1" || transferId(8 字节大端))` → 32 字节，仅文件传输使用，用完即弃。
+> - nonce：XChaCha20-Poly1305 每条消息独立取 24 字节随机数（不从 chunk index 派生），同一 (key, nonce) 绝不重用。
+> - 指纹：`sha256(原始 secret 字节)` 的 hex 前 16 位、两两加空格，用于双方核对填的是同一个 secret。
+> - 除文档外还要有**固定测试向量**：Rust 与 Workers 两侧断言同一组值（文档会漂移，向量不会）。向量在 `server-cloudflare/test/hkdf-vector.spec.ts` 与 `src-tauri/src/core/pair/crypto.rs` 的 `auth_token_matches_relay_generator`。
+>
+> **R18（§63 / §64 协议边界与限流）** 客户端 → 服务端**只接受 binary 帧**；text 帧只用于服务端 → 客户端的控制帧（`server.welcome` / `server.peer` / `server.error`），客户端发 text 一律 `close 1008`——否则已配对的一方能伪造 `server.*`、谎报对方上下线，而且这条路径不经过 AEAD。客户端入站路由规则：text = 服务端控制帧，binary = 对端业务帧；未知 text 类型忽略，不要当成对端消息。限流改为**令牌桶**（容量 = 每秒上限、按时间连续补充；固定窗口在边界会双倍突发，而 R4 要求状态变化立即发送）：每 socket 30 帧/秒、20 个 transfer chunk/秒、12 MiB/秒；12 MiB 是为了让 20 个 512 KiB chunk 的突发（合计约 10 MiB）合法。超过即 `close 1008`（限流 / 帧格式），单帧超过 1 MiB 用 `close 1009`，两者 reason 字符串分开便于排障。
+>
+> **R19（§54 文件树）** 该节文件列表按实际实现更新（补 `test/`、`scripts/`、`vitest.config.ts`、`pnpm-workspace.yaml`、`worker-configuration.d.ts`、`.gitignore`）。
+>
 > **平台事实（已核实，2026-09-23）**
+>
 > - Cloudflare WebSocket 单帧上限自 2025-10-31 起为 32 MiB（此前 1 MiB），超限由平台自动 `close 1009`。注意：这管的是 Worker / DO **收到**方向、且按整帧计（含帧头与 nonce/tag）；客户端接收方向的上限未核实，**不要**写进文档或依赖它。512 KiB 分片继续保留。
 > - Durable Object 免费额度：每天 10 万次请求 + 13,000 GB-s/天；超限是「该类型后续操作失败」，relay 直接不可用。计费折算：**收到的 WebSocket 消息按 20 条 = 1 次请求计**，另加「打开一次 WebSocket 也算 1 次请求」，出站不计费。按 3Hz 连续活动估算约 1.3 万次请求/天，额度仍有余量，所以 R4 / R5 / R6 主要作为性能、电量与体验要求保留（不是额度红线）。换算细节 Phase 2 联调时对着 Cloudflare 面板计数器实测一次再定频率参数。
 
@@ -48,17 +64,17 @@
 
 设计前提：
 
-* 永远只有两个人。
-* 每一对用户自行部署自己的 Cloudflare Relay。
-* 一个 Cloudflare 部署实例对应一对用户。
-* Relay 只做实时转发，不保存聊天记录，不保存文件。
-* 客户端保存聊天记录、输入统计和收到的附件。
-* 双方各自配置同一个服务器地址和 Pair Secret。
-* 自动断线重连。
-* 支持开机启动后自动连接。
-* 不要求公网 VPS。
-* 第一服务端实现仅支持 Cloudflare Workers + Durable Objects。
-* 不提供官方中转服务。
+- 永远只有两个人。
+- 每一对用户自行部署自己的 Cloudflare Relay。
+- 一个 Cloudflare 部署实例对应一对用户。
+- Relay 只做实时转发，不保存聊天记录，不保存文件。
+- 客户端保存聊天记录、输入统计和收到的附件。
+- 双方各自配置同一个服务器地址和 Pair Secret。
+- 自动断线重连。
+- 支持开机启动后自动连接。
+- 不要求公网 VPS。
+- 第一服务端实现仅支持 Cloudflare Workers + Durable Objects。
+- 不提供官方中转服务。
 
 最终体验：
 
@@ -144,12 +160,12 @@ Enter
 
 Cloudflare 中转服务器不得保存：
 
-* 聊天记录
-* 图片
-* 语音
-* 文件
-* 输入统计历史
-* 键鼠事件历史
+- 聊天记录
+- 图片
+- 语音
+- 文件
+- 输入统计历史
+- 键鼠事件历史
 
 服务器只允许维护 WebSocket 当前连接状态。
 
@@ -171,22 +187,22 @@ A → WebSocket chunk → Durable Object → WebSocket chunk → B
 
 不要实现：
 
-* 用户注册
-* 登录
-* OAuth
-* 好友系统
-* 房间列表
-* 创建房间
-* 加入房间
-* 多人房间
-* 在线用户列表
-* 管理后台
-* 官方服务器
-* 消息云同步
-* R2
-* D1
-* KV 聊天存储
-* 离线服务器消息存储
+- 用户注册
+- 登录
+- OAuth
+- 好友系统
+- 房间列表
+- 创建房间
+- 加入房间
+- 多人房间
+- 在线用户列表
+- 管理后台
+- 官方服务器
+- 消息云同步
+- R2
+- D1
+- KV 聊天存储
+- 离线服务器消息存储
 
 一次 Cloudflare 部署本身就是一对用户。
 
@@ -295,13 +311,13 @@ preference
 
 理由：
 
-* 两只猫需要独立位置。
-* 两只猫需要独立缩放。
-* 对方猫可以单独隐藏。
-* Chat 可以自由移动。
-* Chat 可以独立调整大小。
-* 可以直接复用现有 `windowState` 持久化机制。
-* 多显示器体验更好。
+- 两只猫需要独立位置。
+- 两只猫需要独立缩放。
+- 对方猫可以单独隐藏。
+- Chat 可以自由移动。
+- Chat 可以独立调整大小。
+- 可以直接复用现有 `windowState` 持久化机制。
+- 多显示器体验更好。
 
 ---
 
@@ -677,6 +693,20 @@ auth info = "bongocat-pair-auth-v1"
 crypto info = "bongocat-pair-e2ee-v1"
 ```
 
+> ℹ️ 派生参数已由 R17 固化，两侧必须逐项一致（尤其 salt 与「先 base64url 解码再当 IKM」）：
+>
+> | 项                       | 值                                                                                       |
+> | ------------------------ | ---------------------------------------------------------------------------------------- |
+> | KDF                      | HKDF-SHA256                                                                              |
+> | salt                     | 空（等价 HashLen 个零字节；Node 写 `new Uint8Array(0)`，Rust 写 `Hkdf::new(None, ikm)`） |
+> | 输出长度                 | 32 字节                                                                                  |
+> | info（AUTH_TOKEN）       | `bongocat-pair-auth-v1`                                                                  |
+> | info（E2EE_ROOT_KEY）    | `bongocat-pair-e2ee-v1`                                                                  |
+> | info（per-transfer key） | `bongocat-pair-transfer-v1` + transferId(8 字节大端)                                     |
+> | PAIR_SECRET 形态         | base64url(32 原始字节)，无填充                                                           |
+> | AUTH_TOKEN 形态          | base64url 无填充，43 字符                                                                |
+> | 指纹                     | `sha256(原始 secret)` 的 hex 前 16 位，两两空格分组                                      |
+
 服务器只保存：
 
 ```text
@@ -735,6 +765,8 @@ Relay 最大允许两个不同 `deviceId`。
 # 12. E2EE
 
 > ⚠️ 已被 R8 覆盖：服务器看到的是「密文 + 14 字节帧头元数据（类型 / 大小 / 时序）」，不是纯密文。
+>
+> ℹ️ 补充（R17）：XChaCha20-Poly1305 的 nonce 是**每条消息独立**的 24 字节随机数，不从 chunk index 派生，同一 (key, nonce) 绝不重用。
 
 聊天、Presence、Pet State、统计和文件 metadata 建议全部使用端到端加密。
 
@@ -1101,8 +1133,8 @@ handleMouseRatio(xRatio, yRatio)
 
 新增：
 
-```ts
-handleMouseRatio(xRatio: number, yRatio: number)
+```text
+handleMouseRatio(xRatio, yRatio)
 ```
 
 本地鼠标：
@@ -1470,18 +1502,18 @@ src/pages/chat/index.vue
 
 支持：
 
-* 最新 N 条消息
-* N 可配置
-* 滚轮查看历史
-* 拖动窗口
-* 调整窗口大小
-* 复制文字
-* 图片预览
-* 文件打开
-* 文件另存
-* 一键隐藏
-* 置顶
-* 可选窗口穿透
+- 最新 N 条消息
+- N 可配置
+- 滚轮查看历史
+- 拖动窗口
+- 调整窗口大小
+- 复制文字
+- 图片预览
+- 文件打开
+- 文件另存
+- 一键隐藏
+- 置顶
+- 可选窗口穿透
 
 默认：
 
@@ -1917,6 +1949,10 @@ HKDF(E2EE_ROOT_KEY, transferId)
 
 这样 chunk nonce 更容易安全管理。
 
+> ℹ️ 已被 R17 固化：`HKDF-SHA256(ikm = E2EE_ROOT_KEY, salt = 空, info = "bongocat-pair-transfer-v1" || transferId(8 字节大端))` → 32 字节，仅文件传输使用、用完即弃；chunk 的 nonce 仍是每条消息独立的 24 字节随机数。
+
+> ℹ️ 客户端必须自己限速（R18）：同一 transfer 的相邻 chunk 至少间隔 50ms（≤20 chunk/s），并给统计 / 聊天留出帧额度，否则第 21 个 chunk 会被中继 `close 1008`，传输中途中断。
+
 ---
 
 # 41. 文件接收
@@ -1962,16 +1998,16 @@ rename 到 attachments
 
 收到普通文件：
 
-* 不自动执行。
-* 不自动打开。
-* 原文件名必须 sanitize。
-* 实际落盘文件使用 UUID。
-* MIME 不可信。
-* extension 不可信。
-* 点击“打开”必须用户明确操作。
-* 最大文件大小默认 256MB。
-* 设置可以提高。
-* 建议硬上限 1GB。
+- 不自动执行。
+- 不自动打开。
+- 原文件名必须 sanitize。
+- 实际落盘文件使用 UUID。
+- MIME 不可信。
+- extension 不可信。
+- 点击“打开”必须用户明确操作。
+- 最大文件大小默认 256MB。
+- 设置可以提高。
+- 建议硬上限 1GB。
 
 图片和语音允许自动下载，因为它们要用于聊天 UI。
 
@@ -2372,8 +2408,18 @@ server-cloudflare/
 ├── tsconfig.json
 ├── wrangler.jsonc
 ├── README.md
+├── vitest.config.ts
+├── pnpm-workspace.yaml
+├── worker-configuration.d.ts
+├── .gitignore
+├── scripts/
+│   └── generate-pair.mjs
+├── test/
+│   ├── relay.spec.ts
+│   └── hkdf-vector.spec.ts
 └── src/
     ├── index.ts
+    ├── env.ts
     ├── pair.ts
     └── protocol.ts
 ```
@@ -2604,6 +2650,8 @@ Application frame 则全部 binary + E2EE。
 # 63. Server 限制
 
 > ⚠️ 已被 R8 覆盖：`text/control <= 32 KiB`、`binary <= 1 MiB` 的口径按「含 14 字节明文帧头 + nonce/tag 的整帧」计算（该口径属于 R8 的一部分）。
+>
+> ℹ️ 已被 R18 修正：「客户端 → 服务端只接受 binary」；`text/control` 只用于**服务端 → 客户端**的控制帧（每条都很小），客户端发 text 属于协议错误，`close 1008`。所以 `text/control <= 32 KiB` 这个入站上限不再存在。
 
 应用层主动限制：
 
@@ -2625,6 +2673,8 @@ close 1009
 # 64. Server Rate Guard
 
 > ⚠️ 已被 R8 覆盖：DO 可以读取 14 字节明文帧头（kind / transferId / seq），因此能按帧类型分桶限流；但帧头由客户端自报，属「防误用」而非安全边界。该明文帧头必须作为 AEAD 的 associated data 参与认证。
+>
+> ℹ️ 已被 R18 修正为令牌桶（容量 = 每秒上限，按时间连续补充，避免固定窗口的边界双倍突发）：每 socket `30 帧/秒`、`20 个 transfer chunk/秒`、`12 MiB/秒`（12 MiB 让 20 个 512 KiB chunk 的突发合法）。超过即 `close 1008`；单帧超过 1 MiB 用 `close 1009`。
 
 做非常轻量保护。
 
