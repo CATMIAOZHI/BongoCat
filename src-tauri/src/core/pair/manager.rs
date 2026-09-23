@@ -18,7 +18,7 @@ use tauri::{AppHandle, Emitter, Manager as _, Runtime};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::client::{self, PairFailure, PairSocket};
+use super::client::{self, PairFailure};
 use super::crypto::{self, PairCipher};
 use super::history::{
     ChatMessage, MESSAGE_TEXT_LIMIT, MessageDirection, MessageKind, MessageStatus, NewAttachment,
@@ -1272,14 +1272,38 @@ where
     }
 }
 
-async fn live(
+/// 一条会话的主循环。
+///
+/// 传输层是泛型的：只要「能收发 [`Message`]」就能接进来，不要求是 WebSocket。
+/// 中继那条路直接把 [`client::PairSocket`]（`WebSocketStream`）传进来——它本来就
+/// 同时实现了 `Sink<Message>` 与 `Stream<Item = Result<Message, _>>`，所以不需要包装。
+///
+/// 注意 `T` **不是**「当前生效的传输」，而是这条会话的**读侧来源**：函数一进来就先
+/// `read_welcome`（等中继的 `server.welcome`，10 秒超时），而 DataChannel 上永远没有
+/// 这一帧，所以 DC 不可能单独充当 `T`。按 §4.2，DC 在 Phase 8b/8c 里只做出站 sink，
+/// 外加一条额外的入站分支；信令与 `server.peer` 始终留在中继这条流上。
+///
+/// 传输专有的处理点，都在下面的 `match` 里，由传输自己翻译：主动关闭发
+/// `Message::Close`、入站 `Message::Close` 翻成 `describe_close`、流结束
+/// （`stream.next()` 返回 `None`）也按 `describe_close(None)` 收尾、其余控制帧
+/// 落到 `Ok(_)` 分支忽略——**入站 `Message::Ping` 也走这一支**（tungstenite 0.30
+/// 会把入站 Ping 交给调用方，Pong 才是它内部排队的）。还有一处不在这个 `match`
+/// 里：ticker 发的 WS `Message::Ping`——R21 会把它换成应用级 `pair.ping`，因为
+/// DataChannel 上没有 WS 控制帧。
+async fn live<T, E>(
     manager: &Arc<PairManager>,
     generation: u64,
     state: &mut SessionState,
-    socket: PairSocket,
+    transport: T,
     receiver: &mut mpsc::UnboundedReceiver<Command>,
-) -> Outcome {
-    let (mut sink, mut stream) = socket.split();
+) -> Outcome
+where
+    T: futures_util::Sink<Message, Error = E>
+        + futures_util::Stream<Item = Result<Message, E>>
+        + Unpin,
+    E: std::fmt::Display,
+{
+    let (mut sink, mut stream) = transport.split();
     let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
     // 附件分片另有一层额度（R18）：两套都放行才发一块
     let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
@@ -4446,5 +4470,143 @@ mod tests {
                     && payload["message"] == "连接断开，传输已中断")
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 一个**不是** WebSocket 的传输替身。
+    ///
+    /// Phase 8a 的全部意义就是「`live` 只依赖 Sink + Stream 抽象」：Phase 8b 的
+    /// DataChannel 适配器要按同一组约束接进来。这个替身让下面那条用例真的把 `live`
+    /// 跑在一根不是 WebSocket 的传输上——哪天有人把 `live` 重新绑回 `PairSocket`，
+    /// 它会先编译不过。
+    struct FakeTransport {
+        inbound: mpsc::UnboundedReceiver<Message>,
+        sent: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl futures_util::Stream for FakeTransport {
+        type Item = Result<Message, std::convert::Infallible>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.inbound.poll_recv(cx).map(|message| message.map(Ok))
+        }
+    }
+
+    impl futures_util::Sink<Message> for FakeTransport {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(item);
+
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 等一个条件成立；超时返回它最后一次的取值，方便断言里看到真实状态
+    async fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        while tokio::time::Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        predicate()
+    }
+
+    /// Phase 8a：`live` 跑在一条不是 WebSocket 的传输上，入站与出站都照常工作。
+    #[tokio::test]
+    async fn live_runs_over_a_transport_that_is_not_a_websocket() {
+        let (manager, sink) = test_manager();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let transport = FakeTransport {
+            inbound: inbound_rx,
+            sent: Arc::clone(&sent),
+        };
+        let mut receiver = with_session(&manager);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let driver = {
+            let manager = Arc::clone(&manager);
+
+            tokio::spawn(
+                async move { live(&manager, 0, &mut state, transport, &mut receiver).await },
+            )
+        };
+
+        // 入站：中继握手帧（文本控制帧，和 WebSocket 无关）
+        inbound_tx
+            .send(Message::text(
+                json!({
+                    "type": "server.welcome",
+                    "protocol": PROTOCOL_VERSION,
+                    "peerOnline": true,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        assert!(
+            wait_until(|| manager.status().peer_online).await,
+            "welcome 没有被应用：{:?}",
+            manager.status()
+        );
+
+        // 出站：一条应用消息要先过 Pacer，再写成二进制帧
+        manager
+            .send(FrameKind::Ping, message_type::PING, json!({ "sentAt": 1 }))
+            .unwrap();
+
+        let written = || {
+            sent.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|message| matches!(message, Message::Binary(_)))
+        };
+
+        assert!(wait_until(written).await, "假传输上没有写出任何应用帧");
+
+        // 传输结束 → 会话按「中继关闭了连接」收尾（而不是被用户停掉）
+        inbound_tx.send(Message::Close(None)).unwrap();
+
+        match driver.await.unwrap() {
+            Outcome::Lost(failure) => {
+                assert_eq!(failure.message, "中继关闭了连接");
+                assert!(!failure.fatal);
+            }
+            Outcome::Stopped => panic!("不该是被用户停掉"),
+        }
+
+        assert!(!sink.payloads(EVENT_CONNECTION_CHANGED).is_empty());
     }
 }
