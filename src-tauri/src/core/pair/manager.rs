@@ -1288,8 +1288,10 @@ where
 /// （`stream.next()` 返回 `None`）也按 `describe_close(None)` 收尾、其余控制帧
 /// 落到 `Ok(_)` 分支忽略——**入站 `Message::Ping` 也走这一支**（tungstenite 0.30
 /// 会把入站 Ping 交给调用方，Pong 才是它内部排队的）。还有一处不在这个 `match`
-/// 里：ticker 发的 WS `Message::Ping`——R21 会把它换成应用级 `pair.ping`，因为
-/// DataChannel 上没有 WS 控制帧。
+/// 里：ticker 发的 WS `Message::Ping`。它**保持不动**——R28 推翻了 R21 的初版写法：
+/// 中继自己会回 Pong（`server-relay/src/relay.rs:322-324`），与对端在线与否无关；
+/// 换成对端回 pong 会让「对端离线」变成「心跳超时」。DC 那条腿将来有自己独立的
+/// 探针（应用级 `pair.ping`），两条腿的标志互不共用。
 async fn live<T, E>(
     manager: &Arc<PairManager>,
     generation: u64,
