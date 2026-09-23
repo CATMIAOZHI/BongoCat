@@ -10,7 +10,7 @@
 ## 工作区结构
 
 - 工作区根目录就是仓库本体（BongoCat 的本地 fork），没有子仓库。
-- 双人联机功能的设计真相来源是 `docs/pair-plan.md`（含实现前的修订记录 R1~R16，冲突以修订记录为准）。
+- 双人联机功能的设计真相来源是 `docs/pair-plan.md`（含实现前的修订记录 R1~R19，冲突以修订记录为准）。
 - `src/`：前端，Vue 3 + TypeScript + Vite + Pinia + UnoCSS + antdv-next。
 - `src-tauri/`：Rust 后端；`src-tauri/src/plugins/` 下是本仓库自带的本地插件（`admin-status`、`window`）。
 - `src-tauri/assets/models`：内置猫咪模型；`scripts/`：图标生成、发布等脚本。
