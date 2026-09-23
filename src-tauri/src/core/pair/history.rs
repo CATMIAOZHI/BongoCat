@@ -6,6 +6,7 @@
 //!
 //! 这个模块也是**纯存储**：不知道网络、不知道 Tauri，方便直接跑单测。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -100,7 +101,7 @@ pub enum MessageKind {
 }
 
 impl MessageKind {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Text => "text",
             Self::Image => "image",
@@ -167,7 +168,37 @@ pub struct ChatMessage {
     pub text: Option<String>,
     pub status: MessageStatus,
     pub attachment_id: Option<String>,
+    /// 附件消息带上附件记录（§37）：读历史时一并填好，前端不用为每条消息再查一次
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<AttachmentRecord>,
     pub conversation_epoch: i64,
+}
+
+/// 附件记录（§33）。`local_path` 只是本机的落盘位置，永远不会发给对方（§39 / §78）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRecord {
+    pub id: String,
+    pub kind: MessageKind,
+    pub original_name: Option<String>,
+    pub mime: Option<String>,
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+    pub local_path: Option<String>,
+    pub created_at: i64,
+}
+
+/// 待写入的一条附件记录
+#[derive(Debug, Clone)]
+pub struct NewAttachment {
+    pub id: String,
+    pub kind: MessageKind,
+    pub original_name: Option<String>,
+    pub mime: Option<String>,
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+    pub local_path: Option<String>,
+    pub created_at: i64,
 }
 
 /// 待写入的一条新消息（`seq` 由 SQLite 生成，所以不在这里）
@@ -208,6 +239,46 @@ impl NewMessage {
             text: Some(text),
             status: MessageStatus::Received,
             attachment_id: None,
+            conversation_epoch: epoch,
+        }
+    }
+
+    /// 本机发出的附件（§37）：对方的 `transfer.verified` 才是真正的「已送达」
+    pub fn outgoing_attachment(
+        id: String,
+        kind: MessageKind,
+        attachment_id: String,
+        created_at: i64,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            id,
+            direction: MessageDirection::Outgoing,
+            kind,
+            created_at,
+            text: None,
+            status: MessageStatus::Pending,
+            attachment_id: Some(attachment_id),
+            conversation_epoch: epoch,
+        }
+    }
+
+    /// 对方发来的附件：先落 `pending`，校验通过后由上层改成 `received`，失败则 `failed`
+    pub fn incoming_attachment(
+        id: String,
+        kind: MessageKind,
+        attachment_id: String,
+        created_at: i64,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            id,
+            direction: MessageDirection::Incoming,
+            kind,
+            created_at,
+            text: None,
+            status: MessageStatus::Pending,
+            attachment_id: Some(attachment_id),
             conversation_epoch: epoch,
         }
     }
@@ -266,7 +337,76 @@ struct JsonExport<'a> {
     format_version: u32,
     exported_at: i64,
     message_count: usize,
-    messages: &'a [ChatMessage],
+    messages: Vec<ExportedMessage<'a>>,
+}
+
+/// 导出用的消息。
+///
+/// 除了 `local_path` 之外与 `ChatMessage` 一致：本机落盘位置是隐私（§78），而导出的文件
+/// 是拿去备份甚至分享的，带上它就等于把 `C:\Users\...` 一起交出去。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportedMessage<'a> {
+    seq: i64,
+    id: &'a str,
+    direction: MessageDirection,
+    kind: MessageKind,
+    created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    status: MessageStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment: Option<ExportedAttachment<'a>>,
+    conversation_epoch: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportedAttachment<'a> {
+    id: &'a str,
+    kind: MessageKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<&'a str>,
+    created_at: i64,
+}
+
+impl<'a> From<&'a ChatMessage> for ExportedMessage<'a> {
+    fn from(message: &'a ChatMessage) -> Self {
+        Self {
+            seq: message.seq,
+            id: &message.id,
+            direction: message.direction,
+            kind: message.kind,
+            created_at: message.created_at,
+            text: message.text.as_deref(),
+            status: message.status,
+            attachment_id: message.attachment_id.as_deref(),
+            attachment: message.attachment.as_ref().map(ExportedAttachment::from),
+            conversation_epoch: message.conversation_epoch,
+        }
+    }
+}
+
+impl<'a> From<&'a AttachmentRecord> for ExportedAttachment<'a> {
+    fn from(attachment: &'a AttachmentRecord) -> Self {
+        Self {
+            id: &attachment.id,
+            kind: attachment.kind,
+            original_name: attachment.original_name.as_deref(),
+            mime: attachment.mime.as_deref(),
+            size: attachment.size,
+            sha256: attachment.sha256.as_deref(),
+            created_at: attachment.created_at,
+        }
+    }
 }
 
 fn render_json(messages: &[ChatMessage], exported_at: i64) -> Result<String, String> {
@@ -274,7 +414,7 @@ fn render_json(messages: &[ChatMessage], exported_at: i64) -> Result<String, Str
         format_version: 1,
         exported_at,
         message_count: messages.len(),
-        messages,
+        messages: messages.iter().map(ExportedMessage::from).collect(),
     };
 
     serde_json::to_string_pretty(&document).map_err(|err| format!("序列化导出内容失败: {err}"))
@@ -329,11 +469,34 @@ fn render_text(messages: &[ChatMessage]) -> String {
             "[{}] {}：{}\n",
             format_timestamp(message.created_at),
             speaker(message),
-            message.text.as_deref().unwrap_or("（非文本消息）"),
+            describe(message),
         ));
     }
 
     output
+}
+
+/// 导出时怎么描述一条消息。附件只写「类型 + 文件名」，不把内容塞进 JSON / 文本里（§35）。
+fn describe(message: &ChatMessage) -> String {
+    if let Some(text) = message.text.as_deref() {
+        return text.to_string();
+    }
+
+    let label = match message.kind {
+        MessageKind::Image => "图片",
+        MessageKind::File => "文件",
+        MessageKind::Voice => "语音",
+        MessageKind::Text => "文本",
+    };
+
+    match message
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.original_name.clone())
+    {
+        Some(name) => format!("[{label}] {name}"),
+        None => format!("[{label}]"),
+    }
 }
 
 fn render_markdown(messages: &[ChatMessage]) -> String {
@@ -354,11 +517,7 @@ fn render_markdown(messages: &[ChatMessage]) -> String {
             "- **{}** {}：{}\n",
             speaker(message),
             clock.trim(),
-            message
-                .text
-                .as_deref()
-                .unwrap_or("（非文本消息）")
-                .replace('\n', "  \n  "),
+            describe(message).replace('\n', "  \n  "),
         ));
     }
 
@@ -504,11 +663,78 @@ impl PairHistory {
 
         match rows.next() {
             None => Ok(None),
-            Some(row) => Ok(Some(
-                row.map_err(|err| format!("读取聊天记录失败: {err}"))?
-                    .into_message()?,
-            )),
+            Some(row) => {
+                let mut message = row
+                    .map_err(|err| format!("读取聊天记录失败: {err}"))?
+                    .into_message()?;
+
+                fill_attachments(&connection, std::slice::from_mut(&mut message))?;
+
+                Ok(Some(message))
+            }
         }
+    }
+
+    /// 写入（或覆盖）一条附件记录。重发同一个附件时用覆盖，别留下两条孤儿记录。
+    pub fn upsert_attachment(&self, attachment: &NewAttachment) -> Result<AttachmentRecord, String> {
+        self.lock()
+            .execute(
+                "INSERT INTO attachments (id, kind, original_name, mime, size, sha256, local_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    original_name = excluded.original_name,
+                    mime = excluded.mime,
+                    size = excluded.size,
+                    sha256 = excluded.sha256,
+                    local_path = excluded.local_path",
+                params![
+                    attachment.id,
+                    attachment.kind.as_str(),
+                    attachment.original_name,
+                    attachment.mime,
+                    attachment.size.map(|value| value as i64),
+                    attachment.sha256,
+                    attachment.local_path,
+                    attachment.created_at,
+                ],
+            )
+            .map_err(|err| format!("写入附件记录失败: {err}"))?;
+
+        self.attachment(&attachment.id)?
+            .ok_or_else(|| "写入附件记录后读不回来".to_string())
+    }
+
+    pub fn attachment(&self, id: &str) -> Result<Option<AttachmentRecord>, String> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(&format!("{ATTACHMENT_COLUMNS} WHERE id = ?1"))
+            .map_err(|err| format!("查询附件记录失败: {err}"))?;
+
+        statement
+            .query_row(params![id], RawAttachment::from_row)
+            .optional()
+            .map_err(|err| format!("查询附件记录失败: {err}"))?
+            .map(RawAttachment::into_record)
+            .transpose()
+    }
+
+    /// 收完（或取消、重发）之后更新本机落盘路径。
+    ///
+    /// 校验失败时要把路径清回 `None`，否则聊天窗口会一直显示一个已经不存在的文件。
+    pub fn set_attachment_path(
+        &self,
+        id: &str,
+        local_path: Option<&str>,
+    ) -> Result<Option<AttachmentRecord>, String> {
+        self.lock()
+            .execute(
+                "UPDATE attachments SET local_path = ?2 WHERE id = ?1",
+                params![id, local_path],
+            )
+            .map_err(|err| format!("更新附件路径失败: {err}"))?;
+
+        self.attachment(id)
     }
 
     /// 只在状态真的变化时返回新行，避免上层重复广播事件
@@ -565,6 +791,7 @@ impl PairHistory {
 
         messages.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         messages.reverse();
+        fill_attachments(&connection, &mut messages)?;
 
         Ok(HistoryPage {
             messages,
@@ -597,6 +824,8 @@ impl PairHistory {
                     .into_message()?,
             );
         }
+
+        fill_attachments(&connection, &mut messages)?;
 
         Ok(messages)
     }
@@ -634,6 +863,8 @@ impl PairHistory {
                     .into_message()?,
             );
         }
+
+        fill_attachments(&connection, &mut messages)?;
 
         Ok(messages)
     }
@@ -679,6 +910,84 @@ impl PairHistory {
 }
 
 const MESSAGE_COLUMNS: &str = "SELECT seq, id, direction, kind, created_at, text, status, attachment_id, conversation_epoch FROM messages";
+const ATTACHMENT_COLUMNS: &str =
+    "SELECT id, kind, original_name, mime, size, sha256, local_path, created_at FROM attachments";
+
+/// 给附件消息补上附件记录：一次读一页，只对真正带附件的消息各查一次
+fn fill_attachments(
+    connection: &Connection,
+    messages: &mut [ChatMessage],
+) -> Result<(), String> {
+    if !messages.iter().any(|message| message.attachment_id.is_some()) {
+        return Ok(());
+    }
+
+    let mut cached: HashMap<String, Option<AttachmentRecord>> = HashMap::new();
+
+    for message in messages.iter_mut() {
+        let Some(id) = message.attachment_id.clone() else {
+            continue;
+        };
+
+        if !cached.contains_key(&id) {
+            let mut statement = connection
+                .prepare(&format!("{ATTACHMENT_COLUMNS} WHERE id = ?1"))
+                .map_err(|err| format!("查询附件记录失败: {err}"))?;
+            let record = statement
+                .query_row(params![id], RawAttachment::from_row)
+                .optional()
+                .map_err(|err| format!("查询附件记录失败: {err}"))?
+                .map(RawAttachment::into_record)
+                .transpose()?;
+
+            cached.insert(id.clone(), record);
+        }
+
+        message.attachment = cached.get(&id).cloned().flatten();
+    }
+
+    Ok(())
+}
+
+/// 附件表的一行
+struct RawAttachment {
+    id: String,
+    kind: String,
+    original_name: Option<String>,
+    mime: Option<String>,
+    size: Option<i64>,
+    sha256: Option<String>,
+    local_path: Option<String>,
+    created_at: i64,
+}
+
+impl RawAttachment {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            original_name: row.get(2)?,
+            mime: row.get(3)?,
+            size: row.get(4)?,
+            sha256: row.get(5)?,
+            local_path: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    }
+
+    fn into_record(self) -> Result<AttachmentRecord, String> {
+        Ok(AttachmentRecord {
+            id: self.id,
+            kind: MessageKind::parse(&self.kind)?,
+            original_name: self.original_name,
+            mime: self.mime,
+            size: self.size.map(|value| value.max(0) as u64),
+            sha256: self.sha256,
+            local_path: self.local_path,
+            created_at: self.created_at,
+        })
+    }
+}
 
 /// SQLite 里枚举存的是文本，所以先按原始类型取出来再解析
 struct RawMessage {
@@ -718,6 +1027,7 @@ impl RawMessage {
             text: self.text,
             status: MessageStatus::parse(&self.status)?,
             attachment_id: self.attachment_id,
+            attachment: None,
             conversation_epoch: self.conversation_epoch,
         })
     }
@@ -1006,5 +1316,154 @@ mod tests {
         // 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC
         assert_eq!(format_timestamp(1_700_000_000_000), "2023-11-14 22:13:20");
         assert_eq!(format_timestamp(0), "1970-01-01 00:00:00");
+    }
+
+    fn attachment(id: &str, kind: MessageKind, name: &str, size: u64) -> NewAttachment {
+        NewAttachment {
+            id: id.into(),
+            kind,
+            original_name: Some(name.into()),
+            mime: Some("image/png".into()),
+            size: Some(size),
+            sha256: Some("a".repeat(64)),
+            local_path: None,
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    /// 附件消息读回来要带上附件记录，前端才不用为每条消息再查一次
+    #[test]
+    fn attachment_messages_carry_their_record() {
+        let history = history();
+
+        history
+            .upsert_attachment(&attachment("a1", MessageKind::Image, "猫.png", 2048))
+            .unwrap();
+        history
+            .insert(&NewMessage::outgoing_attachment(
+                "m1".into(),
+                MessageKind::Image,
+                "a1".into(),
+                1_700_000_000_000,
+                1,
+            ))
+            .unwrap();
+
+        let message = history.find("m1").unwrap().unwrap();
+
+        assert_eq!(message.kind, MessageKind::Image);
+        assert!(message.text.is_none());
+        assert_eq!(
+            message.attachment.as_ref().map(|record| record.original_name.as_deref()),
+            Some(Some("猫.png"))
+        );
+        assert_eq!(message.attachment.as_ref().and_then(|r| r.size), Some(2048));
+        assert!(message.attachment.as_ref().unwrap().local_path.is_none());
+
+        // 分页与导出走的是同一套填充逻辑
+        let page = history.list(1, None, 10).unwrap();
+
+        assert_eq!(page.messages.len(), 1);
+        assert!(page.messages[0].attachment.is_some());
+
+        let exported = history.all().unwrap();
+
+        assert!(exported[0].attachment.is_some());
+    }
+
+    /// §78：导出的 JSON 也不能带上本机落盘路径（附件记录里的 `localPath`），
+    /// 导出的文件是拿去备份甚至分享的，带上它等于把 `C:\Users\...` 一起交出去
+    #[test]
+    fn json_export_never_carries_local_paths() {
+        let history = history();
+
+        history
+            .upsert_attachment(&attachment("a1", MessageKind::File, "报告.pdf", 100))
+            .unwrap();
+        history
+            .set_attachment_path("a1", Some(r"C:\Users\cat\AppData\Local\BongoCat\attachments\a1.pdf"))
+            .unwrap();
+        history
+            .insert(&NewMessage::outgoing_attachment(
+                "m1".into(),
+                MessageKind::File,
+                "a1".into(),
+                1,
+                1,
+            ))
+            .unwrap();
+
+        let messages = history.all().unwrap();
+
+        assert!(
+            messages[0]
+                .attachment
+                .as_ref()
+                .unwrap()
+                .local_path
+                .is_some(),
+            "库里要留着路径：聊天窗口还要用它预览与「另存为」"
+        );
+
+        let json = ExportFormat::Json.render(&messages, 0).unwrap();
+
+        assert!(!json.contains("Users"), "导出的 JSON 带上了本机路径：{json}");
+        assert!(json.contains(r#""originalName": "报告.pdf""#), "{json}");
+    }
+
+    /// 传输中途 / 失败 / 重发都会改写落盘路径，覆盖写不能留下两条记录
+    #[test]
+    fn attachment_path_is_updated_in_place() {
+        let history = history();
+
+        history
+            .upsert_attachment(&attachment("a1", MessageKind::File, "报告.pdf", 100))
+            .unwrap();
+
+        let stored = history
+            .set_attachment_path("a1", Some(r"C:\cache\abc.pdf"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stored.local_path.as_deref(), Some(r"C:\cache\abc.pdf"));
+
+        // 重发时先清空，再重新覆盖记录
+        let cleared = history.set_attachment_path("a1", None).unwrap().unwrap();
+
+        assert!(cleared.local_path.is_none());
+
+        history
+            .upsert_attachment(&attachment("a1", MessageKind::File, "报告-v2.pdf", 200))
+            .unwrap();
+
+        let overwritten = history.attachment("a1").unwrap().unwrap();
+
+        assert_eq!(overwritten.original_name.as_deref(), Some("报告-v2.pdf"));
+        assert_eq!(overwritten.size, Some(200));
+        assert!(history.attachment("missing").unwrap().is_none());
+    }
+
+    /// 附件消息在 TXT / Markdown 里要有可读的描述，而不是空行
+    #[test]
+    fn exports_describe_attachments() {
+        let history = history();
+
+        history
+            .upsert_attachment(&attachment("a1", MessageKind::Image, "猫.png", 2048))
+            .unwrap();
+        history
+            .insert(&NewMessage::incoming_attachment(
+                "m1".into(),
+                MessageKind::Image,
+                "a1".into(),
+                1_700_000_000_000,
+                1,
+            ))
+            .unwrap();
+
+        let messages = history.all().unwrap();
+        let text = ExportFormat::Txt.render(&messages, 0).unwrap();
+
+        assert!(text.contains("对方：[图片] 猫.png"), "{text}");
     }
 }

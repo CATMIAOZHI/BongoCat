@@ -50,7 +50,14 @@ pub fn run() {
             core::pair::pair_history_list,
             core::pair::pair_history_stats,
             core::pair::pair_history_export,
-            core::pair::pair_history_start_new_epoch
+            core::pair::pair_history_start_new_epoch,
+            core::pair::pair_transfer_paths,
+            core::pair::pair_set_max_attachment_mb,
+            core::pair::pair_send_attachment,
+            core::pair::pair_transfer_accept,
+            core::pair::pair_transfer_reject,
+            core::pair::pair_transfer_cancel,
+            core::pair::pair_attachment_retry
         ])
         .plugin(tauri_plugin_admin_status::init())
         .plugin(tauri_plugin_custom_window::init())

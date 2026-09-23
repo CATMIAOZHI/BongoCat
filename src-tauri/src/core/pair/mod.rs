@@ -9,6 +9,7 @@ pub mod history;
 pub mod manager;
 pub mod protocol;
 pub mod secret;
+pub mod transfer;
 
 #[cfg(test)]
 mod e2e;
@@ -19,8 +20,12 @@ use serde_json::json;
 use tauri::{AppHandle, Manager as _, Runtime, State, command};
 
 use history::{ChatMessage, ExportFormat, ExportSummary, HistoryPage, HistoryStats, PairHistory};
-use manager::{AppEventSink, PairManager, PairStatus};
-use protocol::{FrameKind, InputStats, PetSnapshot, PresencePayload, PresenceState, message_type};
+use history::{MessageKind, NewAttachment, NewMessage};
+use manager::{AppEventSink, OutgoingRequest, PairManager, PairStatus};
+use protocol::{
+    FrameKind, InputStats, PetSnapshot, PresencePayload, PresenceState, TransferKind, message_type,
+};
+use transfer::{TransferStore, sanitize_file_name, sanitize_mime, sha256_file};
 
 /// 应用启动时调用：准备设备 id，并把 PairManager 注册为全局状态
 ///
@@ -35,8 +40,25 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
     });
     let history = Arc::new(open_history(app));
     let sink = Arc::new(AppEventSink::new(app.clone()));
+    let store = match pair_root(app) {
+        Some(root) => TransferStore::new(root),
+        // 定位不到配置目录时退到系统临时目录：附件仍然可用，只是重启后会被清理
+        None => TransferStore::new(std::env::temp_dir().join("bongocat-pair")),
+    };
 
-    app.manage(Arc::new(PairManager::new(device_id, sink, history)));
+    if let Err(error) = store.ensure() {
+        tauri_plugin_log::log::error!("附件目录不可用（附件功能会失败）: {error}");
+    }
+
+    app.manage(Arc::new(PairManager::new(device_id, sink, history, store)));
+}
+
+/// pair 功能的落盘根目录：`<配置目录>/pair`（聊天库、附件、临时文件都在这里）
+fn pair_root<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|directory| directory.join("pair"))
 }
 
 /// 打开本地聊天库。
@@ -44,11 +66,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
 /// 打不开时退化成内存库：聊天记录不落盘，但连接、宠物同步这些功能必须照常可用，
 /// 否则一个磁盘问题会让整个联机功能失效。
 fn open_history<R: Runtime>(app: &AppHandle<R>) -> PairHistory {
-    let path = app
-        .path()
-        .app_config_dir()
-        .ok()
-        .map(|directory| directory.join("pair").join("pair.db"));
+    let path = pair_root(app).map(|directory| directory.join("pair.db"));
 
     match path {
         Some(path) => PairHistory::open(&path).unwrap_or_else(fallback_history),
@@ -258,4 +276,177 @@ pub async fn pair_history_start_new_epoch(
     manager
         .history()
         .start_new_epoch(delete_old.unwrap_or(false))
+}
+
+/// 附件与临时文件的落盘位置（前端要往临时目录里写粘贴的图片）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferPaths {
+    pub root: String,
+    pub attachments: String,
+    pub tmp: String,
+    /// 单个附件上限（字节）
+    pub max_size: u64,
+}
+
+/// 查附件目录与上限
+#[command]
+pub fn pair_transfer_paths(manager: State<'_, Arc<PairManager>>) -> TransferPaths {
+    let store = manager.store();
+
+    TransferPaths {
+        root: store.root().to_string_lossy().to_string(),
+        attachments: store.attachments_dir().to_string_lossy().to_string(),
+        tmp: store.tmp_dir().to_string_lossy().to_string(),
+        max_size: manager.max_attachment_size(),
+    }
+}
+
+/// 设置单个附件的上限（MB）。返回夹紧之后的字节数。
+#[command]
+pub fn pair_set_max_attachment_mb(manager: State<'_, Arc<PairManager>>, mb: u64) -> u64 {
+    manager.set_max_attachment_mb(mb)
+}
+
+/// 发送一个附件（§37 / §38）。
+///
+/// `stage` 为真时把源文件移进本机附件缓存（粘贴的图片、录音这类临时文件用它），
+/// 为假时直接引用用户选的那个文件。返回本地已经落库的那条消息。
+#[command]
+pub async fn pair_send_attachment(
+    manager: State<'_, Arc<PairManager>>,
+    path: String,
+    kind: TransferKind,
+    mime: Option<String>,
+    stage: Option<bool>,
+) -> Result<ChatMessage, String> {
+    let manager = Arc::clone(&manager);
+    let source = std::path::PathBuf::from(path.trim());
+
+    if !source.is_file() {
+        return Err("找不到这个文件".to_string());
+    }
+
+    let original_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let name = sanitize_file_name(&original_name);
+    let max_size = manager.max_attachment_size();
+    let declared_size = std::fs::metadata(&source)
+        .map_err(|error| format!("读取附件信息失败: {error}"))?
+        .len();
+
+    if declared_size > max_size {
+        return Err(too_large(max_size));
+    }
+
+    let source = if stage.unwrap_or(false) {
+        manager.store().stage_copy(&source, &name)?
+    } else {
+        source
+    };
+
+    // 计算 SHA-256 可能要把几百 MB 读一遍，放到阻塞线程池里
+    let hash_source = source.clone();
+    let (sha256, size) = tokio::task::spawn_blocking(move || sha256_file(&hash_source))
+        .await
+        .map_err(|error| format!("计算校验值失败: {error}"))??;
+
+    if size > max_size {
+        return Err(too_large(max_size));
+    }
+
+    let mime = sanitize_mime(mime.as_deref().unwrap_or_default());
+    let kind_of_message = match kind {
+        TransferKind::Image => MessageKind::Image,
+        TransferKind::File => MessageKind::File,
+        TransferKind::Voice => MessageKind::Voice,
+    };
+    let created_at = protocol::now_millis();
+    let attachment_id = uuid::Uuid::new_v4().to_string();
+    let message_id = uuid::Uuid::new_v4().to_string();
+
+    manager.history().upsert_attachment(&NewAttachment {
+        id: attachment_id.clone(),
+        kind: kind_of_message,
+        original_name: Some(name.clone()),
+        mime: Some(mime.clone()),
+        size: Some(size),
+        sha256: Some(sha256.clone()),
+        // 发出的附件在本地留一条路径：聊天记录里还能再打开它
+        local_path: Some(source.to_string_lossy().to_string()),
+        created_at,
+    })?;
+
+    let message = manager.history().insert(&NewMessage::outgoing_attachment(
+        message_id.clone(),
+        kind_of_message,
+        attachment_id.clone(),
+        created_at,
+        manager.history().epoch()?,
+    ))?;
+
+    let request = OutgoingRequest {
+        transfer_id: manager::new_transfer_id(),
+        message_id: message_id.clone(),
+        attachment_id,
+        kind,
+        name,
+        mime,
+        size,
+        sha256,
+        path: source,
+    };
+
+    if let Err(error) = manager.start_transfer(request) {
+        // 没连着、或者同时进行的传输太多：这条消息不能停在「等待发送」等一个永远不会
+        // 到来的重发——标成 failed，UI 才会给出「重试」（§43）
+        manager.fail_attachment(&message_id, &error);
+
+        return Err(error);
+    }
+
+    Ok(manager.history().find(&message.id)?.unwrap_or(message))
+}
+
+fn too_large(max_size: u64) -> String {
+    format!("附件超过上限（{} MB）", max_size / (1024 * 1024))
+}
+
+/// 接收方同意接收（§42 的大文件确认）
+#[command]
+pub async fn pair_transfer_accept(
+    manager: State<'_, Arc<PairManager>>,
+    message_id: String,
+) -> Result<(), String> {
+    manager.accept_transfer(&message_id)
+}
+
+/// 接收方拒绝接收
+#[command]
+pub async fn pair_transfer_reject(
+    manager: State<'_, Arc<PairManager>>,
+    message_id: String,
+) -> Result<(), String> {
+    manager.reject_transfer(&message_id)
+}
+
+/// 取消一次正在进行的传输
+#[command]
+pub async fn pair_transfer_cancel(
+    manager: State<'_, Arc<PairManager>>,
+    message_id: String,
+) -> Result<(), String> {
+    manager.cancel_transfer(&message_id)
+}
+
+/// 重发一条失败的附件（§43）。接收方的失败只能请对方重发。
+#[command]
+pub async fn pair_attachment_retry(
+    manager: State<'_, Arc<PairManager>>,
+    message_id: String,
+) -> Result<(), String> {
+    Arc::clone(&manager).retry_attachment(&message_id)
 }

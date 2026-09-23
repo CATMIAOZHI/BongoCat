@@ -22,6 +22,7 @@ use super::protocol::{FRAME_HEADER_SIZE, FrameHeader, NONCE_SIZE};
 
 pub const AUTH_INFO: &[u8] = b"bongocat-pair-auth-v1";
 pub const E2EE_INFO: &[u8] = b"bongocat-pair-e2ee-v1";
+pub const TRANSFER_INFO: &[u8] = b"bongocat-pair-transfer-v1";
 pub const PAIR_SECRET_BYTES: usize = 32;
 
 /// HKDF-SHA256，salt 为空（RFC 5869 的「无 salt」与「32 字节零 salt」等价，
@@ -42,6 +43,20 @@ pub fn derive_auth_token(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
 
 pub fn derive_root_key(secret: &[u8; PAIR_SECRET_BYTES]) -> [u8; 32] {
     hkdf_sha256(secret, E2EE_INFO)
+}
+
+/// 每个 transfer 一把临时密钥（R17）：
+/// `HKDF-SHA256(ikm = E2EE_ROOT_KEY, salt = 空, info = "bongocat-pair-transfer-v1" || transferId(8 字节大端))`。
+///
+/// 只有文件传输用它，传完即弃；聊天等其它帧仍然用根密钥。这样即使某次传输的
+/// nonce 被复用，也影响不到聊天内容。
+pub fn derive_transfer_key(root_key: &[u8; 32], transfer_id: u64) -> [u8; 32] {
+    let mut info = Vec::with_capacity(TRANSFER_INFO.len() + 8);
+
+    info.extend_from_slice(TRANSFER_INFO);
+    info.extend_from_slice(&transfer_id.to_be_bytes());
+
+    hkdf_sha256(root_key, &info)
 }
 
 /// 解析用户粘贴的 Pair Secret（base64url，32 字节）
@@ -176,6 +191,51 @@ mod tests {
 
         let frame = sender
             .seal(&FrameHeader::new(FrameKind::Chat, 1), b"secret")
+            .unwrap();
+
+        assert!(receiver.open(&frame).is_err());
+    }
+
+    /// R17：每个 transfer 一把临时密钥，跟根密钥和别的 transfer 都不相同，
+    /// 但同一个 transferId 在两端派生出同一把
+    #[test]
+    fn transfer_keys_are_per_transfer_and_deterministic() {
+        let root = derive_root_key(&secret([9u8; 32]));
+        let first = derive_transfer_key(&root, 1);
+        let again = derive_transfer_key(&root, 1);
+        let second = derive_transfer_key(&root, 2);
+
+        assert_eq!(first, again);
+        assert_ne!(first, second);
+        assert_ne!(first, root);
+        // 大端：0x0102... 与逐字节拆分的结果必须一致，别让两端的信息串漂移
+        assert_ne!(
+            derive_transfer_key(&root, 0x0102_0304_0506_0708),
+            derive_transfer_key(&root, 0x0807_0605_0403_0201)
+        );
+    }
+
+    #[test]
+    fn different_secret_fails_with_a_transfer_key() {
+        let sender = PairCipher::new(&derive_transfer_key(
+            &derive_root_key(&secret([1u8; 32])),
+            7,
+        ));
+        let receiver = PairCipher::new(&derive_transfer_key(
+            &derive_root_key(&secret([2u8; 32])),
+            7,
+        ));
+
+        let frame = sender
+            .seal(
+                &FrameHeader {
+                    kind: FrameKind::TransferChunk,
+                    flags: 0,
+                    transfer_id: 7,
+                    seq: 0,
+                },
+                b"chunk",
+            )
             .unwrap();
 
         assert!(receiver.open(&frame).is_err());

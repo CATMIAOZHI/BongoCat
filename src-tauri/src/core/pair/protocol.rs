@@ -110,6 +110,12 @@ pub mod message_type {
     pub const STATS: &str = "pair.stats";
     pub const CHAT_TEXT: &str = "chat.text";
     pub const CHAT_ACK: &str = "chat.ack";
+    pub const TRANSFER_OFFER: &str = "transfer.offer";
+    pub const TRANSFER_ACCEPT: &str = "transfer.accept";
+    pub const TRANSFER_REJECT: &str = "transfer.reject";
+    pub const TRANSFER_COMPLETE: &str = "transfer.complete";
+    pub const TRANSFER_VERIFIED: &str = "transfer.verified";
+    pub const TRANSFER_CANCEL: &str = "transfer.cancel";
 }
 
 /// 应用层信封（加密前的内容）
@@ -185,6 +191,81 @@ pub struct ChatTextPayload {
 #[serde(rename_all = "camelCase")]
 pub struct ChatAckPayload {
     pub message_id: String,
+}
+
+/// 附件类型（§37 / §38 / §44）。落地成本地消息时映射成 `MessageKind`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferKind {
+    Image,
+    File,
+    Voice,
+}
+
+impl TransferKind {
+    /// 线上字符串；目前只有测试与日志会用到，主流程用的是 serde 的 lowercase 映射
+    #[allow(dead_code)]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+            Self::Voice => "voice",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "image" => Ok(Self::Image),
+            "file" => Ok(Self::File),
+            "voice" => Ok(Self::Voice),
+            other => Err(format!("未知的附件类型: {other}")),
+        }
+    }
+}
+
+/// `transfer.offer`（§39）：只带文件名与校验信息。
+///
+/// 发送方的本地完整路径**永远不出现**在载荷里（§39 / §78），接收方落盘用的是自己生成的 UUID。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferOfferPayload {
+    pub transfer_id: u64,
+    /// 与 `chat.text` 一样，收发双方用同一个 id 落地成一条消息
+    pub message_id: String,
+    /// 附件 id 也由发送方生成：重发时两端都覆盖同一条附件记录
+    pub attachment_id: String,
+    pub kind: TransferKind,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub sha256: String,
+    pub chunk_size: u32,
+    pub chunks: u32,
+}
+
+/// `transfer.accept` / `transfer.complete` / `transfer.cancel` 的载荷
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferIdPayload {
+    pub transfer_id: u64,
+}
+
+/// `transfer.reject`：接收方不接受（磁盘、上限或用户点了拒绝）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferRejectPayload {
+    pub transfer_id: u64,
+    pub reason: String,
+}
+
+/// `transfer.verified`：接收方校验完 SHA-256 后告诉发送方结果（§38 / §41）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferVerifiedPayload {
+    pub transfer_id: u64,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// 键盘活动：只有「哪只手 + 强度」，永远不含具体键名（见 docs/pair-plan.md 的 §17 / §18 与 R2 / R3）
@@ -530,5 +611,42 @@ mod tests {
         let decoded: InputStats = serde_json::from_str(&json).unwrap();
 
         assert_eq!(decoded, stats);
+    }
+
+    /// 附件 offer 的线上格式（§39）：字段名走 camelCase，且只有文件名、没有本地路径
+    #[test]
+    fn transfer_offer_stays_camel_case_and_path_free() {
+        let offer = TransferOfferPayload {
+            transfer_id: 42,
+            message_id: "m-1".into(),
+            attachment_id: "a-1".into(),
+            kind: TransferKind::File,
+            name: "secret.zip".into(),
+            size: 1234,
+            mime: "application/zip".into(),
+            sha256: "abc".into(),
+            chunk_size: 524_288,
+            chunks: 1,
+        };
+
+        let json = serde_json::to_string(&offer).unwrap();
+
+        assert!(json.contains(r#""transferId":42"#));
+        assert!(json.contains(r#""messageId":"m-1""#));
+        assert!(json.contains(r#""kind":"file""#));
+        assert!(!json.contains("C:\\"));
+
+        let decoded: TransferOfferPayload = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.chunk_size, 524_288);
+        assert_eq!(decoded.kind, TransferKind::File);
+    }
+
+    #[test]
+    fn transfer_kind_parses_known_values_only() {
+        assert_eq!(TransferKind::parse("image"), Ok(TransferKind::Image));
+        assert_eq!(TransferKind::parse("voice"), Ok(TransferKind::Voice));
+        assert!(TransferKind::parse("movie").is_err());
+        assert_eq!(TransferKind::File.as_str(), "file");
     }
 }

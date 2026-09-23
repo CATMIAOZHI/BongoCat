@@ -19,11 +19,14 @@ use tokio_tungstenite::tungstenite::Message;
 use super::client;
 use super::crypto::{self};
 use super::history::{MessageStatus, PairHistory};
+use super::history::{MessageKind, NewAttachment, NewMessage};
+use super::manager::OutgoingRequest;
+use super::transfer::{TransferStore, sha256_file};
 use super::manager::{
     EVENT_CONNECTION_CHANGED, EVENT_MESSAGE_RECEIVED, EVENT_MESSAGE_UPDATED, EVENT_PEER_CHANGED,
     EVENT_PRESENCE, PairConnectionState, PairManager,
 };
-use super::protocol::{FrameKind, PresencePayload, PresenceState, message_type};
+use super::protocol::{FrameKind, PresencePayload, PresenceState, TransferKind, message_type};
 
 /// 记录所有事件的测试用 sink
 #[derive(Default)]
@@ -34,6 +37,13 @@ struct RecordingSink {
 /// 每个 e2e 客户端一个内存聊天库：端到端用例不碰真实磁盘
 fn memory_history() -> Arc<PairHistory> {
     Arc::new(PairHistory::in_memory().expect("内存聊天库"))
+}
+
+/// 附件目录也用临时目录：端到端用例不往用户的数据目录里写文件
+fn memory_store() -> TransferStore {
+    let root = std::env::temp_dir().join(format!("bongo-cat-pair-e2e-{}", uuid::Uuid::new_v4()));
+
+    TransferStore::new(root)
 }
 
 impl RecordingSink {
@@ -131,11 +141,13 @@ async fn two_clients_exchange_encrypted_presence() {
         "e2e-a".into(),
         sink_a.clone(),
         memory_history(),
+        memory_store(),
     ));
     let manager_b = Arc::new(PairManager::new(
         "e2e-b".into(),
         sink_b.clone(),
         memory_history(),
+        memory_store(),
     ));
 
     manager_a.start(&relay, Some(&secret_text)).unwrap();
@@ -224,11 +236,13 @@ async fn two_clients_exchange_encrypted_chat_messages() {
         "e2e-chat-a".into(),
         sink_a.clone(),
         Arc::clone(&history_a),
+        memory_store(),
     ));
     let manager_b = Arc::new(PairManager::new(
         "e2e-chat-b".into(),
         sink_b.clone(),
         Arc::clone(&history_b),
+        memory_store(),
     ));
 
     manager_a.start(&relay, Some(&secret_text)).unwrap();
@@ -371,11 +385,13 @@ async fn offline_backlog_is_delivered_without_tripping_the_relay_limit() {
         "e2e-backlog-a".into(),
         sink_a.clone(),
         Arc::clone(&history_a),
+        memory_store(),
     ));
     let manager_b = Arc::new(PairManager::new(
         "e2e-backlog-b".into(),
         sink_b.clone(),
         Arc::clone(&history_b),
+        memory_store(),
     ));
 
     manager_a.start(&relay, Some(&secret_text)).unwrap();
@@ -485,6 +501,176 @@ async fn offline_backlog_is_delivered_without_tripping_the_relay_limit() {
     manager_b.disconnect();
 }
 
+/// 附件走真实中继（§81）：A 发 1.5 MiB、B 收下并校验 SHA-256，两边都是终态
+#[tokio::test]
+#[ignore = "需要本地或已部署的 relay，见文件头说明"]
+async fn two_clients_exchange_a_file_through_the_relay() {
+    let Some((relay, secret_text)) = e2e_config() else {
+        eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
+
+        return;
+    };
+
+    let _guard = e2e_lock();
+
+    let store_a = memory_store();
+    let store_b = memory_store();
+    let sink_a = Arc::new(RecordingSink::default());
+    let sink_b = Arc::new(RecordingSink::default());
+    let history_a = memory_history();
+    let history_b = memory_history();
+    let manager_a = Arc::new(PairManager::new(
+        "e2e-file-a".into(),
+        sink_a.clone(),
+        Arc::clone(&history_a),
+        store_a.clone(),
+    ));
+    let manager_b = Arc::new(PairManager::new(
+        "e2e-file-b".into(),
+        sink_b.clone(),
+        Arc::clone(&history_b),
+        store_b.clone(),
+    ));
+
+    manager_a.start(&relay, Some(&secret_text)).unwrap();
+    manager_b.start(&relay, Some(&secret_text)).unwrap();
+
+    let connected = wait_for(
+        || {
+            sink_a.last_state() == Some(PairConnectionState::Connected)
+                && sink_b.last_state() == Some(PairConnectionState::Connected)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(
+        connected,
+        "两端没有进入 Connected：A={:?} B={:?} errors={:?}",
+        sink_a.last_state(),
+        sink_b.last_state(),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // A 侧造一个 1.5 MiB 的附件（约 3 块）
+    let payload: Vec<u8> = (0..(1024 * 1536)).map(|index| (index % 251) as u8).collect();
+    let source = store_a.root().join("相册照片.bin");
+
+    std::fs::create_dir_all(store_a.root()).unwrap();
+    std::fs::write(&source, &payload).unwrap();
+
+    let (sha256, size) = sha256_file(&source).unwrap();
+    let message_id = "e2e-file-message".to_string();
+    let attachment_id = "e2e-file-attachment".to_string();
+
+    history_a
+        .upsert_attachment(&NewAttachment {
+            id: attachment_id.clone(),
+            kind: MessageKind::File,
+            original_name: Some("相册照片.bin".into()),
+            mime: Some("application/octet-stream".into()),
+            size: Some(size),
+            sha256: Some(sha256.clone()),
+            local_path: Some(source.to_string_lossy().to_string()),
+            created_at: 0,
+        })
+        .unwrap();
+    history_a
+        .insert(&NewMessage::outgoing_attachment(
+            message_id.clone(),
+            MessageKind::File,
+            attachment_id.clone(),
+            0,
+            history_a.epoch().unwrap(),
+        ))
+        .unwrap();
+
+    manager_a
+        .start_transfer(OutgoingRequest {
+            transfer_id: super::manager::new_transfer_id(),
+            message_id: message_id.clone(),
+            attachment_id,
+            kind: TransferKind::File,
+            name: "相册照片.bin".into(),
+            mime: "application/octet-stream".into(),
+            size,
+            sha256,
+            path: source,
+        })
+        .unwrap();
+
+    // B 收完并落盘
+    let received = wait_for(
+        || {
+            history_b
+                .find(&message_id)
+                .ok()
+                .flatten()
+                .map(|message| message.status)
+                == Some(MessageStatus::Received)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        received,
+        "B 没有收下附件：errors={:?}",
+        (sink_b.errors(), sink_a.errors())
+    );
+
+    let message = history_b.find(&message_id).unwrap().unwrap();
+    let path = message
+        .attachment
+        .expect("B 的附件记录")
+        .local_path
+        .expect("B 的落盘路径");
+
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+    assert!(
+        std::path::Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .len()
+            > 20,
+        "落盘名应当是 UUID"
+    );
+
+    // A 收到 verified 之后才是 delivered
+    let delivered = wait_for(
+        || {
+            history_a
+                .find(&message_id)
+                .ok()
+                .flatten()
+                .map(|message| message.status)
+                == Some(MessageStatus::Delivered)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert!(
+        delivered,
+        "A 的附件没有变成 delivered：errors={:?}",
+        sink_a.errors()
+    );
+
+    // 三块数据在中继的 20 chunk/s 额度内，不该被限流踢掉
+    let errors = sink_a.errors();
+
+    assert!(
+        !errors
+            .iter()
+            .any(|message| message.contains("1008") || message.contains("发送频率")),
+        "附件传输被中继限流踢掉了：{errors:?}"
+    );
+
+    manager_a.disconnect();
+    manager_b.disconnect();
+}
+
 /// 心跳期间连接保持存活（客户端发 WS ping，中继回 pong）
 #[tokio::test]
 #[ignore = "需要本地或已部署的 relay，见文件头说明"]
@@ -505,6 +691,7 @@ async fn stays_connected_across_heartbeats() {
         "e2e-heartbeat".into(),
         sink.clone(),
         memory_history(),
+        memory_store(),
     ));
 
     manager.start(&relay, Some(&secret_text)).unwrap();
@@ -572,6 +759,7 @@ async fn unreachable_relay_enters_reconnecting() {
         "e2e-reconnect".into(),
         sink.clone(),
         memory_history(),
+        memory_store(),
     ));
 
     manager.start("http://127.0.0.1:1", Some(&secret)).unwrap();

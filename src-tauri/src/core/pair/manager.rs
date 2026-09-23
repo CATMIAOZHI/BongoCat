@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager as _, Runtime};
@@ -20,14 +21,20 @@ use tokio_tungstenite::tungstenite::Message;
 use super::client::{self, PairFailure, PairSocket};
 use super::crypto::{self, PairCipher};
 use super::history::{
-    ChatMessage, MESSAGE_TEXT_LIMIT, MessageDirection, MessageStatus, NewMessage, PairHistory,
+    ChatMessage, MESSAGE_TEXT_LIMIT, MessageDirection, MessageKind, MessageStatus, NewAttachment,
+    NewMessage, PairHistory,
 };
 use super::protocol::{
     AppEnvelope, ChatAckPayload, ChatTextPayload, FrameHeader, FrameKind, InputStats,
     MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PetSnapshot, PresencePayload, PresenceState,
-    RecentMessageIds, ServerFrame, message_type, now_millis,
+    RecentMessageIds, ServerFrame, TransferIdPayload, TransferKind, TransferOfferPayload,
+    TransferRejectPayload, TransferVerifiedPayload, message_type, now_millis,
 };
 use super::secret;
+use super::transfer::{
+    CHUNK_SIZE, DEFAULT_MAX_SIZE, IncomingTransfer, OutgoingTransfer, TransferStore, chunk_count,
+    clamp_limit, needs_confirmation, sanitize_file_name, sanitize_mime,
+};
 
 pub const EVENT_CONNECTION_CHANGED: &str = "pair-connection-changed";
 pub const EVENT_PEER_CHANGED: &str = "pair-peer-changed";
@@ -40,15 +47,28 @@ pub const EVENT_ERROR: &str = "pair-error";
 pub const EVENT_MESSAGE_RECEIVED: &str = "pair-message-received";
 /// 已有消息的状态变化（sent / delivered / failed）
 pub const EVENT_MESSAGE_UPDATED: &str = "pair-message-updated";
+/// 附件传输进度（发送与接收共用）。载荷见 [`TransferProgress`]。
+pub const EVENT_TRANSFER: &str = "pair-transfer";
 
 const RELIABLE_QUEUE_LIMIT: usize = 512;
 /// 一次重连最多补发多少条历史消息，避免对方一上线就被灌满
 const CHAT_RESEND_LIMIT: usize = 100;
+/// 每个 transfer 最多多久报一次进度（§40：进度要有，但别把事件刷爆）
+const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+/// 同时进行的附件传输上限：对端不能靠一堆 offer 把内存或磁盘撑爆
+const MAX_ACTIVE_TRANSFERS: usize = 4;
 /// 出站节奏（R18）：中继每个 socket 只给 30 帧/秒（桶容量同为 30）。一次性补发几十条
 /// 离线消息会把桶扣穿、被 `close 1008` 断开，而重连后又补发同一批，变成「连上就被踢」的
 /// 空转，ack 也永远收不到。客户端主动按 20 帧/秒放行，给心跳与实时快照留出余量。
 const OUTBOUND_FRAMES_PER_SECOND: f64 = 20.0;
 const OUTBOUND_BURST: f64 = 20.0;
+/// 附件分片单独一套额度（R18 / §40）。中继分片桶是 20 个/秒、容量 20，与「20 帧/秒」的
+/// 通用额度贴得死死的：客户端按 20/s 发就是零余量，到达间隔被网络抖动压到 50ms 以下
+/// （或两枚令牌被压进同一瞬间）就会把中继的桶扣穿，传输中途 `close 1008`。
+/// 这里主动降到 15 个/秒、突发 10，留出余量；512 KiB × 15 ≈ 7.5 MiB/s，仍然远快于
+/// 家用上行，用户感知不到差别。
+const OUTBOUND_CHUNKS_PER_SECOND: f64 = 15.0;
+const OUTBOUND_CHUNK_BURST: f64 = 10.0;
 const RECENT_MESSAGE_LIMIT: usize = 256;
 pub const HEARTBEAT_ENV: &str = "BONGO_PAIR_HEARTBEAT_SECS";
 const DEFAULT_HEARTBEAT_SECS: u64 = 60;
@@ -131,7 +151,106 @@ enum Command {
     },
     /// 请连接任务取走「最新一帧可覆盖状态」并立即发送
     FlushReplaceable,
+    /// 开始发送一个已经入库的附件（§38 的 offer）
+    StartTransfer(Box<OutgoingRequest>),
+    /// 接收方同意接收（§42：超过阈值的大文件要用户点一下）
+    AcceptTransfer { transfer_id: u64 },
+    /// 接收方拒绝接收
+    RejectTransfer { transfer_id: u64 },
+    /// 任意一端取消
+    CancelTransfer { transfer_id: u64 },
     Disconnect,
+}
+
+/// 一次「开始发送附件」的请求。附件记录与消息行都已经写进本地库，这里只带发送所需的信息。
+#[derive(Debug, Clone)]
+pub struct OutgoingRequest {
+    pub transfer_id: u64,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub kind: TransferKind,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub sha256: String,
+    pub path: std::path::PathBuf,
+}
+
+/// 附件传输进度事件（`pair-transfer`）的载荷
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub transfer_id: u64,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub kind: TransferKind,
+    pub name: String,
+    pub size: u64,
+    pub transferred: u64,
+    /// 0..100
+    pub percent: u8,
+    pub direction: MessageDirection,
+    /// `waiting`（等对方接收）/ `sending` / `receiving` / `done` / `failed` / `canceled`
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// 传输在会话里的阶段
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferPhase {
+    /// 发送方：offer 已发出，等 accept
+    AwaitingAccept,
+    /// 发送方：正在发分片
+    Sending,
+    /// 接收方：等用户确认（大文件，§42）
+    AwaitingDecision,
+    /// 接收方：正在收分片
+    Receiving,
+}
+
+impl TransferPhase {
+    const fn is_outgoing(self) -> bool {
+        matches!(self, Self::AwaitingAccept | Self::Sending)
+    }
+}
+
+/// 一次附件传输在本会话里的状态
+struct TransferSession {
+    id: u64,
+    message_id: String,
+    attachment_id: String,
+    kind: TransferKind,
+    name: String,
+    mime: String,
+    size: u64,
+    sha256: String,
+    chunk_size: u32,
+    chunks: u32,
+    phase: TransferPhase,
+    outgoing: Option<OutgoingTransfer>,
+    incoming: Option<IncomingTransfer>,
+    /// 进度节流：每个 transfer 最多 150ms 报一次
+    last_progress_at: Option<tokio::time::Instant>,
+}
+
+impl TransferSession {
+    fn direction(&self) -> MessageDirection {
+        if self.phase.is_outgoing() {
+            MessageDirection::Outgoing
+        } else {
+            MessageDirection::Incoming
+        }
+    }
+
+    fn transferred(&self) -> u64 {
+        match (&self.outgoing, &self.incoming) {
+            (Some(outgoing), _) => outgoing.bytes_sent,
+            (_, Some(incoming)) => incoming.received_bytes,
+            _ => 0,
+        }
+    }
+
 }
 
 /// 可覆盖状态（宠物快照、统计）在 manager 这一层的暂存区。
@@ -152,8 +271,16 @@ pub struct PairManager {
     pending: Mutex<PendingReplaceable>,
     generation: AtomicU64,
     envelope_seq: AtomicU64,
+    /// 单个附件的上限（字节）。设置页可以改，硬上限见 `transfer::HARD_MAX_SIZE`。
+    max_attachment_size: AtomicU64,
+    /// 正在进行的传输：`messageId` → `transferId`。
+    ///
+    /// 聊天 UI 手里只有消息 id，所以接受 / 拒绝 / 取消都用消息 id 定位，
+    /// 不用把 transferId 存进数据库（那需要一次表结构迁移）。
+    transfers: Mutex<HashMap<String, u64>>,
     history: Arc<PairHistory>,
     sink: Arc<dyn PairEventSink>,
+    store: TransferStore,
 }
 
 impl PairManager {
@@ -163,7 +290,12 @@ impl PairManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn new(device_id: String, sink: Arc<dyn PairEventSink>, history: Arc<PairHistory>) -> Self {
+    pub fn new(
+        device_id: String,
+        sink: Arc<dyn PairEventSink>,
+        history: Arc<PairHistory>,
+        store: TransferStore,
+    ) -> Self {
         Self {
             status: Mutex::new(PairStatus {
                 state: PairConnectionState::Disconnected,
@@ -179,14 +311,36 @@ impl PairManager {
             pending: Mutex::new(PendingReplaceable::default()),
             generation: AtomicU64::new(0),
             envelope_seq: AtomicU64::new(0),
+            max_attachment_size: AtomicU64::new(DEFAULT_MAX_SIZE),
             history,
             sink,
+            store,
+            transfers: Mutex::new(HashMap::new()),
         }
     }
 
     /// 本地聊天库。历史读取与导出等命令直接用它，不经过连接状态。
     pub fn history(&self) -> &Arc<PairHistory> {
         &self.history
+    }
+
+    /// 附件落盘位置（附件目录与临时目录）
+    pub fn store(&self) -> &TransferStore {
+        &self.store
+    }
+
+    /// 单个附件的上限（字节）
+    pub fn max_attachment_size(&self) -> u64 {
+        self.max_attachment_size.load(Ordering::SeqCst)
+    }
+
+    /// 设置单个附件的上限（MB）。返回夹紧之后真正的字节数。
+    pub fn set_max_attachment_mb(&self, mb: u64) -> u64 {
+        let bytes = clamp_limit(mb);
+
+        self.max_attachment_size.store(bytes, Ordering::SeqCst);
+
+        bytes
     }
 
     pub fn status(&self) -> PairStatus {
@@ -406,6 +560,140 @@ impl PairManager {
         }
     }
 
+    /// 把一次附件发送请求交给连接任务（附件与消息行已经落库）
+    pub fn start_transfer(self: &Arc<Self>, request: OutgoingRequest) -> Result<(), String> {
+        self.sender()?
+            .send(Command::StartTransfer(Box::new(request)))
+            .map_err(|_| "连接任务已结束".to_string())
+    }
+
+    /// 记下「这条消息正在传输」，命令层靠它把 messageId 翻译成 transferId
+    fn register_transfer(&self, message_id: &str, transfer_id: u64) {
+        Self::lock(&self.transfers).insert(message_id.to_string(), transfer_id);
+    }
+
+    fn unregister_transfer(&self, message_id: &str) {
+        Self::lock(&self.transfers).remove(message_id);
+    }
+
+    fn transfer_of(&self, message_id: &str) -> Result<u64, String> {
+        Self::lock(&self.transfers)
+            .get(message_id)
+            .copied()
+            .ok_or_else(|| "这次传输已经结束了".to_string())
+    }
+
+    /// 接收方同意接收某个大文件（§42）
+    pub fn accept_transfer(&self, message_id: &str) -> Result<(), String> {
+        let transfer_id = self.transfer_of(message_id)?;
+
+        self.sender()?
+            .send(Command::AcceptTransfer { transfer_id })
+            .map_err(|_| "连接任务已结束".to_string())
+    }
+
+    /// 接收方拒绝接收（§42）
+    pub fn reject_transfer(&self, message_id: &str) -> Result<(), String> {
+        let transfer_id = self.transfer_of(message_id)?;
+
+        self.sender()?
+            .send(Command::RejectTransfer { transfer_id })
+            .map_err(|_| "连接任务已结束".to_string())
+    }
+
+    /// 任一端取消正在进行的传输（§43）
+    pub fn cancel_transfer(&self, message_id: &str) -> Result<(), String> {
+        let transfer_id = self.transfer_of(message_id)?;
+
+        self.sender()?
+            .send(Command::CancelTransfer { transfer_id })
+            .map_err(|_| "连接任务已结束".to_string())
+    }
+
+    /// 发起方重试一条失败的附件消息（§43：UI 上的「重试」）。
+    ///
+    /// 只支持本机发出的附件：接收方的「重试」要请对方重发，协议里没有这条消息，
+    /// 所以接收方只能显示失败原因。
+    pub fn retry_attachment(self: &Arc<Self>, message_id: &str) -> Result<(), String> {
+        let message = self
+            .history
+            .find(message_id)?
+            .ok_or_else(|| "找不到这条消息".to_string())?;
+
+        if message.direction != MessageDirection::Outgoing {
+            return Err("这是对方发来的附件，需要对方重发".to_string());
+        }
+
+        let attachment = message
+            .attachment
+            .clone()
+            .ok_or_else(|| "这条消息没有附件".to_string())?;
+        let path = attachment
+            .local_path
+            .clone()
+            .ok_or_else(|| "附件不在本机了，请重新选择文件".to_string())?;
+        let path = std::path::PathBuf::from(path);
+
+        if !path.exists() {
+            return Err("附件不在本机了，请重新选择文件".to_string());
+        }
+
+        let size = attachment.size.unwrap_or_default();
+        let sha256 = attachment.sha256.clone().unwrap_or_default();
+
+        if size > self.max_attachment_size() {
+            return Err("附件超过当前的大小上限".to_string());
+        }
+
+        let request = OutgoingRequest {
+            transfer_id: new_transfer_id(),
+            message_id: message.id.clone(),
+            attachment_id: attachment.id.clone(),
+            kind: TransferKind::parse(attachment.kind.as_str())?,
+            name: attachment
+                .original_name
+                .clone()
+                .unwrap_or_else(|| "attachment".to_string()),
+            mime: attachment
+                .mime
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            size,
+            sha256,
+            path,
+        };
+
+        // 重发前先回到「等待发送」，否则 UI 会一直显示上一次的失败
+        self.publish_message_status(message_id, MessageStatus::Pending);
+
+        self.start_transfer(request)
+    }
+
+    /// 广播传输进度（调用方已经做过节流）
+    fn publish_transfer(&self, progress: &TransferProgress) {
+        self.sink.emit(
+            EVENT_TRANSFER,
+            serde_json::to_value(progress).unwrap_or(Value::Null),
+        );
+    }
+
+    /// 附件消息失败：更新状态并让 UI 知道原因。
+    ///
+    /// 命令层也要用它：发送请求根本没能交给连接任务时（没连着、同时传输太多），
+    /// 消息必须落到 failed，否则它永远停在「等待发送」既不会重发也不能重试（§43）。
+    pub(crate) fn fail_attachment(&self, message_id: &str, reason: &str) {
+        self.mark_attachment_failed(message_id);
+
+        self.sink
+            .emit(EVENT_ERROR, json!({ "message": reason.to_string() }));
+    }
+
+    /// 只改状态、不报错：用户自己取消不是故障，偏好页不该因此留下一条红色的
+    /// 「最近一次错误」（§43 只要求 UI 给出「重试」）
+    pub(crate) fn mark_attachment_failed(&self, message_id: &str) {
+        self.publish_message_status(message_id, MessageStatus::Failed);
+    }
+
     /// 取走所有待发送的可覆盖状态（每次 flush 只取一次，取走后由连接任务负责送达）
     fn take_pending_replaceable(&self) -> Vec<(FrameKind, AppEnvelope)> {
         let mut pending = Self::lock(&self.pending);
@@ -535,23 +823,71 @@ pub fn is_valid_device_id(device_id: &str) -> bool {
 
 struct SessionState {
     cipher: PairCipher,
+    /// 派生 per-transfer 密钥要用（R17）
+    root_key: [u8; 32],
     /// 可靠队列：帧与它对应的信封一起存，队列满时才知道挤掉的是哪条消息
     reliable: VecDeque<(Vec<u8>, AppEnvelope)>,
     /// 每种可覆盖类型各自最多留一帧（`BTreeMap` 同时保证发送顺序稳定）
     replaceable: BTreeMap<u8, Vec<u8>>,
     frame_seq: u32,
     recent: RecentMessageIds,
+    /// 这一次连接里正在进行的附件传输，按 transferId 索引
+    transfers: HashMap<u64, TransferSession>,
 }
 
 impl SessionState {
     fn new(root_key: &[u8; 32]) -> Self {
         Self {
             cipher: PairCipher::new(root_key),
+            root_key: *root_key,
             reliable: VecDeque::new(),
             replaceable: BTreeMap::new(),
             frame_seq: 0,
             recent: RecentMessageIds::new(RECENT_MESSAGE_LIMIT),
+            transfers: HashMap::new(),
         }
+    }
+
+    /// 每个 transfer 一把临时密钥（R17）。派生很便宜，就不做缓存了。
+    fn transfer_cipher(&self, transfer_id: u64) -> PairCipher {
+        PairCipher::new(&crypto::derive_transfer_key(&self.root_key, transfer_id))
+    }
+
+    /// 放进一次传输会话。超过上限就拒绝，避免对端用一堆 offer 撑爆内存与磁盘。
+    fn open_transfer(&mut self, session: TransferSession) -> Result<(), String> {
+        if self.transfers.contains_key(&session.id) {
+            return Err("重复的 transferId".to_string());
+        }
+
+        if self.transfers.len() >= MAX_ACTIVE_TRANSFERS {
+            return Err("同时进行的附件传输太多，请稍后再发".to_string());
+        }
+
+        self.transfers.insert(session.id, session);
+
+        Ok(())
+    }
+
+    /// 还有没有「等着发分片」的发送方会话
+    fn has_pending_chunks(&self) -> bool {
+        self.transfers
+            .values()
+            .any(|session| session.phase == TransferPhase::Sending && !session_is_complete(session))
+    }
+
+    /// 下一次该发分片的 transfer（按 map 顺序稳定取第一个即可：并发传输数量很小）
+    fn next_sending_transfer(&self) -> Option<u64> {
+        self.transfers
+            .iter()
+            .find(|(_, session)| {
+                session.phase == TransferPhase::Sending && !session_is_complete(session)
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// 收下所有传输会话（连接结束时用来收尾）
+    fn take_transfers(&mut self) -> Vec<TransferSession> {
+        self.transfers.drain().map(|(_, session)| session).collect()
     }
 
     fn encode(&mut self, kind: FrameKind, envelope: &AppEnvelope) -> Result<Vec<u8>, String> {
@@ -601,33 +937,56 @@ impl SessionState {
     }
 }
 
-/// 出站节奏控制器（R18）。令牌按时间连续补充，容量等于每秒上限。
+/// 发送方是不是把所有分片都发出去了
+fn session_is_complete(session: &TransferSession) -> bool {
+    session
+        .outgoing
+        .as_ref()
+        .map(|outgoing| outgoing.is_done())
+        .unwrap_or(true)
+}
+
+/// 传输 id：8 字节随机数。同时用于派生 per-transfer 密钥，两端各生成一个即可，撞号概率可忽略。
+pub fn new_transfer_id() -> u64 {
+    let mut bytes = [0u8; 8];
+
+    rand::rng().fill_bytes(&mut bytes);
+
+    match u64::from_be_bytes(bytes) {
+        0 => 1,
+        value => value,
+    }
+}
+
+/// 出站节奏控制器（R18）。令牌按时间连续补充，容量等于突发上限。
+///
+/// 速率与容量都是参数：应用帧与附件分片各用一套（见 `OUTBOUND_*` 常量）。
 struct Pacer {
     tokens: f64,
     updated_at: tokio::time::Instant,
+    rate: f64,
+    burst: f64,
 }
 
 impl Pacer {
-    fn new() -> Self {
+    fn new(rate: f64, burst: f64) -> Self {
         Self {
-            tokens: OUTBOUND_BURST,
+            tokens: burst,
             updated_at: tokio::time::Instant::now(),
+            rate,
+            burst,
         }
     }
 
     /// 按经过的时间补充令牌，但不允许攒成无限突发（纯函数，便于单测）
-    fn refill(tokens: f64, elapsed_secs: f64) -> f64 {
-        (tokens + elapsed_secs.max(0.0) * OUTBOUND_FRAMES_PER_SECOND).min(OUTBOUND_BURST)
+    fn refill(tokens: f64, elapsed_secs: f64, rate: f64, burst: f64) -> f64 {
+        (tokens + elapsed_secs.max(0.0) * rate).min(burst)
     }
 
     /// 取一枚令牌；没有就等到下一枚补充出来
     async fn acquire(&mut self) {
         loop {
-            let now = tokio::time::Instant::now();
-            let elapsed = now.duration_since(self.updated_at).as_secs_f64();
-
-            self.updated_at = now;
-            self.tokens = Self::refill(self.tokens, elapsed);
+            self.refill_now();
 
             if self.tokens >= 1.0 {
                 self.tokens -= 1.0;
@@ -635,10 +994,47 @@ impl Pacer {
                 return;
             }
 
-            let wait = (1.0 - self.tokens) / OUTBOUND_FRAMES_PER_SECOND;
+            let wait = (1.0 - self.tokens) / self.rate;
 
             tokio::time::sleep(Duration::from_secs_f64(wait)).await;
         }
+    }
+
+    /// 按当前时间把令牌补上（取令牌前必做）
+    fn refill_now(&mut self) {
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(self.updated_at).as_secs_f64();
+
+        self.updated_at = now;
+        self.tokens = Self::refill(self.tokens, elapsed, self.rate, self.burst);
+    }
+
+    /// 同时取两套额度：**两边都够才一起扣**。
+    ///
+    /// 附件分片要同时过通用帧额度与分片额度，分两次取会出现「扣了通用令牌、分片令牌
+    /// 不够」这种白扣一枚的情况；非阻塞也是必须的，否则发一块要等 67ms，把入站读取
+    /// 也一起挡住了。
+    fn try_acquire_pair(first: &mut Self, second: &mut Self) -> bool {
+        first.refill_now();
+        second.refill_now();
+
+        if first.tokens < 1.0 || second.tokens < 1.0 {
+            return false;
+        }
+
+        first.tokens -= 1.0;
+        second.tokens -= 1.0;
+
+        true
+    }
+
+    /// 距离下一枚令牌还有多久（现在已经能取就是 `ZERO`）
+    fn wait_duration(&self) -> Duration {
+        if self.tokens >= 1.0 {
+            return Duration::ZERO;
+        }
+
+        Duration::from_secs_f64((1.0 - self.tokens) / self.rate)
     }
 }
 
@@ -718,8 +1114,17 @@ async fn run_session(
                 });
 
                 match live(&manager, generation, &mut state, socket, &mut receiver).await {
-                    Outcome::Stopped => break,
-                    Outcome::Lost(failure) => failure,
+                    Outcome::Stopped => {
+                        abort_transfers(&manager, &mut state);
+
+                        break;
+                    }
+                    Outcome::Lost(failure) => {
+                        // §43：V1 不做断点续传，连接一断就收尾（删掉 .part 并标记失败）
+                        abort_transfers(&manager, &mut state);
+
+                        failure
+                    }
                 }
             }
             Ok(Err(failure)) => failure,
@@ -763,7 +1168,7 @@ async fn run_session(
                                     generation,
                                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                 );
-                                retry_dropped_chat(&manager, &dropped);
+                                retry_dropped_chat(&manager, &mut state, &dropped);
                             }
                             Ok(None) => {}
                             Err(error) => manager.emit_error(generation, error),
@@ -775,6 +1180,17 @@ async fn run_session(
                                 manager.emit_error(generation, error);
                             }
                         }
+                    }
+                    Some(Command::StartTransfer(request)) => {
+                        // 没连着也先把 offer 排进队列，重连后随第一次 flush 发出去
+                        if let Err(error) = start_outgoing_transfer(&manager, &mut state, *request) {
+                            manager.emit_error(generation, error);
+                        }
+                    }
+                    Some(Command::AcceptTransfer { .. })
+                    | Some(Command::RejectTransfer { .. })
+                    | Some(Command::CancelTransfer { .. }) => {
+                        // 退避期间没有会话可操作：offer 还没收到，或者传输已经随连接结束被收尾
                     }
                 },
             }
@@ -795,7 +1211,9 @@ async fn live(
     receiver: &mut mpsc::UnboundedReceiver<Command>,
 ) -> Outcome {
     let (mut sink, mut stream) = socket.split();
-    let mut pacer = Pacer::new();
+    let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+    // 附件分片另有一层额度（R18）：两套都放行才发一块
+    let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
 
     if let Err(error) = flush(&mut sink, state, &mut pacer).await {
         return Outcome::Lost(PairFailure {
@@ -813,7 +1231,26 @@ async fn live(
     let mut last_inbound = tokio::time::Instant::now();
 
     loop {
+        // 附件分片走单独一条分支：每次最多发一块，且必须拿到 pacing 令牌（R18）。
+        // 这样一次几百块的传输不会像补发队列那样长时间挡住入站读取。
+        let chunk_wait = if state.has_pending_chunks() {
+            Some(pacer.wait_duration().max(chunk_pacer.wait_duration()))
+        } else {
+            None
+        };
+
         tokio::select! {
+            _ = async move {
+                match chunk_wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match send_next_chunk(&mut sink, manager, state, &mut pacer, &mut chunk_pacer).await {
+                    Ok(_) => {}
+                    Err(error) => return Outcome::Lost(PairFailure { message: error, fatal: false }),
+                }
+            },
             command = receiver.recv() => match command {
                 None | Some(Command::Disconnect) => {
                     let _ = tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Close(None))).await;
@@ -829,7 +1266,7 @@ async fn live(
                                     generation,
                                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                 );
-                                retry_dropped_chat(manager, &dropped);
+                                retry_dropped_chat(manager, state, &dropped);
                             }
 
                             if let Err(error) = flush(&mut sink, state, &mut pacer).await {
@@ -846,6 +1283,95 @@ async fn live(
                     }
 
                     if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                        return Outcome::Lost(PairFailure { message: error, fatal: false });
+                    }
+                }
+                Some(Command::StartTransfer(request)) => {
+                    if let Err(error) = start_outgoing_transfer(manager, state, *request) {
+                        manager.emit_error(generation, error);
+                    } else if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                        return Outcome::Lost(PairFailure { message: error, fatal: false });
+                    }
+                }
+                Some(Command::AcceptTransfer { transfer_id }) => {
+                    match accept_incoming_transfer(manager, state, transfer_id) {
+                        Ok(Some((kind, reply))) => {
+                            if let Err(error) = enqueue_reply(
+                                &mut sink,
+                                manager,
+                                state,
+                                &mut pacer,
+                                generation,
+                                kind,
+                                reply,
+                            )
+                            .await
+                            {
+                                return Outcome::Lost(PairFailure { message: error, fatal: false });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.emit_error(generation, error),
+                    }
+                }
+                Some(Command::RejectTransfer { transfer_id }) => {
+                    let reply = AppEnvelope::new(
+                        message_type::TRANSFER_REJECT,
+                        manager.next_envelope_seq(),
+                        json!(TransferRejectPayload {
+                            transfer_id,
+                            reason: "你拒绝了这次传输".to_string(),
+                        }),
+                    );
+
+                    close_transfer(
+                        manager,
+                        state,
+                        transfer_id,
+                        TransferOutcome::Canceled,
+                        "你拒绝了这次传输",
+                    );
+
+                    if let Err(error) = enqueue_reply(
+                        &mut sink,
+                        manager,
+                        state,
+                        &mut pacer,
+                        generation,
+                        FrameKind::TransferControl,
+                        reply,
+                    )
+                    .await
+                    {
+                        return Outcome::Lost(PairFailure { message: error, fatal: false });
+                    }
+                }
+                Some(Command::CancelTransfer { transfer_id }) => {
+                    let reply = AppEnvelope::new(
+                        message_type::TRANSFER_CANCEL,
+                        manager.next_envelope_seq(),
+                        json!(TransferIdPayload { transfer_id }),
+                    );
+
+                    close_transfer(
+                        manager,
+                        state,
+                        transfer_id,
+                        TransferOutcome::Canceled,
+                        "你取消了这次传输",
+                    );
+
+                    if let Err(error) = enqueue_reply(
+                        &mut sink,
+                        manager,
+                        state,
+                        &mut pacer,
+                        generation,
+                        FrameKind::TransferControl,
+                        reply,
+                    )
+                    .await
+                    {
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
                 }
@@ -882,7 +1408,7 @@ async fn live(
                                                 generation,
                                                 "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                             );
-                                            retry_dropped_chat(manager, &dropped);
+                                            retry_dropped_chat(manager, state, &dropped);
                                         }
 
                                         if let Err(error) = flush(&mut sink, state, &mut pacer).await {
@@ -979,18 +1505,686 @@ where
     Ok(())
 }
 
+/// 入站消息产生的回执：放进可靠队列并立刻尝试发出去
+async fn enqueue_reply<S>(
+    sink: &mut S,
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    pacer: &mut Pacer,
+    generation: u64,
+    kind: FrameKind,
+    envelope: AppEnvelope,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    match state.queue(kind, &envelope, false) {
+        Err(error) => {
+            manager.emit_error(generation, error);
+
+            Ok(())
+        }
+        Ok(dropped) => {
+            if let Some(dropped) = dropped {
+                manager.emit_error(
+                    generation,
+                    "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
+                );
+                retry_dropped_chat(manager, state, &dropped);
+            }
+
+            flush(sink, state, pacer).await
+        }
+    }
+}
+
 /// 队列满时被挤掉的聊天消息退回「等待发送」（§32）：下一次对端上线会重新补发，
 /// 既不假装「已发送」，也不会变成无法重试的终态。
-fn retry_dropped_chat(manager: &Arc<PairManager>, envelope: &AppEnvelope) {
-    if envelope.message_type != message_type::CHAT_TEXT {
-        return;
-    }
-
+fn retry_dropped_chat(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    envelope: &AppEnvelope,
+) {
     let Some(id) = envelope.payload.get("messageId").and_then(Value::as_str) else {
         return;
     };
 
-    manager.publish_message_status(id, MessageStatus::Pending);
+    match envelope.message_type.as_str() {
+        message_type::CHAT_TEXT => manager.publish_message_status(id, MessageStatus::Pending),
+        // 附件 offer 被挤掉时对方永远等不到分片，只能标记失败让用户重试。会话要一起收掉，
+        // 否则这个永远等不到 accept 的会话会一直占着 MAX_ACTIVE_TRANSFERS 的名额
+        message_type::TRANSFER_OFFER => {
+            let reason = "发送队列已满，附件没有发出去，可以重试";
+
+            match manager.transfer_of(id) {
+                Ok(transfer_id) => {
+                    close_transfer(manager, state, transfer_id, TransferOutcome::Failed, reason)
+                }
+                Err(_) => manager.fail_attachment(id, reason),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 组装一条进度事件
+fn progress_payload(
+    session: &TransferSession,
+    state: &'static str,
+    transferred: u64,
+    message: Option<String>,
+) -> TransferProgress {
+    let percent = if session.size == 0 {
+        100
+    } else {
+        ((transferred as f64 / session.size as f64).clamp(0.0, 1.0) * 100.0).round() as u8
+    };
+
+    TransferProgress {
+        transfer_id: session.id,
+        message_id: session.message_id.clone(),
+        attachment_id: session.attachment_id.clone(),
+        kind: session.kind,
+        name: session.name.clone(),
+        size: session.size,
+        transferred,
+        percent,
+        direction: session.direction(),
+        state,
+        message,
+    }
+}
+
+/// 进度节流：`force` 用于阶段变化与结束，其余情况每个 transfer 最多 150ms 报一次
+fn report_progress(
+    manager: &Arc<PairManager>,
+    session: &mut TransferSession,
+    state: &'static str,
+    message: Option<String>,
+    force: bool,
+) {
+    let now = tokio::time::Instant::now();
+    let due = session
+        .last_progress_at
+        .map(|last| now.duration_since(last) >= TRANSFER_PROGRESS_INTERVAL)
+        .unwrap_or(true);
+
+    if !force && !due {
+        return;
+    }
+
+    session.last_progress_at = Some(now);
+
+    let payload = progress_payload(session, state, session.transferred(), message);
+
+    manager.publish_transfer(&payload);
+}
+
+/// 一次传输的收尾方式（§43）。取消与失败在 UI 上不是一回事：取消是用户自己的决定，
+/// 显示「传输失败」会让人以为出了故障。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferOutcome {
+    Done,
+    Failed,
+    Canceled,
+}
+
+impl TransferOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    /// 取消也算「没送到」：消息标成 failed，用户重新打开窗口后还能点「重试」（§43）
+    const fn marks_failed(self) -> bool {
+        !matches!(self, Self::Done)
+    }
+
+    /// 只有真的出错才报「最近一次错误」：取消是用户自己的决定，不是故障
+    const fn reports_error(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+/// 一次传输的收尾：标记状态、删掉临时文件、把会话从表里摘掉
+fn close_transfer(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    transfer_id: u64,
+    outcome: TransferOutcome,
+    reason: &str,
+) {
+    let Some(mut session) = state.transfers.remove(&transfer_id) else {
+        return;
+    };
+
+    manager.unregister_transfer(&session.message_id);
+
+    if let Some(incoming) = session.incoming.take() {
+        incoming.abort();
+
+        let _ = manager
+            .history
+            .set_attachment_path(&session.attachment_id, None);
+    }
+
+    if outcome.marks_failed() {
+        if outcome.reports_error() {
+            manager.fail_attachment(&session.message_id, reason);
+        } else {
+            manager.mark_attachment_failed(&session.message_id);
+        }
+    }
+
+    let payload = progress_payload(
+        &session,
+        outcome.as_str(),
+        session.transferred(),
+        if outcome.marks_failed() {
+            Some(reason.to_string())
+        } else {
+            None
+        },
+    );
+
+    manager.publish_transfer(&payload);
+}
+
+/// 连接结束时收尾（§43）：V1 不做断点续传，半成品直接丢掉，消息标记失败以便重试
+fn abort_transfers(manager: &Arc<PairManager>, state: &mut SessionState) {
+    for mut session in state.take_transfers() {
+        manager.unregister_transfer(&session.message_id);
+
+        if let Some(incoming) = session.incoming.take() {
+            incoming.abort();
+
+            let _ = manager
+                .history
+                .set_attachment_path(&session.attachment_id, None);
+        }
+
+        manager.publish_message_status(&session.message_id, MessageStatus::Failed);
+
+        let payload = progress_payload(
+            &session,
+            "failed",
+            session.transferred(),
+            Some("连接断开，传输已中断".to_string()),
+        );
+
+        manager.publish_transfer(&payload);
+    }
+}
+
+/// 发送方：发起一次附件 offer（附件与消息行已经落库）
+fn start_outgoing_transfer(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    request: OutgoingRequest,
+) -> Result<(), String> {
+    if request.size > manager.max_attachment_size() {
+        return Err(format!(
+            "附件超过本机上限（{} MB）",
+            manager.max_attachment_size() / (1024 * 1024)
+        ));
+    }
+
+    if state.transfers.len() >= MAX_ACTIVE_TRANSFERS {
+        return Err("同时进行的附件传输太多，请等一会儿再发".to_string());
+    }
+
+    let outgoing = OutgoingTransfer::with_digest(
+        request.path.clone(),
+        &request.name,
+        &request.mime,
+        request.size,
+        request.sha256.clone(),
+    );
+
+    let session = TransferSession {
+        id: request.transfer_id,
+        message_id: request.message_id.clone(),
+        attachment_id: request.attachment_id.clone(),
+        kind: request.kind,
+        name: outgoing.name.clone(),
+        mime: outgoing.mime.clone(),
+        size: outgoing.size,
+        sha256: outgoing.sha256.clone(),
+        chunk_size: CHUNK_SIZE as u32,
+        chunks: outgoing.chunks,
+        phase: TransferPhase::AwaitingAccept,
+        outgoing: Some(outgoing),
+        incoming: None,
+        last_progress_at: None,
+    };
+
+    let offer = TransferOfferPayload {
+        transfer_id: session.id,
+        message_id: session.message_id.clone(),
+        attachment_id: session.attachment_id.clone(),
+        kind: session.kind,
+        name: session.name.clone(),
+        size: session.size,
+        mime: session.mime.clone(),
+        sha256: session.sha256.clone(),
+        chunk_size: session.chunk_size,
+        chunks: session.chunks,
+    };
+
+    state.open_transfer(session)?;
+
+    manager.register_transfer(&request.message_id, request.transfer_id);
+
+    let envelope = AppEnvelope::new(
+        message_type::TRANSFER_OFFER,
+        manager.next_envelope_seq(),
+        serde_json::to_value(offer).map_err(|error| format!("序列化附件 offer 失败: {error}"))?,
+    );
+
+    match state.queue(FrameKind::TransferControl, &envelope, false) {
+        Ok(Some(dropped)) => {
+            manager.emit_error(
+                manager.generation(),
+                "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
+            );
+            retry_dropped_chat(manager, state, &dropped);
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+
+    manager.publish_message_status(&request.message_id, MessageStatus::Sent);
+
+    if let Some(session) = state.transfers.get_mut(&request.transfer_id) {
+        report_progress(manager, session, "waiting", None, true);
+    }
+
+    Ok(())
+}
+
+/// 接收方：用户点了「接收」（§42），开始收分片
+fn accept_incoming_transfer(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    transfer_id: u64,
+) -> Result<Reply, String> {
+    let Some(session) = state.transfers.get_mut(&transfer_id) else {
+        return Ok(None);
+    };
+
+    if session.phase != TransferPhase::AwaitingDecision {
+        return Ok(None);
+    }
+
+    let incoming = IncomingTransfer::create(
+        &manager.store().tmp_dir(),
+        session.size,
+        &session.sha256,
+        session.chunks,
+    )?;
+
+    session.incoming = Some(incoming);
+    session.phase = TransferPhase::Receiving;
+
+    report_progress(manager, session, "receiving", None, true);
+
+    Ok(Some((
+        FrameKind::TransferControl,
+        AppEnvelope::new(
+            message_type::TRANSFER_ACCEPT,
+            manager.next_envelope_seq(),
+            json!(TransferIdPayload { transfer_id }),
+        ),
+    )))
+}
+
+/// 接收方：收到一块分片（per-transfer 密钥已经解好）
+fn handle_transfer_chunk(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    header: &FrameHeader,
+    plaintext: &[u8],
+) -> Result<Reply, String> {
+    let Some(session) = state.transfers.get_mut(&header.transfer_id) else {
+        return Err("收到未知附件传输的分片".to_string());
+    };
+
+    if session.phase != TransferPhase::Receiving {
+        return Err("附件传输还没进入接收阶段就收到了分片".to_string());
+    }
+
+    session
+        .incoming
+        .as_mut()
+        .ok_or_else(|| "接收中的会话缺少接收状态".to_string())?
+        .write_chunk(header.seq, plaintext)?;
+
+    let finished = session
+        .incoming
+        .as_ref()
+        .map(|incoming| incoming.received_chunks >= incoming.chunks)
+        .unwrap_or(false);
+
+    if !finished {
+        report_progress(manager, session, "receiving", None, false);
+
+        return Ok(None);
+    }
+
+    finish_incoming_transfer(manager, state, header.transfer_id)
+}
+
+/// 接收方：所有分片到齐，校验 SHA-256 并落盘（§41）
+fn finish_incoming_transfer(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    transfer_id: u64,
+) -> Result<Reply, String> {
+    let Some(mut session) = state.transfers.remove(&transfer_id) else {
+        return Ok(None);
+    };
+
+    manager.unregister_transfer(&session.message_id);
+
+    let Some(incoming) = session.incoming.take() else {
+        return Ok(None);
+    };
+
+    let target = manager
+        .store()
+        .attachment_path(&manager.store().attachment_name(&session.name));
+
+    match incoming.finish(target) {
+        Ok((path, _size, _sha256)) => {
+            let _ = manager
+                .history
+                .set_attachment_path(&session.attachment_id, Some(&path.to_string_lossy()));
+            manager.publish_message_status(&session.message_id, MessageStatus::Received);
+
+            let payload = progress_payload(&session, "done", session.size, None);
+
+            manager.publish_transfer(&payload);
+
+            Ok(Some((
+                FrameKind::TransferControl,
+                AppEnvelope::new(
+                    message_type::TRANSFER_VERIFIED,
+                    manager.next_envelope_seq(),
+                    json!(TransferVerifiedPayload {
+                        transfer_id,
+                        ok: true,
+                        message: None,
+                    }),
+                ),
+            )))
+        }
+        Err(error) => {
+            let _ = manager
+                .history
+                .set_attachment_path(&session.attachment_id, None);
+            manager.publish_message_status(&session.message_id, MessageStatus::Failed);
+
+            let payload = progress_payload(&session, "failed", session.transferred(), Some(error.clone()));
+
+            manager.publish_transfer(&payload);
+
+            Ok(Some((
+                FrameKind::TransferControl,
+                AppEnvelope::new(
+                    message_type::TRANSFER_VERIFIED,
+                    manager.next_envelope_seq(),
+                    json!(TransferVerifiedPayload {
+                        transfer_id,
+                        ok: false,
+                        message: Some(error),
+                    }),
+                ),
+            )))
+        }
+    }
+}
+
+/// 接收方：收到 offer（§39）。大文件先问用户，其余直接开始收。
+fn handle_transfer_offer(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    payload: TransferOfferPayload,
+) -> Result<Reply, String> {
+    let reject = |reason: &str| {
+        Ok(Some((
+            FrameKind::TransferControl,
+            AppEnvelope::new(
+                message_type::TRANSFER_REJECT,
+                manager.next_envelope_seq(),
+                json!(TransferRejectPayload {
+                    transfer_id: payload.transfer_id,
+                    reason: reason.to_string(),
+                }),
+            ),
+        )))
+    };
+
+    if payload.chunk_size != CHUNK_SIZE as u32
+        || payload.chunks != chunk_count(payload.size)
+        || payload.sha256.len() != 64
+        || !payload.sha256.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("附件 offer 的参数不合法".to_string());
+    }
+
+    if state.transfers.contains_key(&payload.transfer_id) {
+        return Ok(None);
+    }
+
+    if state.transfers.len() >= MAX_ACTIVE_TRANSFERS {
+        return reject("对方同时进行的附件传输太多");
+    }
+
+    if payload.size > manager.max_attachment_size() {
+        return reject("超过本机允许的附件大小");
+    }
+
+    let name = sanitize_file_name(&payload.name);
+    let mime = sanitize_mime(&payload.mime);
+    let kind = match payload.kind {
+        TransferKind::Image => MessageKind::Image,
+        TransferKind::File => MessageKind::File,
+        TransferKind::Voice => MessageKind::Voice,
+    };
+    let created_at = now_millis();
+
+    manager.history.upsert_attachment(&NewAttachment {
+        id: payload.attachment_id.clone(),
+        kind,
+        original_name: Some(name.clone()),
+        mime: Some(mime.clone()),
+        size: Some(payload.size),
+        sha256: Some(payload.sha256.clone()),
+        local_path: None,
+        created_at,
+    })?;
+
+    // 同一个 messageId 又来了：这是对方在重发，改回 pending 而不是插一条新的
+    let existing = manager.history.find(&payload.message_id)?;
+    let message = match existing {
+        Some(message) if message.direction == MessageDirection::Incoming => {
+            manager
+                .history
+                .set_status(&payload.message_id, MessageStatus::Pending)?
+                .unwrap_or(message)
+        }
+        _ => manager.history.insert(&NewMessage::incoming_attachment(
+            payload.message_id.clone(),
+            kind,
+            payload.attachment_id.clone(),
+            created_at,
+            manager.history.epoch()?,
+        ))?,
+    };
+
+    manager.sink.emit(
+        EVENT_MESSAGE_RECEIVED,
+        serde_json::to_value(&message).unwrap_or(Value::Null),
+    );
+
+    let awaiting = needs_confirmation(payload.kind, payload.size);
+    let mut session = TransferSession {
+        id: payload.transfer_id,
+        message_id: payload.message_id,
+        attachment_id: payload.attachment_id,
+        kind: payload.kind,
+        name,
+        mime,
+        size: payload.size,
+        sha256: payload.sha256,
+        chunk_size: payload.chunk_size,
+        chunks: payload.chunks,
+        phase: if awaiting {
+            TransferPhase::AwaitingDecision
+        } else {
+            TransferPhase::Receiving
+        },
+        outgoing: None,
+        incoming: None,
+        last_progress_at: None,
+    };
+
+    if !awaiting {
+        session.incoming = Some(IncomingTransfer::create(
+            &manager.store().tmp_dir(),
+            session.size,
+            &session.sha256,
+            session.chunks,
+        )?);
+    }
+
+    let transfer_id = session.id;
+    let message_id = session.message_id.clone();
+
+    state.open_transfer(session)?;
+
+    manager.register_transfer(&message_id, transfer_id);
+
+    if let Some(session) = state.transfers.get_mut(&transfer_id) {
+        report_progress(
+            manager,
+            session,
+            if awaiting { "waiting" } else { "receiving" },
+            None,
+            true,
+        );
+    }
+
+    if awaiting {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        FrameKind::TransferControl,
+        AppEnvelope::new(
+            message_type::TRANSFER_ACCEPT,
+            manager.next_envelope_seq(),
+            json!(TransferIdPayload { transfer_id }),
+        ),
+    )))
+}
+
+/// 发送方：发一块分片。返回 `Ok(false)` 表示这次没轮到（没有待发分片或 pacing 令牌不够）。
+async fn send_next_chunk<S>(
+    sink: &mut S,
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    pacer: &mut Pacer,
+    chunk_pacer: &mut Pacer,
+) -> Result<bool, String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let Some(transfer_id) = state.next_sending_transfer() else {
+        return Ok(false);
+    };
+
+    // 两套额度都拿到才发（R18）：通用帧额度防止补发把中继扣穿，分片额度再留一层余量，
+    // 否则 20/s 对 20/s 零余量，网络抖动一压缩到达间隔就会被 `close 1008` 打断
+    if !Pacer::try_acquire_pair(pacer, chunk_pacer) {
+        return Ok(false);
+    }
+
+    let (frame, sent_bytes, complete) = {
+        let session = state
+            .transfers
+            .get(&transfer_id)
+            .ok_or_else(|| "传输会话不见了".to_string())?;
+        let outgoing = session
+            .outgoing
+            .as_ref()
+            .ok_or_else(|| "发送中的会话缺少发送状态".to_string())?;
+        let index = outgoing.next_index();
+        let chunk = outgoing.read_chunk(index)?;
+
+        // 读出来的分片必须和 offer 里声明的分片大小一致，否则对方一定校验失败
+        if chunk.len() != outgoing.expected_length() {
+            return Err("读取到的附件分片大小不对".to_string());
+        }
+
+        let header = FrameHeader {
+            kind: FrameKind::TransferChunk,
+            flags: 0,
+            transfer_id,
+            seq: index,
+        };
+        let frame = state.transfer_cipher(transfer_id).seal(&header, &chunk)?;
+
+        if frame.len() > MAX_BINARY_FRAME_SIZE {
+            return Err("待发送的附件分片超过中继允许的大小".to_string());
+        }
+
+        (frame, chunk.len(), index + 1 >= outgoing.chunks)
+    };
+
+    send_frame(sink, Message::Binary(frame.into())).await?;
+
+    let Some(session) = state.transfers.get_mut(&transfer_id) else {
+        return Ok(true);
+    };
+
+    if let Some(outgoing) = session.outgoing.as_mut() {
+        outgoing.mark_sent(sent_bytes);
+    }
+
+    if complete {
+        // 分片发完再告诉对方「发完了」，等它校验（§38）
+        let envelope = AppEnvelope::new(
+            message_type::TRANSFER_COMPLETE,
+            manager.next_envelope_seq(),
+            json!(TransferIdPayload { transfer_id }),
+        );
+
+        match state.queue(FrameKind::TransferControl, &envelope, false) {
+            Ok(dropped) => {
+                // 和别的入队点一样：队列满时旧帧会被挤掉，不能一声不响地吞下去
+                if let Some(dropped) = dropped {
+                    manager.emit_error(
+                        manager.generation(),
+                        "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
+                    );
+                    retry_dropped_chat(manager, state, &dropped);
+                }
+
+                flush(sink, state, pacer).await?;
+            }
+            Err(error) => manager.emit_error(manager.generation(), error),
+        }
+    } else {
+        report_progress(manager, session, "sending", None, false);
+    }
+
+    Ok(true)
 }
 
 /// 带超时的写入。对端不读数据时 `send` 会无限等待；超时后由调用方把连接判为断开。
@@ -1019,6 +2213,20 @@ fn handle_binary(
     state: &mut SessionState,
     bytes: &[u8],
 ) -> Result<Reply, String> {
+    // 附件分片用 per-transfer 密钥（R17），所以先按明文帧头里的 kind / transferId 选密钥。
+    // 帧头是 AEAD 的 associated data，选错密钥只会解密失败，不会绕过认证。
+    let peeked = FrameHeader::decode(bytes).ok_or_else(|| "未知的帧类型".to_string())?;
+
+    if peeked.kind == FrameKind::TransferChunk {
+        let (header, plaintext) = state.transfer_cipher(peeked.transfer_id).open(bytes)?;
+
+        if header.flags != 0 {
+            return Err("收到不支持的帧标志".into());
+        }
+
+        return handle_transfer_chunk(manager, state, &header, &plaintext);
+    }
+
     let (header, plaintext) = state.cipher.open(bytes)?;
 
     if header.flags != 0 {
@@ -1146,6 +2354,158 @@ fn handle_binary(
 
             Ok(None)
         }
+        message_type::TRANSFER_OFFER => {
+            // 载荷不合法就丢掉：对端本来就不可信
+            let Ok(payload) = serde_json::from_value::<TransferOfferPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            handle_transfer_offer(manager, state, payload)
+        }
+        message_type::TRANSFER_ACCEPT => {
+            let Ok(payload) = serde_json::from_value::<TransferIdPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            let Some(session) = state.transfers.get_mut(&payload.transfer_id) else {
+                return Ok(None);
+            };
+
+            // 只有发送方在等 accept
+            if session.phase != TransferPhase::AwaitingAccept {
+                return Ok(None);
+            }
+
+            session.phase = TransferPhase::Sending;
+
+            report_progress(manager, session, "sending", None, true);
+
+            // 空文件没有分片（§81 的 0 byte）：`transfer.complete` 平时由发最后一块的人捎带，
+            // 这里没有「最后一块」，不补一条的话两边会停在 sending / receiving 直到断线
+            if session_is_complete(session) {
+                return Ok(Some((
+                    FrameKind::TransferControl,
+                    AppEnvelope::new(
+                        message_type::TRANSFER_COMPLETE,
+                        manager.next_envelope_seq(),
+                        json!(TransferIdPayload { transfer_id: payload.transfer_id }),
+                    ),
+                )));
+            }
+
+            Ok(None)
+        }
+        message_type::TRANSFER_REJECT => {
+            let Ok(payload) =
+                serde_json::from_value::<TransferRejectPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            close_transfer(
+                manager,
+                state,
+                payload.transfer_id,
+                TransferOutcome::Failed,
+                &format!("对方没有接收: {}", payload.reason),
+            );
+
+            Ok(None)
+        }
+        message_type::TRANSFER_COMPLETE => {
+            let Ok(payload) = serde_json::from_value::<TransferIdPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            // 接收方：分片应该已经收齐了，没收齐说明中间丢了数据
+            let missing = state
+                .transfers
+                .get(&payload.transfer_id)
+                .and_then(|session| session.incoming.as_ref())
+                .map(|incoming| incoming.received_chunks < incoming.chunks)
+                .unwrap_or(false);
+
+            let Some(session) = state.transfers.get(&payload.transfer_id) else {
+                return Ok(None);
+            };
+
+            if session.phase != TransferPhase::Receiving {
+                return Ok(None);
+            }
+
+            if missing {
+                close_transfer(
+                    manager,
+                    state,
+                    payload.transfer_id,
+                    TransferOutcome::Failed,
+                    "附件分片没有收全，请让对方重发",
+                );
+
+                return Ok(Some((
+                    FrameKind::TransferControl,
+                    AppEnvelope::new(
+                        message_type::TRANSFER_VERIFIED,
+                        manager.next_envelope_seq(),
+                        json!(TransferVerifiedPayload {
+                            transfer_id: payload.transfer_id,
+                            ok: false,
+                            message: Some("分片没有收全".to_string()),
+                        }),
+                    ),
+                )));
+            }
+
+            finish_incoming_transfer(manager, state, payload.transfer_id)
+        }
+        message_type::TRANSFER_VERIFIED => {
+            let Ok(payload) =
+                serde_json::from_value::<TransferVerifiedPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            if payload.ok {
+                if let Some(session) = state.transfers.get(&payload.transfer_id) {
+                    manager.publish_message_status(&session.message_id, MessageStatus::Delivered);
+                }
+
+                close_transfer(manager, state, payload.transfer_id, TransferOutcome::Done, "");
+            } else {
+                let reason = payload
+                    .message
+                    .unwrap_or_else(|| "对方没有通过附件校验".to_string());
+
+                close_transfer(
+                    manager,
+                    state,
+                    payload.transfer_id,
+                    TransferOutcome::Failed,
+                    &reason,
+                );
+            }
+
+            Ok(None)
+        }
+        message_type::TRANSFER_CANCEL => {
+            let Ok(payload) = serde_json::from_value::<TransferIdPayload>(envelope.payload.clone())
+            else {
+                return Ok(None);
+            };
+
+            close_transfer(
+                manager,
+                state,
+                payload.transfer_id,
+                TransferOutcome::Canceled,
+                "对方取消了这次传输",
+            );
+
+            Ok(None)
+        }
         _ => {
             manager.sink.emit(
                 EVENT_MESSAGE,
@@ -1227,6 +2587,7 @@ fn publish_peer(manager: &Arc<PairManager>, generation: u64, online: bool) {
 mod tests {
     use super::*;
     use crate::core::pair::protocol::{PetKeyboardState, PetPointerState};
+    use crate::core::pair::transfer::sha256_file;
 
     const ROOT_KEY: [u8; 32] = [11u8; 32];
 
@@ -1263,9 +2624,17 @@ mod tests {
             "test-device".into(),
             sink.clone(),
             history,
+            test_store(),
         ));
 
         (manager, sink)
+    }
+
+    /// 单测用的附件目录：每次一片新的临时目录，互不干扰
+    fn test_store() -> TransferStore {
+        TransferStore::new(
+            std::env::temp_dir().join(format!("bongo-cat-pair-unit-{}", uuid::Uuid::new_v4())),
+        )
     }
 
     /// 给 manager 装一条假的会话通道：这样 `send_chat` 会走「真的发出去」的分支
@@ -1677,6 +3046,7 @@ mod tests {
 
         retry_dropped_chat(
             &manager,
+            &mut SessionState::new(&[3u8; 32]),
             &AppEnvelope::new(
                 message_type::CHAT_TEXT,
                 1,
@@ -1693,6 +3063,7 @@ mod tests {
         // 非聊天帧没有对应的消息，不能误改状态
         retry_dropped_chat(
             &manager,
+            &mut SessionState::new(&[3u8; 32]),
             &AppEnvelope::new(message_type::CHAT_ACK, 2, json!({ "messageId": "m1" })),
         );
         assert_eq!(
@@ -1701,34 +3072,164 @@ mod tests {
         );
     }
 
+    /// offer 被可靠性队列挤掉时：消息标 failed，**而且**那个等不到 accept 的会话要一起收掉，
+    /// 否则它会一直占着 MAX_ACTIVE_TRANSFERS 的名额，用户只会看到「同时进行的传输太多」
+    #[tokio::test]
+    async fn a_dropped_offer_frees_the_transfer_slot() {
+        let store = TransferStore::new(temp_root("dropped-offer"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let (source, size, sha256) = source_file(&root, &[1, 2, 3]);
+
+        manager
+            .history
+            .insert(&NewMessage::outgoing_attachment(
+                "m-1".into(),
+                MessageKind::File,
+                "a-1".into(),
+                0,
+                1,
+            ))
+            .unwrap();
+        manager
+            .history
+            .upsert_attachment(&NewAttachment {
+                id: "a-1".into(),
+                kind: MessageKind::File,
+                original_name: Some("x.bin".into()),
+                mime: Some("application/octet-stream".into()),
+                size: Some(size),
+                sha256: Some(sha256.clone()),
+                local_path: Some(source.to_string_lossy().to_string()),
+                created_at: 0,
+            })
+            .unwrap();
+
+        start_outgoing_transfer(
+            &manager,
+            &mut state,
+            OutgoingRequest {
+                transfer_id: 9,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind: TransferKind::File,
+                name: "x.bin".into(),
+                mime: "application/octet-stream".into(),
+                size,
+                sha256,
+                path: source,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.transfers.len(), 1);
+
+        retry_dropped_chat(
+            &manager,
+            &mut state,
+            &AppEnvelope::new(
+                message_type::TRANSFER_OFFER,
+                1,
+                json!({ "messageId": "m-1" }),
+            ),
+        );
+
+        assert!(
+            state.transfers.is_empty(),
+            "被挤掉的 offer 不能继续占着传输名额"
+        );
+        assert!(manager.transfer_of("m-1").is_err());
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+        assert!(
+            sink.payloads(EVENT_TRANSFER)
+                .iter()
+                .any(|payload| payload["state"] == "failed")
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn pacer_refills_at_the_configured_rate_and_caps_at_the_burst() {
+        let rate = OUTBOUND_FRAMES_PER_SECOND;
+        let burst = OUTBOUND_BURST;
+
         assert!(
-            (Pacer::refill(0.0, 0.05) - 1.0).abs() < 1e-9,
+            (Pacer::refill(0.0, 0.05, rate, burst) - 1.0).abs() < 1e-9,
             "50ms 应当补一枚令牌"
         );
         assert!(
-            (Pacer::refill(5.0, 0.0) - 5.0).abs() < 1e-9,
+            (Pacer::refill(5.0, 0.0, rate, burst) - 5.0).abs() < 1e-9,
             "没有经过时间就不补充"
         );
         assert!(
-            (Pacer::refill(19.5, 30.0) - OUTBOUND_BURST).abs() < 1e-9,
+            (Pacer::refill(19.5, 30.0, rate, burst) - burst).abs() < 1e-9,
             "长时间空闲也不能攒成无限突发"
         );
         assert!(
-            (Pacer::refill(1.0, -5.0) - 1.0).abs() < 1e-9,
+            (Pacer::refill(1.0, -5.0, rate, burst) - 1.0).abs() < 1e-9,
             "时钟异常不该扣令牌"
         );
+    }
+
+    /// 分片要同时过两套额度，而两套必须**一起扣**：只够一边时一枚都不能扣，
+    /// 否则会出现「白扣一枚通用令牌却什么都没发」。
+    #[test]
+    fn acquiring_two_pacers_never_spends_only_one() {
+        // 补充量按经过时间算，这里让两次调用之间只隔几百微秒，容差取 0.05 枚
+        const EPS: f64 = 0.05;
+
+        let mut frame = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut chunk = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+
+        // 分片额度不够：通用额度也不能被扣
+        frame.tokens = 10.0;
+        chunk.tokens = 0.5;
+        frame.updated_at = tokio::time::Instant::now();
+        chunk.updated_at = tokio::time::Instant::now();
+
+        assert!(!Pacer::try_acquire_pair(&mut frame, &mut chunk));
+        assert!((frame.tokens - 10.0).abs() < EPS, "通用额度被白扣了");
+        assert!((chunk.tokens - 0.5).abs() < EPS, "分片额度不该被扣");
+
+        // 反过来同理
+        frame.tokens = 0.5;
+        chunk.tokens = 10.0;
+        frame.updated_at = tokio::time::Instant::now();
+        chunk.updated_at = tokio::time::Instant::now();
+
+        assert!(!Pacer::try_acquire_pair(&mut frame, &mut chunk));
+        assert!((frame.tokens - 0.5).abs() < EPS);
+        assert!((chunk.tokens - 10.0).abs() < EPS, "分片额度被白扣了");
+
+        // 两边都够才各扣一枚
+        frame.tokens = 3.0;
+        chunk.tokens = 3.0;
+        frame.updated_at = tokio::time::Instant::now();
+        chunk.updated_at = tokio::time::Instant::now();
+
+        assert!(Pacer::try_acquire_pair(&mut frame, &mut chunk));
+        assert!((frame.tokens - 2.0).abs() < EPS);
+        assert!((chunk.tokens - 2.0).abs() < EPS);
     }
 
     /// 客户端自己也得守住中继的预算，否则一次补发就会被 close 1008
     #[test]
     fn outbound_pacing_stays_within_the_relay_budget() {
-        // server-cloudflare/src/protocol.ts: MAX_FRAMES_PER_SECOND = 30
+        // server-cloudflare/src/protocol.ts: MAX_FRAMES_PER_SECOND = 30 / MAX_CHUNKS_PER_SECOND = 20
         const RELAY_FRAMES_PER_SECOND: f64 = 30.0;
+        const RELAY_CHUNKS_PER_SECOND: f64 = 20.0;
 
         assert!(OUTBOUND_BURST < RELAY_FRAMES_PER_SECOND);
         assert!(OUTBOUND_FRAMES_PER_SECOND < RELAY_FRAMES_PER_SECOND);
+
+        // 分片这一路要和中继的分片桶留出余量：贴死之后任何到达间隔抖动都会扣穿它
+        assert!(OUTBOUND_CHUNK_BURST < RELAY_CHUNKS_PER_SECOND);
+        assert!(OUTBOUND_CHUNKS_PER_SECOND < RELAY_CHUNKS_PER_SECOND);
     }
 
     /// 单看「突发 < 中继上限」还不够：真正的不变量是**任意时刻累计放行量**都不超过中继的
@@ -1746,7 +3247,12 @@ mod tests {
         let mut released = 0usize;
 
         for step in 1..=STEPS {
-            client_tokens = Pacer::refill(client_tokens, STEP_SECS);
+            client_tokens = Pacer::refill(
+                client_tokens,
+                STEP_SECS,
+                OUTBOUND_FRAMES_PER_SECOND,
+                OUTBOUND_BURST,
+            );
             relay_tokens = (relay_tokens + STEP_SECS * RELAY_FRAMES_PER_SECOND).min(RELAY_BURST);
 
             if client_tokens < 1.0 {
@@ -1771,6 +3277,50 @@ mod tests {
 
         // 第一秒正好放行 20 突发 + 20 补充，仍在中继的 60 以内
         assert!(released > 1_000, "模拟没有真的发送：{released} 帧");
+    }
+
+    /// 分片这一路还要再模拟一次中继的**分片桶**（20 个/秒、容量 20）：
+    /// 客户端只要贴到 20/s，中继的桶就会长期悬在 0，抖动一下即 `close 1008`，传输中途断掉。
+    #[test]
+    fn chunk_pacing_keeps_the_relay_chunk_bucket_in_the_black() {
+        const RELAY_CHUNKS_PER_SECOND: f64 = 20.0;
+        const RELAY_BURST: f64 = 20.0;
+        const STEP_SECS: f64 = 0.005;
+        const STEPS: usize = 20_000;
+
+        let mut client_tokens = OUTBOUND_CHUNK_BURST;
+        let mut relay_tokens = RELAY_BURST;
+        let mut released = 0usize;
+        let mut worst = f64::MAX;
+
+        for step in 1..=STEPS {
+            client_tokens = Pacer::refill(
+                client_tokens,
+                STEP_SECS,
+                OUTBOUND_CHUNKS_PER_SECOND,
+                OUTBOUND_CHUNK_BURST,
+            );
+            relay_tokens = (relay_tokens + STEP_SECS * RELAY_CHUNKS_PER_SECOND).min(RELAY_BURST);
+
+            if client_tokens < 1.0 {
+                continue;
+            }
+
+            client_tokens -= 1.0;
+            relay_tokens -= 1.0;
+            released += 1;
+            worst = worst.min(relay_tokens);
+
+            assert!(
+                relay_tokens >= 0.0,
+                "中继分片桶被扣穿：第 {released} 块，t = {}s",
+                step as f64 * STEP_SECS
+            );
+        }
+
+        assert!(released > 1_000, "模拟没有真的发送：{released} 块");
+        // 留出的余量要看得见：全程中继桶都不该被压到 5 枚以下
+        assert!(worst >= 5.0, "分片限速余量太小：最低只剩 {worst} 枚");
     }
 
     #[test]
@@ -1964,5 +3514,742 @@ mod tests {
                 .send(FrameKind::Ping, message_type::PING, json!({}))
                 .is_err()
         );
+    }
+
+    /// 记录所有写出去的帧，用来验证分片的实际线格式
+    #[derive(Default)]
+    struct RecordingSocket {
+        sent: Vec<Message>,
+    }
+
+    impl futures_util::Sink<Message> for RecordingSocket {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            mut self: std::pin::Pin<&mut Self>,
+            item: Message,
+        ) -> Result<(), Self::Error> {
+            self.sent.push(item);
+
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 一个带真实附件目录的 manager（附件要真的落盘）
+    fn manager_with_store(
+        store: TransferStore,
+    ) -> (Arc<PairManager>, Arc<TestSink>, std::path::PathBuf) {
+        let root = store.root().to_path_buf();
+
+        store.ensure().unwrap();
+
+        let sink = Arc::new(TestSink::default());
+        let manager = Arc::new(PairManager::new(
+            "test-device".into(),
+            sink.clone(),
+            Arc::new(PairHistory::in_memory().unwrap()),
+            store,
+        ));
+
+        (manager, sink, root)
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bongo-cat-pair-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        std::fs::create_dir_all(&root).unwrap();
+
+        root
+    }
+
+    /// 写一个真实文件当发送源，返回 (路径, 大小, sha256)
+    fn source_file(root: &std::path::Path, bytes: &[u8]) -> (std::path::PathBuf, u64, String) {
+        let path = root.join("source.bin");
+
+        std::fs::write(&path, bytes).unwrap();
+
+        let (sha256, size) = sha256_file(&path).unwrap();
+
+        (path, size, sha256)
+    }
+
+    fn offer_for(
+        transfer_id: u64,
+        kind: TransferKind,
+        name: &str,
+        size: u64,
+        sha256: &str,
+    ) -> AppEnvelope {
+        AppEnvelope::new(
+            message_type::TRANSFER_OFFER,
+            1,
+            serde_json::to_value(TransferOfferPayload {
+                transfer_id,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind,
+                name: name.into(),
+                size,
+                mime: "application/octet-stream".into(),
+                sha256: sha256.into(),
+                chunk_size: CHUNK_SIZE as u32,
+                chunks: chunk_count(size),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// 用 per-transfer 密钥发一块分片
+    fn deliver_chunk(
+        manager: &Arc<PairManager>,
+        state: &mut SessionState,
+        transfer_id: u64,
+        index: u32,
+        bytes: &[u8],
+    ) -> Result<Reply, String> {
+        let header = FrameHeader {
+            kind: FrameKind::TransferChunk,
+            flags: 0,
+            transfer_id,
+            seq: index,
+        };
+        let frame = PairCipher::new(&crypto::derive_transfer_key(&ROOT_KEY, transfer_id))
+            .seal(&header, bytes)
+            .unwrap();
+
+        handle_binary(manager, 0, state, &frame)
+    }
+
+    fn count_part_files(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root.join("tmp"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|value| value.to_str()) == Some("part")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// §81 的主路径：offer → accept → 分片 → 校验通过 → 落进附件目录
+    #[test]
+    fn a_received_file_lands_in_the_cache_after_verification() {
+        let root = temp_root("receive");
+        let store = TransferStore::new(&root);
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        // 跨块边界：一块半多一点
+        let payload: Vec<u8> = (0..(CHUNK_SIZE + 7)).map(|index| (index % 251) as u8).collect();
+        let (source, size, sha256) = source_file(&root, &payload);
+
+        std::fs::remove_file(&source).unwrap();
+
+        let reply = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_for(77, TransferKind::File, r"C:\Users\cat\秘密.zip", size, &sha256),
+        )
+        .unwrap();
+
+        assert!(reply.is_some(), "小文件应当自动接收并回 accept");
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Pending
+        );
+
+        for index in 0..chunk_count(size) {
+            let start = index as usize * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(payload.len());
+            let reply = deliver_chunk(&manager, &mut state, 77, index, &payload[start..end]).unwrap();
+
+            if index + 1 < chunk_count(size) {
+                assert!(reply.is_none(), "中间的分片不该有回执");
+            } else {
+                let (_, verified) = reply.expect("最后一块应当回 verified");
+
+                assert_eq!(verified.message_type, message_type::TRANSFER_VERIFIED);
+                assert_eq!(verified.payload["ok"], true);
+            }
+        }
+
+        let message = manager.history.find("m-1").unwrap().unwrap();
+
+        assert_eq!(message.status, MessageStatus::Received);
+        assert_eq!(message.kind, MessageKind::File);
+
+        let attachment = message.attachment.expect("消息要带上附件记录");
+        let path = attachment.local_path.expect("收完要有落盘路径");
+
+        assert_eq!(attachment.original_name.as_deref(), Some("秘密.zip"));
+        assert_eq!(attachment.size, Some(size));
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        // 落盘用的是 UUID + 扩展名，绝不是对方的原始文件名（§42）
+        let file_name = std::path::Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        assert!(file_name.ends_with(".zip"), "{file_name}");
+        assert!(!file_name.contains("秘密"), "{file_name}");
+        assert_eq!(count_part_files(&root), 0, "不该留下 .part");
+
+        let events = sink.payloads(EVENT_TRANSFER);
+
+        assert!(events.iter().any(|payload| payload["state"] == "done"));
+        assert!(events.iter().any(|payload| payload["percent"] == 100));
+
+        assert!(state.transfers.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// §81：hash 不对要拒绝、删掉半成品、标记失败
+    #[test]
+    fn a_hash_mismatch_fails_the_message_and_deletes_the_copy() {
+        let store = TransferStore::new(temp_root("hash-bad"));
+        let (manager, _sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let payload = vec![3u8; 1024];
+        let (_, size, _) = source_file(&root, &payload);
+
+        deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_for(9, TransferKind::File, "a.bin", size, &"0".repeat(64)),
+        )
+        .unwrap();
+
+        let reply = deliver_chunk(&manager, &mut state, 9, 0, &payload).unwrap();
+        let (_, verified) = reply.expect("校验失败也要回 verified");
+
+        assert_eq!(verified.payload["ok"], false);
+
+        let message = manager.history.find("m-1").unwrap().unwrap();
+
+        assert_eq!(message.status, MessageStatus::Failed);
+        assert!(message.attachment.unwrap().local_path.is_none());
+        assert_eq!(count_part_files(&root), 0);
+        assert!(state.transfers.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// §42 / §81：超过上限的 offer 直接拒绝，磁盘与数据库都不动
+    #[test]
+    fn an_oversized_offer_is_rejected_without_touching_the_disk() {
+        let store = TransferStore::new(temp_root("oversize"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        assert_eq!(manager.set_max_attachment_mb(1), 1024 * 1024);
+
+        let size = 2 * 1024 * 1024;
+        let reply = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_for(3, TransferKind::File, "big.bin", size, &"a".repeat(64)),
+        )
+        .unwrap();
+        let (_, reject) = reply.expect("超限的 offer 应当被拒绝");
+
+        assert_eq!(reject.message_type, message_type::TRANSFER_REJECT);
+        assert!(manager.history.find("m-1").unwrap().is_none());
+        assert!(manager.history.attachment("a-1").unwrap().is_none());
+        assert!(state.transfers.is_empty());
+        assert!(sink.payloads(EVENT_TRANSFER).is_empty());
+        assert_eq!(count_part_files(&root), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// §42：普通大文件先问用户，确认之前一块都不收
+    #[test]
+    fn a_large_file_waits_for_the_user_before_receiving_chunks() {
+        let store = TransferStore::new(temp_root("confirm"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let size = 50 * 1024 * 1024 + 1;
+        let reply = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_for(11, TransferKind::File, "movie.mkv", size, &"b".repeat(64)),
+        )
+        .unwrap();
+
+        assert!(reply.is_none(), "等用户确认之前不该回 accept");
+
+        let session = state.transfers.get(&11).expect("会话应当在等确认");
+
+        assert_eq!(session.phase, TransferPhase::AwaitingDecision);
+        assert!(session.incoming.is_none(), "还没确认就不该建临时文件");
+        assert_eq!(count_part_files(&root), 0);
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Pending
+        );
+
+        let events = sink.payloads(EVENT_TRANSFER);
+
+        assert!(events.iter().any(|payload| payload["state"] == "waiting"));
+
+        // 用户点「接收」之后才开始建临时文件并回 accept
+        let reply = accept_incoming_transfer(&manager, &mut state, 11).unwrap();
+
+        assert!(reply.is_some());
+        assert_eq!(state.transfers.get(&11).unwrap().phase, TransferPhase::Receiving);
+        assert_eq!(count_part_files(&root), 1);
+
+        // 收尾：删掉临时文件，别把测试垃圾留在临时目录里
+        abort_transfers(&manager, &mut state);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 同一个 transferId 的 offer 重发不该建第二个会话
+    #[test]
+    fn a_duplicate_offer_is_ignored() {
+        let store = TransferStore::new(temp_root("duplicate"));
+        let (manager, _sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let payload = vec![1u8; 64];
+        let (_, size, sha256) = source_file(&root, &payload);
+        let offer = offer_for(5, TransferKind::Image, "cat.png", size, &sha256);
+
+        assert!(
+            deliver(&manager, &mut state, FrameKind::TransferControl, &offer)
+                .unwrap()
+                .is_some()
+        );
+
+        let again = deliver(&manager, &mut state, FrameKind::TransferControl, &offer).unwrap();
+
+        assert!(again.is_none(), "重复 offer 不该再回一次 accept");
+        assert_eq!(state.transfers.len(), 1);
+
+        abort_transfers(&manager, &mut state);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 发送侧完整走一遍：offer → accept → 分片 → complete → verified
+    #[tokio::test]
+    async fn the_sender_walks_offer_accept_chunks_complete_and_verified() {
+        let store = TransferStore::new(temp_root("send"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 2 + 5))
+            .map(|index| (index % 97) as u8)
+            .collect();
+        let (source, size, sha256) = source_file(&root, &payload);
+
+        let mut socket = RecordingSocket::default();
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+
+        manager
+            .history
+            .insert(&NewMessage::outgoing_attachment(
+                "m-1".into(),
+                MessageKind::File,
+                "a-1".into(),
+                0,
+                1,
+            ))
+            .unwrap();
+        manager
+            .history
+            .upsert_attachment(&NewAttachment {
+                id: "a-1".into(),
+                kind: MessageKind::File,
+                original_name: Some("source.bin".into()),
+                mime: Some("application/octet-stream".into()),
+                size: Some(size),
+                sha256: Some(sha256.clone()),
+                local_path: Some(source.to_string_lossy().to_string()),
+                created_at: 0,
+            })
+            .unwrap();
+
+        start_outgoing_transfer(
+            &manager,
+            &mut state,
+            OutgoingRequest {
+                transfer_id: 5,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind: TransferKind::File,
+                name: "source.bin".into(),
+                mime: "application/octet-stream".into(),
+                size,
+                sha256,
+                path: source,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.transfers.get(&5).unwrap().phase, TransferPhase::AwaitingAccept);
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
+
+        // 真实流程里连接任务在处理 StartTransfer 之后立刻 flush：offer 先出去
+        flush(&mut socket, &mut state, &mut pacer).await.unwrap();
+
+        // 对端同意
+        deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &AppEnvelope::new(
+                message_type::TRANSFER_ACCEPT,
+                2,
+                json!(TransferIdPayload { transfer_id: 5 }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(state.transfers.get(&5).unwrap().phase, TransferPhase::Sending);
+
+        while send_next_chunk(
+            &mut socket,
+            &manager,
+            &mut state,
+            &mut pacer,
+            &mut chunk_pacer,
+        )
+            .await
+            .unwrap()
+        {}
+
+        // 线格式：第一帧是 offer（根密钥），随后是分片（per-transfer 密钥），最后一帧是 complete
+        assert_eq!(socket.sent.len(), 1 + chunk_count(size) as usize + 1);
+
+        let Message::Binary(offer_frame) = &socket.sent[0] else {
+            panic!("第一个应当是二进制帧");
+        };
+        let (offer_header, offer_plain) = PairCipher::new(&ROOT_KEY).open(offer_frame).unwrap();
+
+        assert_eq!(offer_header.kind, FrameKind::TransferControl);
+
+        let envelope = AppEnvelope::from_bytes(&offer_plain).unwrap();
+
+        assert_eq!(envelope.message_type, message_type::TRANSFER_OFFER);
+
+        let offer: TransferOfferPayload = serde_json::from_value(envelope.payload).unwrap();
+
+        assert_eq!(offer.transfer_id, 5);
+        assert_eq!(offer.chunks, chunk_count(size));
+        assert_eq!(offer.sha256, manager.history.attachment("a-1").unwrap().unwrap().sha256.unwrap());
+
+        // 分片拼回来必须和源文件逐字节一致
+        let cipher = PairCipher::new(&crypto::derive_transfer_key(&ROOT_KEY, 5));
+        let mut rebuilt = Vec::new();
+
+        for (index, message) in socket.sent[1..socket.sent.len() - 1].iter().enumerate() {
+            let Message::Binary(frame) = message else {
+                panic!("分片必须是二进制帧");
+            };
+            let (header, plain) = cipher.open(frame).unwrap();
+
+            assert_eq!(header.kind, FrameKind::TransferChunk);
+            assert_eq!(header.transfer_id, 5);
+            assert_eq!(header.seq, index as u32);
+
+            rebuilt.extend_from_slice(&plain);
+        }
+
+        assert_eq!(rebuilt, payload);
+
+        let Message::Binary(complete_frame) = socket.sent.last().unwrap() else {
+            panic!("最后一帧必须是二进制帧");
+        };
+        let (_, complete_plain) = PairCipher::new(&ROOT_KEY).open(complete_frame).unwrap();
+        let complete = AppEnvelope::from_bytes(&complete_plain).unwrap();
+
+        assert_eq!(complete.message_type, message_type::TRANSFER_COMPLETE);
+
+        // 对方校验通过
+        deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &AppEnvelope::new(
+                message_type::TRANSFER_VERIFIED,
+                3,
+                json!(TransferVerifiedPayload {
+                    transfer_id: 5,
+                    ok: true,
+                    message: None,
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Delivered
+        );
+        assert!(state.transfers.is_empty());
+        assert!(
+            manager.transfer_of("m-1").is_err(),
+            "结束后不该再留下可操作的传输"
+        );
+        assert!(sink.payloads(EVENT_TRANSFER).iter().any(|payload| payload["state"] == "done"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// §81：0 字节文件没有分片可发，`transfer.complete` 只能在收到 accept 时立刻补一条。
+    /// 少了它两边会停在 sending / receiving，一直到断线才被判失败。
+    #[tokio::test]
+    async fn an_empty_file_completes_right_after_the_accept() {
+        let store = TransferStore::new(temp_root("empty"));
+        let (manager, _sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let (source, size, sha256) = source_file(&root, &[]);
+        let empty_sha256 = sha256.clone();
+
+        assert_eq!(size, 0);
+        assert_eq!(chunk_count(size), 0);
+
+        manager
+            .history
+            .insert(&NewMessage::outgoing_attachment(
+                "m-1".into(),
+                MessageKind::File,
+                "a-1".into(),
+                0,
+                1,
+            ))
+            .unwrap();
+        manager
+            .history
+            .upsert_attachment(&NewAttachment {
+                id: "a-1".into(),
+                kind: MessageKind::File,
+                original_name: Some("empty.bin".into()),
+                mime: Some("application/octet-stream".into()),
+                size: Some(size),
+                sha256: Some(sha256.clone()),
+                local_path: Some(source.to_string_lossy().to_string()),
+                created_at: 0,
+            })
+            .unwrap();
+
+        start_outgoing_transfer(
+            &manager,
+            &mut state,
+            OutgoingRequest {
+                transfer_id: 7,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind: TransferKind::File,
+                name: "empty.bin".into(),
+                mime: "application/octet-stream".into(),
+                size,
+                sha256,
+                path: source,
+            },
+        )
+        .unwrap();
+
+        let mut socket = RecordingSocket::default();
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+
+        flush(&mut socket, &mut state, &mut pacer).await.unwrap();
+
+        assert!(!state.has_pending_chunks(), "空文件不该有待发分片");
+
+        let reply = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &AppEnvelope::new(
+                message_type::TRANSFER_ACCEPT,
+                2,
+                json!(TransferIdPayload { transfer_id: 7 }),
+            ),
+        )
+        .unwrap()
+        .expect("accept 之后必须立刻补一条 transfer.complete");
+
+        assert_eq!(reply.0, FrameKind::TransferControl);
+        assert_eq!(reply.1.message_type, message_type::TRANSFER_COMPLETE);
+
+        // 接收方那一侧：0 分片的 offer（不是大文件，自动接收）收到 complete 必须能收尾
+        let receiver_store = TransferStore::new(temp_root("empty-receive"));
+        let (receiver, _receiver_sink, receiver_root) = manager_with_store(receiver_store);
+        let mut receiver_state = SessionState::new(&ROOT_KEY);
+
+        let accepted = deliver(
+            &receiver,
+            &mut receiver_state,
+            FrameKind::TransferControl,
+            &offer_for(21, TransferKind::File, "empty.bin", 0, &empty_sha256),
+        )
+        .unwrap();
+
+        assert!(accepted.is_some(), "0 字节不是大文件，应当自动接收并回 accept");
+
+        let verified = deliver(
+            &receiver,
+            &mut receiver_state,
+            FrameKind::TransferControl,
+            &AppEnvelope::new(
+                message_type::TRANSFER_COMPLETE,
+                3,
+                json!(TransferIdPayload { transfer_id: 21 }),
+            ),
+        )
+        .unwrap()
+        .expect("0 分片的 complete 必须能收尾");
+
+        assert_eq!(verified.1.message_type, message_type::TRANSFER_VERIFIED);
+        assert_eq!(verified.1.payload["ok"], true);
+        assert!(receiver_state.transfers.is_empty(), "接收方会话要摘掉");
+        assert_eq!(
+            receiver.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Received
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&receiver_root).unwrap();
+    }
+
+    /// §81：对方拒绝时，发送方要标记失败并说明原因
+    #[tokio::test]
+    async fn a_reject_marks_the_outgoing_attachment_failed() {
+        let store = TransferStore::new(temp_root("reject"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let (source, size, sha256) = source_file(&root, &vec![9u8; 128]);
+
+        manager
+            .history
+            .insert(&NewMessage::outgoing_attachment(
+                "m-1".into(),
+                MessageKind::File,
+                "a-1".into(),
+                0,
+                1,
+            ))
+            .unwrap();
+
+        start_outgoing_transfer(
+            &manager,
+            &mut state,
+            OutgoingRequest {
+                transfer_id: 6,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind: TransferKind::File,
+                name: "source.bin".into(),
+                mime: "application/octet-stream".into(),
+                size,
+                sha256,
+                path: source,
+            },
+        )
+        .unwrap();
+
+        deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &AppEnvelope::new(
+                message_type::TRANSFER_REJECT,
+                2,
+                json!(TransferRejectPayload {
+                    transfer_id: 6,
+                    reason: "超过本机允许的附件大小".to_string(),
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+        assert!(state.transfers.is_empty());
+        assert!(
+            sink.payloads(EVENT_TRANSFER)
+                .iter()
+                .any(|payload| payload["state"] == "failed"
+                    && payload["percent"] == 0
+                    && payload["direction"] == "outgoing")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// §81：传输中断线 —— 半成品要删掉、消息标记失败、还能重试
+    #[test]
+    fn a_disconnect_mid_transfer_cleans_up_and_allows_a_retry() {
+        let store = TransferStore::new(temp_root("interrupt"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let payload: Vec<u8> = vec![5u8; CHUNK_SIZE + 1];
+        let (_, size, sha256) = source_file(&root, &payload);
+
+        deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_for(21, TransferKind::Image, "cat.png", size, &sha256),
+        )
+        .unwrap();
+        deliver_chunk(&manager, &mut state, 21, 0, &payload[..CHUNK_SIZE]).unwrap();
+
+        assert_eq!(count_part_files(&root), 1);
+
+        abort_transfers(&manager, &mut state);
+
+        assert!(state.transfers.is_empty());
+        assert_eq!(count_part_files(&root), 0, "断线要删掉 .part");
+        assert_eq!(
+            manager.history.find("m-1").unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+        assert!(
+            sink.payloads(EVENT_TRANSFER)
+                .iter()
+                .any(|payload| payload["state"] == "failed"
+                    && payload["message"] == "连接断开，传输已中断")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
