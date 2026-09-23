@@ -8,6 +8,10 @@ pub mod client;
 pub mod crypto;
 pub mod history;
 pub mod manager;
+// P2P（WebRTC）传输。只在 Windows 上编译：Phase 8 的范围就是 Windows 客户端，
+// 非 Windows 的 release 目标连 webrtc 那棵依赖树都不编译（见 src-tauri/Cargo.toml）。
+#[cfg(windows)]
+pub mod p2p;
 pub mod protocol;
 pub mod secret;
 pub mod transfer;

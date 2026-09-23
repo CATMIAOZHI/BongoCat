@@ -21,3 +21,10 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.
 tauri-plugin-custom-window = { path = "./src-tauri/src/plugins/window" }
 tauri-plugin-admin-status = { path = "./src-tauri/src/plugins/admin-status" }
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+# P2P（WebRTC）。只在 Windows 客户端上编译，见 src-tauri/Cargo.toml 的 cfg(windows) 段。
+# 显式写 features 而不是吃默认值：0.21 的默认就是这两个，但上游哪天改默认会连带
+# 换掉 crypto 后端（ring / aws-lc-rs），而 aws-lc-rs 需要 cmake 与 C 工具链。
+webrtc = { version = "0.21", default-features = false, features = [ "runtime-tokio", "crypto-ring" ] }
+# PeerConnectionEventHandler 的实现必须挂 #[async_trait::async_trait]
+async-trait = "0.1"

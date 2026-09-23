@@ -58,5 +58,13 @@ hound = "3.5.1"
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel.workspace = true
 
+# P2P（WebRTC）只在 Windows 上编译。Phase 8 的范围就是 Windows 客户端，所以非
+# Windows 的 4 个 release 目标完全不碰这棵依赖树（净新增 41 个 crate；需要 C 工具链
+# 的 ring 本来就在树里，没有新增构建工具要求），构建风险面从 7 个目标降到 3 个。
+# 调用点不要在这里散写 cfg：见 src/core/pair/link.rs 那层 cfg 中立的 seam。
+[target."cfg(windows)".dependencies]
+webrtc.workspace = true
+async-trait.workspace = true
+
 [features]
 cargo-clippy = []
