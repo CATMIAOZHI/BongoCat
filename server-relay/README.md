@@ -98,6 +98,26 @@ openssl rand -base64 24                               # 任何 ≥16 个字符�
 
 **证书是硬要求（仅这一种模式）**：客户端用 `rustls-tls-webpki-roots` 校验，也就是**编译进客户端的那份 Mozilla 根证书库**（它**不看** Windows 的证书存储，自己往系统里装的根证书不起作用）。所以走域名时必须用**受信任证书**：自签证书连不上。裸 IP 请用下面的 direct 模式（明文 `ws://`），不要对着裸 IP 试 `https://`。
 
+## 预编译二进制（不用在服务器上编译）
+
+服务器是 2 核小机器时，`docker compose up -d` 里那步 `cargo build --release` 要十几分钟。可以直接下 CI 编好的包（`.github/workflows/relay-release.yml` 产出的）：
+
+```bash
+# relay-v1 换成实际标签。用标签地址而不是 releases/latest —— 仓库里还有客户端自己的 release
+BASE=https://github.com/CATMIAOZHI/BongoCat/releases/download/relay-v1
+curl -fLO $BASE/bongocat-pair-relay-linux-x86_64.tar.gz
+curl -fLO $BASE/bongocat-pair-relay-linux-x86_64.tar.gz.sha256
+sha256sum -c bongocat-pair-relay-linux-x86_64.tar.gz.sha256   # 校验下载完整
+tar -xzf bongocat-pair-relay-linux-x86_64.tar.gz              # 得到 bongocat-pair-relay 与 generate-pair
+./generate-pair --server                                      # 生成服务器密码（服务器上不用装 Rust）
+```
+
+包里是两个二进制：`bongocat-pair-relay`（服务本体）与 `generate-pair`（生成配对密码 / 服务器密码）。上面的 `docker compose` 流程照旧，只是不再需要 `cargo run` 与 Rust 工具链——把 `.env` 里的 `PAIR_SERVER_PASSWORD` 换成 `generate-pair --server` 的输出即可。
+
+**CI 的 runner 必须留在 ubuntu-22.04（glibc 2.35）**：服务器是 `debian:bookworm-slim`（glibc 2.36），用更新的发行版（ubuntu-latest 是 24.04 / glibc 2.39）编出来的二进制丢上去会报 `GLIBC_2.3x not found`。workflow 里那步 `Check glibc requirement` 会打印二进制要求的最高 glibc 符号并卡住超标的构建。
+
+想彻底不装编译器：把 `Dockerfile` 换成「下载 → 解压 → 拷进镜像」的版本，`docker compose build` 就只要几秒（本仓库的 `Dockerfile` 目前还是多阶段编译版）。
+
 ## 裸 IP 模式（没有域名 / 临时测试）
 
 ```bash

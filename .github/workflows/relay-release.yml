@@ -1,0 +1,100 @@
+name: Pair Relay Release
+
+# 自建中继（server-relay）的**预编译**二进制：把「服务器上 2 核编译十几分钟」换成
+# 「下载 → 解压 → 起容器」，服务器上不再需要 Rust 工具链。
+#
+# 两种触发方式：
+#   1. 打标签：`git tag relay-v1 && git push origin relay-v1` → 二进制挂到这个标签的
+#      GitHub Release 上，服务器用固定链接直接下载
+#   2. Actions 页面点 Run workflow → 产物存成 Artifact（不发 Release）
+#
+# 为什么 runner 必须是 ubuntu-22.04：服务器跑的是 debian:bookworm-slim（glibc 2.36），
+# 在 ubuntu-22.04（glibc 2.35）上编出来的二进制才跑得起来；ubuntu-latest 是 24.04
+# （glibc 2.39），编出来丢到 bookworm 上会报 GLIBC_2.3x not found。下面那步
+# 「Check glibc requirement」就是为了让这种错在 CI 里先红，而不是等部署时才发现。
+
+on:
+  push:
+    tags:
+      - 'relay-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: server-relay
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache（第二次起只要 1~2 分钟）
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-relay -> target
+
+      # --bins 会连 `generate-pair` 一起编：服务器上没装 Rust 也要能生成服务器密码
+      - name: Build release binary
+        run: cargo build --release --locked --bins
+
+      - name: Check glibc requirement
+        run: |
+          highest=$(objdump -T target/release/bongocat-pair-relay \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "二进制要求的最高 glibc 符号: ${highest:-（没有，可能是静态链接）}"
+          # 服务器是 debian:bookworm-slim = GLIBC_2.36，超过就说明 runner 选错了
+          if [ "$(printf '%s\n' GLIBC_2.36 "$highest" | sort -V | tail -1)" != "GLIBC_2.36" ]; then
+            echo "::error::$highest 高于服务器的 GLIBC_2.36，这个包在 Debian 12 上跑不起来（runner 不该换到更新的发行版）"
+            exit 1
+          fi
+
+      - name: Smoke test（真的起一次中继，确认二进制能跑）
+        env:
+          PAIR_LISTEN: 127.0.0.1:18080
+          # 只要 ≥16 个字符就行；这里只是本机起一下马上杀掉，不是任何真凭据
+          PAIR_SERVER_PASSWORD: github-actions-smoke-test-password
+        run: |
+          ./target/release/bongocat-pair-relay &
+          relay_pid=$!
+          for _ in $(seq 1 20); do
+            sleep 0.5
+            if curl -fsS http://127.0.0.1:18080/health; then break; fi
+          done
+          # 和 docker-compose.yml 里那条 healthcheck 走同一条路
+          ./target/release/bongocat-pair-relay --health-check
+          kill "$relay_pid"
+
+      - name: Pack
+        run: |
+          mkdir -p dist
+          cp target/release/bongocat-pair-relay target/release/generate-pair dist/
+          tar -czf bongocat-pair-relay-linux-x86_64.tar.gz -C dist bongocat-pair-relay generate-pair
+          sha256sum bongocat-pair-relay-linux-x86_64.tar.gz > bongocat-pair-relay-linux-x86_64.tar.gz.sha256
+          ls -lh bongocat-pair-relay-linux-x86_64.tar.gz bongocat-pair-relay-linux-x86_64.tar.gz.sha256
+
+      # 手动触发时：产物进 Artifact，在 Actions 页面下载
+      - name: Upload artifact (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bongocat-pair-relay-linux-x86_64
+          path: |
+            server-relay/bongocat-pair-relay-linux-x86_64.tar.gz
+            server-relay/bongocat-pair-relay-linux-x86_64.tar.gz.sha256
+
+      # 打标签时：产物挂到 GitHub Release 上，服务器用固定链接直接下载
+      - name: Publish to GitHub Release (tag)
+        if: startsWith(github.ref, 'refs/tags/relay-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            server-relay/bongocat-pair-relay-linux-x86_64.tar.gz
+            server-relay/bongocat-pair-relay-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true
