@@ -212,8 +212,8 @@
         "labels": {
           "connectionSettings": "Connection",
           "enabled": "Enable Duo Mode",
-          "relayUrl": "Relay URL",
-          "pairSecret": "Pair Secret",
+          "relayUrl": "Server Address",
+          "pairSecret": "Pairing Key",
           "autoConnect": "Auto Connect",
           "status": "Connection Status",
           "lastError": "Last Error",
@@ -259,8 +259,12 @@
         },
         "hints": {
           "enabled": "Turning this off disconnects immediately and stops all data sharing.",
-          "relayUrl": "Use your own Cloudflare Worker address, for example https://xxx.workers.dev.",
-          "pairSecret": "Both sides must use the same Pair Secret. It is stored in the system credential vault only, never in the settings file, and never shown in plain text.",
+          "relayUrl": "The pairing server both sides use, for example cat.example.com. A self-hosted server without a certificate can be filled in as a plain IP, for example 123.123.123.123:8080.",
+          "pairSecret": "Both sides must enter exactly the same pairing key to join the same two-person session. After generating one, send the server address and the key to the other person together. The key is stored in the system credential vault only, never in the settings file, and never shown in plain text.",
+          "plaintextServer": "This server does not use HTTPS/WSS, so the connection handshake is not protected by TLS.",
+          "secretCopied": "Pairing key copied",
+          "secretGenerated": "Generated a new pairing key and copied it to the clipboard. Send it to the other person, then save.",
+          "secretGeneratedNotCopied": "Generated a new pairing key, but copying it failed. Use Copy to send it, then save.",
           "secretConfigured": "Configured",
           "secretSaved": "Saved",
           "fingerprint": "Verification fingerprint (must match on both sides):",
@@ -300,8 +304,8 @@
           "presence": "Your partner will see that you stepped away."
         },
         "placeholders": {
-          "relayUrl": "https://xxx.workers.dev",
-          "pairSecret": "Paste Pair Secret",
+          "relayUrl": "cat.example.com or 123.123.123.123:8080",
+          "pairSecret": "Paste the pairing key",
           "remoteModel": "Same as mine",
           "awayMessage": "Going for a meal"
         },
@@ -315,6 +319,8 @@
         "buttons": {
           "save": "Save",
           "delete": "Delete",
+          "generateSecret": "Generate Key",
+          "copy": "Copy",
           "connect": "Connect",
           "disconnect": "Disconnect",
           "export": "Export",
@@ -332,7 +338,7 @@
         },
         "p2p": {
           "label": "P2P Channel",
-          "hint": "When hole punching succeeds, pet state and input stats travel directly between the two computers instead of through the relay. If it fails everything falls back to the relay unchanged.",
+          "hint": "When hole punching succeeds, pet state and input stats travel directly between the two computers instead of through the server. If it fails everything falls back to the server unchanged.",
           "off": "Off",
           "connecting": "Punching...",
           "connected": "Direct"

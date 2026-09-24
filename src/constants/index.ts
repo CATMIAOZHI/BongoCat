@@ -36,6 +36,7 @@ export const INVOKE_KEY = {
   PAIR_GET_DEVICE_ID: 'pair_get_device_id',
   PAIR_SET_SECRET: 'pair_set_secret',
   PAIR_HAS_SECRET: 'pair_has_secret',
+  PAIR_GENERATE_SECRET: 'pair_generate_secret',
   PAIR_GET_SECRET_FINGERPRINT: 'pair_get_secret_fingerprint',
   PAIR_DELETE_SECRET: 'pair_delete_secret',
   PAIR_CONNECT: 'pair_connect',

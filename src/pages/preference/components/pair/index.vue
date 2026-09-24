@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { emit } from '@tauri-apps/api/event'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { save } from '@tauri-apps/plugin-dialog'
 import { useDebounceFn } from '@vueuse/core'
 import { Alert, Badge, Button, Flex, Input, InputNumber, message, Modal, Select, Slider, Switch, Tag } from 'antdv-next'
@@ -15,6 +16,7 @@ import {
   pairConnect,
   pairDeleteSecret,
   pairDisconnect,
+  pairGenerateSecret,
   pairGetSecretFingerprint,
   pairHasSecret,
   pairHistoryExport,
@@ -35,6 +37,23 @@ const modelStore = useModelStore()
 const { t } = useI18n()
 const secretInput = ref('')
 const saving = ref(false)
+const generating = ref(false)
+
+/**
+ * §23 的明文提醒只在「它说的就是当前这个地址」时显示。
+ *
+ * Rust 侧只在连接时按当次地址算 `plaintext`，改地址不会把它清掉——直接绑上去会变成
+ * 「填了域名、却还挂着一条说 IP 是明文的提醒」。
+ */
+const plaintextServerWarning = computed(() => {
+  if (!pairStore.runtime.plaintext) return false
+
+  // 只有首尾空白和结尾的 `/` 会被 Rust 当成同一个地址，比较口径跟着它走
+  const normalize = (value?: string) => (value ?? '').trim().replace(/\/+$/, '')
+  const inUse = normalize(pairStore.runtime.relayUrl)
+
+  return inUse !== '' && inUse === normalize(pairStore.settings.relay.url)
+})
 const exportFormat = ref<ExportFormat>('json')
 const exporting = ref(false)
 const historyStats = ref<HistoryStats>({ epoch: 1, current: 0, total: 0 })
@@ -265,6 +284,48 @@ async function handleSaveSecret() {
   }
 }
 
+/**
+ * §22：密钥由 Rust 用系统 CSPRNG 生成，前端把它填进输入框（要留下得自己点保存）。
+ *
+ * 生成后**顺手复制一次**：保存会把输入框清空（明文不留在界面上），不先复制的话
+ * 「生成 → 保存 → 再复制」就永远走不通了。
+ */
+async function handleGenerateSecret() {
+  generating.value = true
+
+  try {
+    secretInput.value = await pairGenerateSecret()
+  } catch (reason) {
+    message.error(String(reason))
+    generating.value = false
+
+    return
+  }
+
+  generating.value = false
+
+  // 复制和生成分开处理：剪贴板被别的程序占着时密钥其实**已经生成、就在输入框里**，
+  // 报「生成失败」会让用户再点一次、把刚生成好的那把换掉
+  try {
+    await writeText(secretInput.value.trim())
+
+    message.success(t('pages.preference.pair.hints.secretGenerated'))
+  } catch {
+    message.warning(t('pages.preference.pair.hints.secretGeneratedNotCopied'))
+  }
+}
+
+/** 复制的是输入框里当前的值：生成之后还没保存也能先发给对方 */
+async function handleCopySecret() {
+  try {
+    await writeText(secretInput.value.trim())
+
+    message.success(t('pages.preference.pair.hints.secretCopied'))
+  } catch (reason) {
+    message.error(String(reason))
+  }
+}
+
 async function handleDeleteSecret() {
   try {
     await pairDisconnect()
@@ -333,6 +394,15 @@ const canPreviewSound = computed(
         class="w-full"
         :placeholder="$t('pages.preference.pair.placeholders.relayUrl')"
       />
+
+      <!-- §23：地址是明文时只提醒一句，绝不阻止连接 -->
+      <Alert
+        v-if="plaintextServerWarning"
+        class="mt-2 w-full"
+        :message="$t('pages.preference.pair.hints.plaintextServer')"
+        show-icon
+        type="warning"
+      />
     </ProListItem>
 
     <ProListItem
@@ -344,12 +414,27 @@ const canPreviewSound = computed(
         align="center"
         class="w-full"
         gap="small"
+        wrap
       >
         <Input.Password
           v-model:value="secretInput"
-          class="w-60"
+          class="w-56"
           :placeholder="$t('pages.preference.pair.placeholders.pairSecret')"
         />
+
+        <Button
+          :loading="generating"
+          @click="handleGenerateSecret"
+        >
+          {{ $t('pages.preference.pair.buttons.generateSecret') }}
+        </Button>
+
+        <Button
+          :disabled="!secretInput.trim()"
+          @click="handleCopySecret"
+        >
+          {{ $t('pages.preference.pair.buttons.copy') }}
+        </Button>
 
         <Button
           :disabled="!secretInput.trim()"

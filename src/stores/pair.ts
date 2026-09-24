@@ -131,6 +131,13 @@ export interface PairRuntime {
    * `0` = 还没拿到：发送侧按 v1 的 3Hz 兜底（见 `usePairState`）。
    */
   petStateHz: number
+  /** §23：服务器地址是不是明文（没有 TLS），只用来显示一条非阻塞提醒 */
+  plaintext: boolean
+  /**
+   * 上面那条提醒说的是**哪一次连接**用的地址（Rust 侧只在 `start()` 里按当次地址算
+   * `plaintext`）。界面拿它和输入框比一比，避免「改了地址、旧提醒还挂着」。
+   */
+  relayUrl?: string
   peerOnline: boolean
   peerName?: string
   remotePresence: RemotePresenceState
@@ -196,6 +203,8 @@ export const usePairStore = defineStore('pair', () => {
     connection: 'disabled',
     p2p: 'off',
     petStateHz: 0,
+    plaintext: false,
+    relayUrl: void 0,
     peerOnline: false,
     peerName: void 0,
     remotePresence: 'offline',

@@ -58,6 +58,8 @@ export function usePairStatus() {
     store.runtime.connection = store.settings.enabled ? translate(status.state) : 'disabled'
     store.runtime.p2p = store.settings.enabled ? (status.p2p ?? 'off') : 'off'
     store.runtime.petStateHz = store.settings.enabled ? (status.petStateHz ?? 0) : 0
+    store.runtime.plaintext = store.settings.enabled && (status.plaintext ?? false)
+    store.runtime.relayUrl = status.relayUrl ?? void 0
     store.runtime.peerOnline = status.peerOnline
     store.runtime.peerName = status.peerName ?? void 0
     store.runtime.remotePresence = status.peerOnline

@@ -27,6 +27,8 @@ export interface PairStatus {
    * CF 缺省与其它情况是 3（v1 的老行为）。前端不再自己判断该用哪个上限。
    */
   petStateHz?: number
+  /** §23：这次连接的地址是不是明文（`http://` / `ws://` / 裸 IP），只用于界面提醒 */
+  plaintext?: boolean
 }
 
 export type P2pState = 'off' | 'connecting' | 'connected'
@@ -52,6 +54,11 @@ export function pairSetSecret(secret: string) {
 
 export function pairHasSecret() {
   return invoke<boolean>(INVOKE_KEY.PAIR_HAS_SECRET)
+}
+
+/** 生成一个新的联机密钥（§22）：Rust 侧用系统 CSPRNG 取 32 字节，前端不自己造 */
+export function pairGenerateSecret() {
+  return invoke<string>(INVOKE_KEY.PAIR_GENERATE_SECRET)
 }
 
 /** 重启后重新读出已存 secret 的指纹；没存过时是 `null` */

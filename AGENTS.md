@@ -10,8 +10,8 @@
 ## 工作区结构
 
 - 工作区根目录就是仓库本体（BongoCat 的本地 fork），没有子仓库。
-- 双人联机功能的设计真相来源分两份：`docs/pair-plan.md`（Phase 1~6：多窗口 / Cloudflare Relay / 对方猫 / 聊天 / 附件 / 语音，修订记录 R1~R19）与 `docs/pair-plan-cloud-p2p.md`（Phase 7~9：自建中继 / P2P / 60Hz，修订记录 R20~R25）。两份都冲突时以各自的修订记录为准；跨文档冲突以 `pair-plan-cloud-p2p.md` 为准。
-- 中继有两份实现：`server-cloudflare/`（Cloudflare Worker + Durable Object）与 `server-relay/`（自建 Rust 服务，一对用户一套）。线上契约以 `server-cloudflare/README.md` 为准，两侧必须一致（自建版只多出 `server.welcome` 里可选的 `limits` / `iceServers` 字段，旧客户端忽略）。`server-relay/` 是**独立 workspace**（不在根 workspace 里），单独用 `cargo test --manifest-path server-relay/Cargo.toml` 跑测试。
+- 双人联机功能的设计真相来源分三份：`docs/pair-plan.md`（Phase 1~6：多窗口 / Cloudflare Relay / 对方猫 / 聊天 / 附件 / 语音，修订记录 R1~R19）、`docs/pair-plan-cloud-p2p.md`（Phase 7~10：自建中继 / P2P / 60Hz / reliable 通道，修订记录 R20~R33）与 `docs/pair-plan-multi-session.md`（Phase 11：一套服务器承载多个双人会话，修订记录 R34 起）。三份都冲突时以各自的修订记录为准；跨文档冲突以 `pair-plan-multi-session.md` 为准。
+- 中继有两份实现：`server-cloudflare/`（Cloudflare Worker + Durable Object，**一个部署只服务一对用户**，忽略 `X-Bongo-Room`）与 `server-relay/`（自建 Rust 服务，**一套承载多个双人会话**，按 `X-Bongo-Room` 分组）。线上契约以 `server-cloudflare/README.md` 为准，两侧必须一致（自建版多出 `server.welcome` 里可选的 `limits` / `iceServers` 字段、`/health` 的 `mode` 字段、容量满时的 HTTP 503，以及**本版必需**的 `X-Bongo-Room` 头——新客户端连两份中继都行，**旧客户端连自建版会被 HTTP 400 挡住**，所以升级自建版要先升两台设备上的客户端，见 `server-relay/README.md` 的兼容矩阵）。`server-relay/` 是**独立 workspace**（不在根 workspace 里），单独用 `cargo test --manifest-path server-relay/Cargo.toml` 跑测试。
 - `src/`：前端，Vue 3 + TypeScript + Vite + Pinia + UnoCSS + antdv-next。
 - `src-tauri/`：Rust 后端；`src-tauri/src/plugins/` 下是本仓库自带的本地插件（`admin-status`、`window`）。
 - `src-tauri/assets/models`：内置猫咪模型；`scripts/`：图标生成、发布等脚本。

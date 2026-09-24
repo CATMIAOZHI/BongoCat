@@ -212,8 +212,8 @@
         "labels": {
           "connectionSettings": "连接",
           "enabled": "启用双人联机",
-          "relayUrl": "Relay URL",
-          "pairSecret": "Pair Secret",
+          "relayUrl": "服务器地址",
+          "pairSecret": "联机密钥",
           "autoConnect": "自动连接",
           "status": "连接状态",
           "lastError": "最近一次错误",
@@ -259,8 +259,12 @@
         },
         "hints": {
           "enabled": "关闭后立即断开连接，也不会再发送任何数据。",
-          "relayUrl": "填你自己部署的 Cloudflare Worker 地址，例如 https://xxx.workers.dev。",
-          "pairSecret": "双方必须填同一个 Pair Secret。它只保存在系统凭据库里，不会写进设置文件，也不会显示明文。",
+          "relayUrl": "填写双方共同使用的联机服务器地址，例如 cat.example.com；自建服务器没有证书时也可以直接填 IP，例如 123.123.123.123:8080。",
+          "pairSecret": "双方填写完全相同的联机密钥，就会进入同一个双人联机会话。生成后请把「服务器地址」和这串密钥两个值一起发给对方。密钥只保存在系统凭据库里，不会写进设置文件，也不会显示明文。",
+          "plaintextServer": "该服务器未使用 HTTPS/WSS，连接握手信息不会受到 TLS 保护。",
+          "secretCopied": "联机密钥已复制",
+          "secretGenerated": "已生成新的联机密钥，并复制到剪贴板。把它发给对方，再点保存。",
+          "secretGeneratedNotCopied": "已生成新的联机密钥，但复制失败。请点「复制」再手动发出去，然后保存。",
           "secretConfigured": "已配置",
           "secretSaved": "已保存",
           "fingerprint": "核对指纹（双方一致才算配对成功）：",
@@ -300,8 +304,8 @@
           "presence": "开启后对方会看到你暂时离开。"
         },
         "placeholders": {
-          "relayUrl": "https://xxx.workers.dev",
-          "pairSecret": "粘贴 Pair Secret",
+          "relayUrl": "cat.example.com 或 123.123.123.123:8080",
+          "pairSecret": "粘贴联机密钥",
           "remoteModel": "与本机相同",
           "awayMessage": "去吃饭啦"
         },
@@ -315,6 +319,8 @@
         "buttons": {
           "save": "保存",
           "delete": "删除",
+          "generateSecret": "生成联机密钥",
+          "copy": "复制",
           "connect": "立即连接",
           "disconnect": "断开",
           "export": "导出",
@@ -332,7 +338,7 @@
         },
         "p2p": {
           "label": "P2P 通道",
-          "hint": "打洞成功时，猫咪状态与输入统计直接在两台电脑之间传输，不经过服务器；失败会自动走中继，功能不变。",
+          "hint": "打洞成功时，猫咪状态与输入统计直接在两台电脑之间传输，不经过服务器；失败会自动回退到服务器，功能不变。",
           "off": "未启用",
           "connecting": "打洞中...",
           "connected": "已直连"
