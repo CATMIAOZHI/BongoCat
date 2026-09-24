@@ -747,13 +747,30 @@ fn encode_description(description: &RTCSessionDescription) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::crypto::PairCipher;
+    use super::super::protocol::{FRAME_HEADER_SIZE, FrameHeader, FrameKind, NONCE_SIZE};
+    use super::super::transfer::P2P_CHUNK_SIZE;
     use super::*;
 
-    /// 两条腿在同一个进程里互相对接：不经过中继，也不需要任何外部服务。
+    /// 这一层用的 transfer id（值本身不重要，帧头里带上它只是为了让「错帧」看得出来）
+    const TRANSFER_ID: u64 = 42;
+    /// 三个用例共用的一份根密钥，不碰 `secret` / `crypto` 的跨语言固定向量。
     ///
-    /// 这是这一层唯一能自动化验证的路径——真机双端打洞是人工验收项（§10）。
-    #[tokio::test(flavor = "multi_thread")]
-    async fn two_legs_negotiate_and_open_the_channel() {
+    /// 真实路径是 `crypto::derive_transfer_key(root, transfer_id)`，这里直接拿根密钥当
+    /// cipher key：用例只关心**线上长度与字节边界**，而封帧开销（帧头 + nonce + tag）
+    /// 与密钥是什么完全无关。
+    const ROOT_KEY: [u8; 32] = [7; 32];
+    /// Poly1305 认证标签的长度（`transfer::AEAD_TAG_SIZE` 是私有的，这里只为对拍尺寸）
+    const TAG_SIZE: usize = 16;
+
+    /// 两条腿在同一个进程里互相对接：不经过中继，不需要第二台机器，也不需要任何外部服务。
+    ///
+    /// 这是这一层唯一能自动化验证的路径——跨 NAT 的打洞成功率是人工验收项（§10），
+    /// 但「真的 SCTP / DataChannel 能不能把这一帧送过去」在本机就能验。
+    ///
+    /// 返回两条腿**与两边的接收端**：两条事件流都要留着，丢掉任何一侧的接收端都会让
+    /// 那一侧的驱动循环再也送不出信令（发送失败被忽略，腿会一直停在协商中）。
+    async fn connect_two_legs() -> (P2pLink, P2pLink, P2pEvents, P2pEvents) {
         let (link_a, mut events_a) = P2pLink::spawn("a".to_string(), Vec::new());
         let (link_b, mut events_b) = P2pLink::spawn("b".to_string(), Vec::new());
 
@@ -788,6 +805,47 @@ mod tests {
             "30 秒内没有打通：a_open={a_open:?} b_open={b_open:?}"
         );
 
+        (link_a, link_b, events_a, events_b)
+    }
+
+    /// 一段可校验的伪随机负载：任意一块被重复、跳号或截断，逐字节比较都会失败
+    fn source_bytes(length: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut bytes = Vec::with_capacity(length);
+
+        while bytes.len() < length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push((state >> 24) as u8);
+        }
+
+        bytes
+    }
+
+    /// 按真的分片形状封帧：`TransferChunk` + 48 KiB 明文（`manager.rs` 在 Direct 那一单
+    /// 用的就是 `P2P_CHUNK_SIZE`）
+    fn seal_chunks(cipher: &PairCipher, payload: &[u8]) -> Vec<Vec<u8>> {
+        payload
+            .chunks(P2P_CHUNK_SIZE)
+            .enumerate()
+            .map(|(index, chunk)| {
+                let header = FrameHeader {
+                    kind: FrameKind::TransferChunk,
+                    flags: 0,
+                    transfer_id: TRANSFER_ID,
+                    seq: index as u32,
+                };
+
+                cipher.seal(&header, chunk).expect("封帧")
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_legs_negotiate_and_open_the_channel() {
+        let (link_a, _link_b, _events_a, mut events_b) = connect_two_legs().await;
+
         // 两条通道都是双向的：A 各发一帧，B 应该在同一条 lane 上原样收到
         link_a.send(Lane::Replaceable, vec![1, 2, 3]);
         link_a.send(Lane::Reliable, vec![4, 5, 6]);
@@ -817,10 +875,249 @@ mod tests {
         assert_eq!(seen[1], Some(vec![4, 5, 6]), "可靠通道");
     }
 
+    /// §10：48 KiB 的分片**真的**过 DataChannel。
+    ///
+    /// 假腿单测能证明「按 48 KiB 切块、序号连续」，证明不了这一帧过不过得了 SCTP /
+    /// DataChannel（消息大小、分片重组、顺序）。这里两条腿在同一进程里，但数据全程走
+    /// 真的 host candidate——**不需要第二台机器，也不需要中继**。
+    ///
+    /// 结尾故意多一个字节：真实附件的最后一块总是短块（`transfer::chunk_length`），
+    /// 而短帧过不过得了 SCTP 是另一个问题，不能只在整块上验。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reliable_lane_carries_real_48kib_chunks() {
+        const CHUNKS: usize = 24;
+
+        let (link_a, _link_b, _events_a, mut events_b) = connect_two_legs().await;
+
+        let payload = source_bytes(P2P_CHUNK_SIZE * CHUNKS + 1);
+        let cipher = PairCipher::new(&ROOT_KEY);
+        let frames = seal_chunks(&cipher, &payload);
+
+        // 24 块整块 + 1 个 1 字节的短块
+        assert_eq!(frames.len(), CHUNKS + 1);
+        assert_eq!(
+            frames[0].len(),
+            P2P_CHUNK_SIZE + FRAME_HEADER_SIZE + NONCE_SIZE + TAG_SIZE,
+            "上线长度该是 48 KiB 明文加分片开销"
+        );
+        assert_eq!(
+            frames.last().unwrap().len(),
+            1 + FRAME_HEADER_SIZE + NONCE_SIZE + TAG_SIZE,
+            "短块的上线长度只有 1 字节明文"
+        );
+
+        for frame in &frames {
+            link_a.send(Lane::Reliable, frame.clone());
+        }
+
+        let received = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut sequence = Vec::new();
+            let mut rebuilt = Vec::new();
+            let mut last_length = 0;
+
+            while sequence.len() < frames.len() {
+                match events_b.next().await {
+                    Some(P2pEvent::Inbound(Lane::Reliable, bytes)) => {
+                        let (header, plain) = cipher.open(&bytes).expect("解密这一帧");
+
+                        assert_eq!(header.kind, FrameKind::TransferChunk);
+                        assert_eq!(header.transfer_id, TRANSFER_ID);
+
+                        last_length = plain.len();
+                        sequence.push(header.seq);
+                        rebuilt.extend_from_slice(&plain);
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+
+            (sequence, rebuilt, last_length)
+        })
+        .await
+        .expect("60 秒内 25 块都该到");
+
+        assert_eq!(
+            received.0,
+            (0..(CHUNKS + 1) as u32).collect::<Vec<_>>(),
+            "序号必须严格递增，一块都不能少"
+        );
+        assert_eq!(received.2, 1, "最后一块该是 1 字节的短块");
+        assert_eq!(
+            received.1.len(),
+            payload.len(),
+            "拼回来的长度该和源字节一样"
+        );
+        assert_eq!(received.1, payload, "拼回来必须逐字节一致");
+    }
+
+    /// §10 / R32：DC 的发送缓冲真的会压到上限、也真的能排空翻回来（`writable`）。
+    ///
+    /// 灌进去的分片远多于 192 KiB 的发送缓冲上限，所以「压满 → `writable` 翻假」与
+    /// 「排空 → 低水位事件翻回真」这两件事都能在本机跑出来：真的 SCTP 发送缓冲就在这个
+    /// 进程里。压满之后逐字节一致，说明等待期间一块都没被丢掉或写坏。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_send_buffer_really_fills_and_drains() {
+        /// 200 块 48 KiB ≈ 9.4 MiB，远多于 192 KiB 的上限
+        const CHUNKS: usize = 200;
+
+        let (link_a, _link_b, _events_a, mut events_b) = connect_two_legs().await;
+
+        let payload = source_bytes(P2P_CHUNK_SIZE * CHUNKS);
+        let cipher = PairCipher::new(&ROOT_KEY);
+        let frames = seal_chunks(&cipher, &payload);
+
+        assert!(link_a.writable(), "刚开好的通道该是可写的");
+
+        // 一口气灌进去：驱动循环一边发一边等缓冲，越过上限就会把标志翻假
+        for frame in &frames {
+            link_a.send(Lane::Reliable, frame.clone());
+        }
+
+        let blocked = tokio::time::timeout(Duration::from_secs(30), async {
+            while link_a.writable() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            blocked.is_ok(),
+            "灌了 {} KiB 都没把发送缓冲压到上限（{} KiB）：背压等于没生效",
+            payload.len() / 1024,
+            SEND_BUFFER_LIMIT / 1024
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(120), async {
+            let mut rebuilt = Vec::new();
+
+            while rebuilt.len() < payload.len() {
+                match events_b.next().await {
+                    Some(P2pEvent::Inbound(Lane::Reliable, bytes)) => {
+                        let (_, plain) = cipher.open(&bytes).expect("解密这一帧");
+
+                        rebuilt.extend_from_slice(&plain);
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+
+            rebuilt
+        })
+        .await
+        .expect("120 秒内 200 块都该到");
+
+        assert_eq!(received, payload, "压满再排空之后拼回来必须逐字节一致");
+
+        let drained = tokio::time::timeout(Duration::from_secs(30), async {
+            while !link_a.writable() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            drained.is_ok(),
+            "排空之后背压没有翻回来：低水位事件（OnBufferedAmountLow）没到"
+        );
+    }
+
     fn lane_index(lane: Lane) -> usize {
         match lane {
             Lane::Replaceable => 0,
             Lane::Reliable => 1,
         }
+    }
+
+    /// §10 的「中途拔掉 P2P」在**线上格式**那一半：真的把腿拔掉时，对面只会少收整块，
+    /// 绝不会收到半块、错块或乱序的块。
+    ///
+    /// 会话层那一半（`direct_lost()` → 钉在 DC 上的那一单按 §43 失败、中继上补一条
+    /// `transfer.cancel`、中继那一单不受影响）由 `manager.rs` 的
+    /// `losing_the_direct_leg_fails_its_transfer_and_cancels_it_over_the_relay` 覆盖：
+    /// 会话层没有真的「拔腿」入口，所以那个动作只能直接调用。这里管的是接收侧看到的
+    /// 字节边界。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_leg_mid_burst_never_delivers_a_torn_chunk() {
+        const CHUNKS: usize = 8;
+        /// 先收到几块再拔线：太早拔可能一块都还没到，就测不出「线上的块是完整的」
+        const EARLY: usize = 2;
+
+        let (link_a, _link_b, _events_a, mut events_b) = connect_two_legs().await;
+
+        let payload = source_bytes(P2P_CHUNK_SIZE * CHUNKS);
+        let cipher = PairCipher::new(&ROOT_KEY);
+        let frames = seal_chunks(&cipher, &payload);
+
+        for frame in &frames {
+            link_a.send(Lane::Reliable, frame.clone());
+        }
+
+        let early = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut early = Vec::new();
+
+            while early.len() < EARLY {
+                match events_b.next().await {
+                    Some(P2pEvent::Inbound(Lane::Reliable, bytes)) => early.push(bytes),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+
+            early
+        })
+        .await
+        .expect("30 秒内前两块该到");
+
+        assert_eq!(early.len(), EARLY, "拔线之前该已经收到前两块");
+
+        // 拔线：`Drop` 发的 `Input::Stop` 与上面那 8 帧走的是同一条 FIFO，所以驱动循环会先把
+        // 8 帧交给 SCTP 的发送缓冲、再关掉 PeerConnection（已经上路的帧仍可能到对端；
+        // 到不了的只是没发出去的那部分）。
+        drop(link_a);
+
+        // 接收侧多久之后才**发现**对端没了（ICE 的 consent freshness 是几十秒量级）不由这一层
+        // 决定，所以这里只做一个有界窗口的观察：**窗口里到过**的每一块都必须是整块且有序的。
+        let late = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut late = Vec::new();
+
+            while let Some(event) = events_b.next().await {
+                if let P2pEvent::Inbound(Lane::Reliable, bytes) = event {
+                    late.push(bytes);
+                }
+            }
+
+            late
+        })
+        .await
+        .unwrap_or_default();
+
+        let received: Vec<Vec<u8>> = early.into_iter().chain(late).collect();
+
+        assert!(
+            received.len() <= CHUNKS,
+            "收到 {} 块，超过发出去的 {CHUNKS} 块",
+            received.len()
+        );
+
+        let mut rebuilt = Vec::new();
+
+        for (index, bytes) in received.iter().enumerate() {
+            // 解不开就是线上格式被截断或被拼接了——接收侧会把它当成另一单的分片
+            let (header, plain) = cipher.open(bytes).expect("掉线不能送出半块：这一帧解不开");
+
+            assert_eq!(header.seq, index as u32, "拔线的间隙也不能乱序");
+            assert_eq!(plain.len(), P2P_CHUNK_SIZE, "每一块都该是整块");
+
+            rebuilt.extend_from_slice(&plain);
+        }
+
+        // 收到的那几块必须是源字节的**前缀**：少收可以（对端拔线了），错位不行
+        assert_eq!(
+            rebuilt,
+            payload[..rebuilt.len()].to_vec(),
+            "收到的那几块该是源字节的前缀"
+        );
     }
 }

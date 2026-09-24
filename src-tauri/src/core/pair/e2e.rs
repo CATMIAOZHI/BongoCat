@@ -10,10 +10,13 @@
 //! cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored --nocapture
 //! ```
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::client;
@@ -123,6 +126,107 @@ async fn wait_for<F: Fn() -> bool>(predicate: F, timeout: Duration) -> bool {
     }
 
     predicate()
+}
+
+/// 挡在真中继前面的字节计数器（§10 的单机版「服务器转发量」观测）。
+///
+/// 只做 TCP 转发与计数，**不解析 WebSocket**：所以两个方向的字节数包含握手、心跳与帧头
+/// 开销——用例要的正是「服务器到底经手了多少字节」的上界。
+struct ProxyBytes {
+    /// 客户端 -> 中继（中继真正收到并转发的量）
+    to_relay: AtomicU64,
+    /// 中继 -> 客户端
+    to_client: AtomicU64,
+}
+
+impl ProxyBytes {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.to_relay.load(Ordering::Relaxed),
+            self.to_client.load(Ordering::Relaxed),
+        )
+    }
+}
+
+enum Direction {
+    ToRelay,
+    ToClient,
+}
+
+/// 在中继前面起一个计数代理，返回它的地址与计数器。
+///
+/// 客户端把它当成中继地址填进去即可：中继只按路径（`/ws`）、鉴权头与协议版本判断
+/// 要不要升级，不校验 Host，所以中间多一跳不影响握手。
+async fn counting_proxy(upstream: SocketAddr) -> (SocketAddr, Arc<ProxyBytes>) {
+    let bytes = Arc::new(ProxyBytes {
+        to_relay: AtomicU64::new(0),
+        to_client: AtomicU64::new(0),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("计数代理的监听端口");
+    let address = listener.local_addr().expect("计数代理的地址");
+    let counts = Arc::clone(&bytes);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                break;
+            };
+            let Ok(relay) = tokio::net::TcpStream::connect(upstream).await else {
+                // 连不上中继只丢这一条连接：重连由客户端自己退避
+                continue;
+            };
+            let counts = Arc::clone(&counts);
+
+            tokio::spawn(async move {
+                let (client_read, client_write) = client.into_split();
+                let (relay_read, relay_write) = relay.into_split();
+
+                tokio::join!(
+                    pump(
+                        client_read,
+                        relay_write,
+                        Arc::clone(&counts),
+                        Direction::ToRelay
+                    ),
+                    pump(relay_read, client_write, counts, Direction::ToClient),
+                );
+            });
+        }
+    });
+
+    (address, bytes)
+}
+
+async fn pump<R, W>(mut reader: R, mut writer: W, counts: Arc<ProxyBytes>, direction: Direction)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; 16 * 1024];
+
+    loop {
+        let Ok(read) = reader.read(&mut buffer).await else {
+            break;
+        };
+
+        if read == 0 {
+            break;
+        }
+
+        if writer.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+
+        match direction {
+            Direction::ToRelay => counts.to_relay.fetch_add(read as u64, Ordering::Relaxed),
+            Direction::ToClient => counts.to_client.fetch_add(read as u64, Ordering::Relaxed),
+        };
+    }
+
+    // 一边结束就把另一半的写方向也关掉，让对端一起收尾
+    let _ = writer.shutdown().await;
 }
 
 /// 两个客户端通过真实中继交换一条加密的 Presence 消息
@@ -968,4 +1072,223 @@ async fn two_clients_open_a_p2p_channel_through_the_relay() {
     .await;
 
     assert!(reset, "断开后 P2P 状态没有复位：{:?}", last_p2p(&sink_a));
+}
+
+/// §10 的单机版「服务器转发量」观测：真的附件**走 DC**，中继在那个窗口里只看到信令。
+///
+/// 跨 NAT 的成功率只能人工双机验；但「分片到底走没走中继」在本机就能量出来：用例在中继
+/// 前面挡一个纯 TCP 的字节计数器，两个客户端都连到它上面。作为对照，同一条链路上
+/// `two_clients_exchange_a_file_through_the_relay` 会把整个文件都推过服务器——**它不等
+/// P2P**（offer 早于 `reliable_verified`，这一单因此钉在中继上），自己并不校验路由；那份
+/// 对照是单独量过的：同一个 1.5 MiB 的负载让中继经手 1,572,864 字节 + 约 5 KB 开销。
+///
+/// 需要 `http://host:port` 形式的 relay（计数代理只转发裸 TCP），本机自建中继就是这一种。
+/// 别的形态（例如已经部署好的 https 中继）上这条用例会**跳过**——打印一行就返回，而
+/// `--ignored` 全跑时跳过的用例仍算通过，所以「7/7」在这条用例上不等于「计数真的量过」。
+#[tokio::test]
+#[ignore = "需要本地或已部署的 relay，见文件头说明"]
+async fn a_file_takes_the_data_channel_and_barely_touches_the_relay() {
+    let Some((relay, secret_text)) = e2e_config() else {
+        eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
+
+        return;
+    };
+
+    let Some(upstream) = relay
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .parse::<SocketAddr>()
+        .ok()
+    else {
+        eprintln!("跳过：这条用例需要 `http://host:port` 形式的 relay，收到 {relay}");
+
+        return;
+    };
+
+    let _guard = e2e_lock();
+
+    let (proxy, counts) = counting_proxy(upstream).await;
+    let through_proxy = format!("http://{proxy}");
+
+    let store_a = memory_store();
+    let store_b = memory_store();
+    let sink_a = Arc::new(RecordingSink::default());
+    let sink_b = Arc::new(RecordingSink::default());
+    let history_a = memory_history();
+    let history_b = memory_history();
+    let manager_a = Arc::new(PairManager::new(
+        "e2e-dc-file-a".into(),
+        sink_a.clone(),
+        Arc::clone(&history_a),
+        store_a.clone(),
+    ));
+    let manager_b = Arc::new(PairManager::new(
+        "e2e-dc-file-b".into(),
+        sink_b.clone(),
+        Arc::clone(&history_b),
+        store_b.clone(),
+    ));
+
+    manager_a.start(&through_proxy, Some(&secret_text)).unwrap();
+    manager_b.start(&through_proxy, Some(&secret_text)).unwrap();
+
+    let connected = wait_for(
+        || {
+            sink_a.last_state() == Some(PairConnectionState::Connected)
+                && sink_b.last_state() == Some(PairConnectionState::Connected)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(
+        connected,
+        "两端没有进入 Connected：A={:?} B={:?} errors={:?}",
+        sink_a.last_state(),
+        sink_b.last_state(),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // 打洞要等 ICE：本机两个进程之间是秒级，留 30 秒余量
+    let opened = wait_for(
+        || {
+            last_p2p(&sink_a).as_deref() == Some("connected")
+                && last_p2p(&sink_b).as_deref() == Some("connected")
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        opened,
+        "P2P 没有打通：A={:?} B={:?} errors={:?}",
+        last_p2p(&sink_a),
+        last_p2p(&sink_b),
+        (sink_a.errors(), sink_b.errors())
+    );
+
+    // 附件那一单在 offer 之前就钉腿，而 `reliable` 那条通道要等它自己的 ping / pong 回来
+    // 才算「验过」（`reliable_verified`；UI 的 `p2p` 只描述可覆盖那条腿）。本机往返是毫秒
+    // 级，这里给 2 秒。真有偏差也不会假通过——下面那条断言会把绕中继的一单抓出来。
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (to_relay_before, _) = counts.snapshot();
+
+    assert!(
+        to_relay_before > 0,
+        "计数代理不在链路上：握手与打洞的信令也该经过它"
+    );
+
+    // A 发一个 1.5 MiB 的附件：多一个字节，让最后一块是真实的**短块**（Direct 那一单按
+    // 48 KiB 切，32 块整块 + 1 个 1 字节的短块）
+    let payload: Vec<u8> = (0..(1024 * 1536 + 1))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let source = store_a.root().join("直连分片.bin");
+
+    std::fs::create_dir_all(store_a.root()).unwrap();
+    std::fs::write(&source, &payload).unwrap();
+
+    let (sha256, size) = sha256_file(&source).unwrap();
+    let message_id = "e2e-dc-file-message".to_string();
+    let attachment_id = "e2e-dc-file-attachment".to_string();
+
+    history_a
+        .upsert_attachment(&NewAttachment {
+            id: attachment_id.clone(),
+            kind: MessageKind::File,
+            original_name: Some("直连分片.bin".into()),
+            mime: Some("application/octet-stream".into()),
+            size: Some(size),
+            sha256: Some(sha256.clone()),
+            local_path: Some(source.to_string_lossy().to_string()),
+            created_at: 0,
+        })
+        .unwrap();
+    history_a
+        .insert(&NewMessage::outgoing_attachment(
+            message_id.clone(),
+            MessageKind::File,
+            attachment_id.clone(),
+            0,
+            history_a.epoch().unwrap(),
+        ))
+        .unwrap();
+
+    manager_a
+        .start_transfer(OutgoingRequest {
+            transfer_id: super::manager::new_transfer_id(),
+            message_id: message_id.clone(),
+            attachment_id,
+            kind: TransferKind::File,
+            name: "直连分片.bin".into(),
+            mime: "application/octet-stream".into(),
+            size,
+            sha256,
+            path: source,
+        })
+        .unwrap();
+
+    // B 收完并落盘
+    let received = wait_for(
+        || {
+            history_b
+                .find(&message_id)
+                .ok()
+                .flatten()
+                .map(|message| message.status)
+                == Some(MessageStatus::Received)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        received,
+        "B 没有收下附件：errors={:?}",
+        (sink_b.errors(), sink_a.errors())
+    );
+
+    let (to_relay_after, _) = counts.snapshot();
+    let forwarded = to_relay_after - to_relay_before;
+
+    let message = history_b.find(&message_id).unwrap().unwrap();
+    let path = message
+        .attachment
+        .expect("B 的附件记录")
+        .local_path
+        .expect("B 的落盘路径");
+
+    assert_eq!(std::fs::read(&path).unwrap(), payload, "落盘内容必须一致");
+
+    // 这一条是「服务器转发量下降」的单机证据：文件走了 DC 的话，中继在这个窗口里只剩
+    // 心跳（与可能的状态帧）。真走中继的话它会至少看到整个文件的大小。
+    assert!(
+        forwarded < payload.len() as u64 / 8,
+        "这一单看起来绕了中继：窗口内中继经手 {forwarded} 字节（文件 {} 字节）",
+        payload.len()
+    );
+
+    // 传完这条腿还得在：附件不该把 DC 用坏
+    assert_eq!(
+        last_p2p(&sink_a).as_deref(),
+        Some("connected"),
+        "A 的 P2P 腿在传输后掉了：errors={:?}",
+        sink_a.errors()
+    );
+    assert_eq!(
+        last_p2p(&sink_b).as_deref(),
+        Some("connected"),
+        "B 的 P2P 腿在传输后掉了：errors={:?}",
+        sink_b.errors()
+    );
+
+    eprintln!(
+        "单机观测：文件 {} 字节，窗口内中继经手 {forwarded} 字节（{}%）",
+        payload.len(),
+        forwarded * 100 / payload.len() as u64
+    );
+
+    manager_a.disconnect();
+    manager_b.disconnect();
 }

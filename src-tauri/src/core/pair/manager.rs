@@ -5847,6 +5847,154 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// §43 / §10 第 4 条的落地：可靠那条腿不可用时，**钉在它上面的那一单**本地判失败，
+    /// 并且在中继上补一条 `transfer.cancel`；钉在中继上的那一单一点都不受牵连。
+    ///
+    /// 这条直接调 [`direct_lost`]：会话层没有「真的拔掉一条 DC 腿」的入口（真拔腿只能在
+    /// `p2p.rs` 的用例里做，而那层拿不到会话表），所以「收尾」这个动作本身只能钉在这里。
+    /// `p2p.rs` 的 `dropping_the_leg_mid_burst_never_delivers_a_torn_chunk` 管的是另一半
+    /// （拔腿时线上不会出现半块）。
+    #[tokio::test]
+    async fn losing_the_direct_leg_fails_its_transfer_and_cancels_it_over_the_relay() {
+        let store = TransferStore::new(temp_root("direct-lost"));
+        let (manager, sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let payload: Vec<u8> = vec![9u8; 4096];
+        let (source, size, sha256) = source_file(&root, &payload);
+
+        for (message_id, attachment_id) in [("m-direct", "a-direct"), ("m-relay", "a-relay")] {
+            manager
+                .history
+                .insert(&NewMessage::outgoing_attachment(
+                    message_id.into(),
+                    MessageKind::File,
+                    attachment_id.into(),
+                    0,
+                    1,
+                ))
+                .unwrap();
+            manager
+                .history
+                .upsert_attachment(&NewAttachment {
+                    id: attachment_id.into(),
+                    kind: MessageKind::File,
+                    original_name: Some("x.bin".into()),
+                    mime: Some("application/octet-stream".into()),
+                    size: Some(size),
+                    sha256: Some(sha256.clone()),
+                    local_path: Some(source.to_string_lossy().to_string()),
+                    created_at: 0,
+                })
+                .unwrap();
+        }
+
+        // 两条会话：一条钉在可靠腿上（DC 那一单），一条钉在中继上
+        for (transfer_id, message_id, attachment_id, route) in [
+            (71, "m-direct", "a-direct", link::Route::Direct),
+            (72, "m-relay", "a-relay", link::Route::Relay),
+        ] {
+            start_outgoing_transfer(
+                &manager,
+                &mut state,
+                OutgoingRequest {
+                    transfer_id,
+                    message_id: message_id.into(),
+                    attachment_id: attachment_id.into(),
+                    kind: TransferKind::File,
+                    name: "x.bin".into(),
+                    mime: "application/octet-stream".into(),
+                    size,
+                    sha256: sha256.clone(),
+                    path: source.clone(),
+                },
+                route,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(state.transfers.len(), 2);
+
+        let mut socket = RecordingSocket::default();
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+
+        // 先把两条 offer 推出去（都是中继那条线：没有 DC 腿）
+        flush(&mut socket, &mut state, &mut pacer, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(socket.sent.len(), 2, "两条 offer");
+
+        socket.sent.clear();
+
+        let tokens_before = pacer.tokens;
+
+        direct_lost(&mut socket, &manager, 0, &mut state, &mut pacer)
+            .await
+            .unwrap();
+
+        // DC 那一单：本地判失败 + 中继上补一条 cancel
+        assert!(
+            !state.transfers.contains_key(&71),
+            "钉在 DC 上的那一单该被收掉"
+        );
+        assert_eq!(
+            manager.history.find("m-direct").unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+
+        assert_eq!(socket.sent.len(), 1, "cancel 只该有一条");
+
+        let Message::Binary(frame) = &socket.sent[0] else {
+            panic!("cancel 必须是二进制帧");
+        };
+        let (header, plain) = PairCipher::new(&ROOT_KEY).open(frame).unwrap();
+        let cancel = AppEnvelope::from_bytes(&plain).unwrap();
+
+        assert_eq!(header.kind, FrameKind::TransferControl);
+        assert_eq!(cancel.message_type, message_type::TRANSFER_CANCEL);
+        assert_eq!(cancel.payload["transferId"], json!(71));
+
+        // 用户看到的那句话（`close_transfer` 的 reason）也要有断言钉着
+        assert!(
+            sink.payloads(EVENT_TRANSFER)
+                .iter()
+                .any(|payload| payload["transferId"] == 71 && payload["state"] == "failed"),
+            "UI 该看到那一单失败：{:?}",
+            sink.payloads(EVENT_TRANSFER)
+        );
+        assert!(
+            sink.payloads(EVENT_ERROR)
+                .iter()
+                .any(|payload| payload["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("P2P 通路断开"))),
+            "失败原因该报出来：{:?}",
+            sink.payloads(EVENT_ERROR)
+        );
+
+        // cancel 走的是中继那条线：额度和 DC 那条腿无关
+        assert!(
+            (pacer.tokens - (tokens_before - 1.0)).abs() < 0.05,
+            "cancel 该吃中继的帧额度：{} -> {}",
+            tokens_before,
+            pacer.tokens
+        );
+
+        // 中继那一单原封不动：DC 掉了不该牵连它
+        let relay = state.transfers.get(&72).expect("中继那一单还在");
+
+        assert_eq!(relay.route, link::Route::Relay);
+        assert_eq!(relay.phase, TransferPhase::AwaitingAccept);
+        // `Sent` 而不是 `Pending`：上面那条 offer 已经推出去了
+        assert_eq!(
+            manager.history.find("m-relay").unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// §81：0 字节文件没有分片可发，`transfer.complete` 只能在收到 accept 时立刻补一条。
     /// 少了它两边会停在 sending / receiving，一直到断线才被判失败。
     #[tokio::test]
