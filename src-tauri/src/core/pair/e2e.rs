@@ -5,7 +5,7 @@
 //!
 //! ```powershell
 //! $env:BONGO_PAIR_E2E_RELAY = "http://127.0.0.1:8787"
-//! $env:BONGO_PAIR_E2E_SECRET = "<联机密钥（两端填同一个值）>"
+//! $env:BONGO_PAIR_E2E_SECRET = "<配对密码（两端填同一个值）>"
 //! $env:BONGO_PAIR_HEARTBEAT_SECS = "2"
 //! cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored --nocapture
 //! ```
@@ -108,6 +108,20 @@ fn e2e_config() -> Option<(String, String)> {
     }
 
     Some((relay, secret))
+}
+
+/// R36：这一版自建中继会要求服务器密码，跑 e2e 时用 `BONGO_PAIR_E2E_SERVER_PASSWORD`
+/// 传进来。没设就不带 `X-Bongo-Server` 头——旧的单会话中继与 Cloudflare 版仍然是
+/// 同一批用例跑得通的（这正是「不改协议也能兼容」的证据）。
+fn e2e_server_password() -> Option<String> {
+    std::env::var("BONGO_PAIR_E2E_SERVER_PASSWORD")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// 服务器密码 → 升级头里的凭据
+fn e2e_server_token() -> Option<String> {
+    e2e_server_password().map(|password| super::crypto::derive_server_token(&password))
 }
 
 /// 端到端用例必须串行执行。
@@ -263,8 +277,8 @@ async fn two_clients_exchange_encrypted_presence() {
         memory_store(),
     ));
 
-    manager_a.start(&relay, Some(&secret_text)).unwrap();
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_a.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let connected = wait_for(
         || {
@@ -368,7 +382,7 @@ async fn two_rooms_share_one_relay_without_crossing() {
             memory_store(),
         ));
 
-        manager.start(&relay, Some(secret)).unwrap();
+        manager.start(&relay, Some(secret), e2e_server_password().as_deref()).unwrap();
 
         rooms.push((device_id, manager, sink));
     }
@@ -575,8 +589,8 @@ async fn two_clients_exchange_encrypted_chat_messages() {
         memory_store(),
     ));
 
-    manager_a.start(&relay, Some(&secret_text)).unwrap();
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_a.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let connected = wait_for(
         || {
@@ -658,7 +672,7 @@ async fn two_clients_exchange_encrypted_chat_messages() {
         "B 离线期间不该收到消息"
     );
 
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let resent = wait_for(
         || sink_b.status_events(EVENT_MESSAGE_RECEIVED).len() == 2,
@@ -724,8 +738,8 @@ async fn offline_backlog_is_delivered_without_tripping_the_relay_limit() {
         memory_store(),
     ));
 
-    manager_a.start(&relay, Some(&secret_text)).unwrap();
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_a.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let connected = wait_for(
         || {
@@ -770,7 +784,7 @@ async fn offline_backlog_is_delivered_without_tripping_the_relay_limit() {
     );
 
     // B 回来：A 补发 40 帧（20 帧突发 + 20 帧按 20/s），仍在中继 30 帧/秒的额度内
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let all_arrived = wait_for(
         || sink_b.status_events(EVENT_MESSAGE_RECEIVED).len() == BACKLOG,
@@ -862,8 +876,8 @@ async fn two_clients_exchange_a_file_through_the_relay() {
         store_b.clone(),
     ));
 
-    manager_a.start(&relay, Some(&secret_text)).unwrap();
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_a.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let connected = wait_for(
         || {
@@ -1025,7 +1039,7 @@ async fn stays_connected_across_heartbeats() {
         memory_store(),
     ));
 
-    manager.start(&relay, Some(&secret_text)).unwrap();
+    manager.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     assert!(
         wait_for(
@@ -1038,9 +1052,15 @@ async fn stays_connected_across_heartbeats() {
     );
 
     // 用第二个连接观察心跳：客户端每心跳发一次 WS ping，中继应当回 pong
-    let mut observer = client::connect(&relay, &room_id, &auth_token, "e2e-heartbeat-peer")
-        .await
-        .unwrap();
+    let mut observer = client::connect(
+        &relay,
+        &room_id,
+        &auth_token,
+        e2e_server_token().as_deref(),
+        "e2e-heartbeat-peer",
+    )
+    .await
+    .unwrap();
     let _ = client::send_message(&mut observer, tungstenite_ping()).await;
 
     let heard_pong = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1093,7 +1113,7 @@ async fn unreachable_relay_enters_reconnecting() {
         memory_store(),
     ));
 
-    manager.start("http://127.0.0.1:1", Some(&secret)).unwrap();
+    manager.start("http://127.0.0.1:1", Some(&secret), None).unwrap();
 
     let reconnecting = wait_for(
         || sink.last_state() == Some(PairConnectionState::Reconnecting),
@@ -1171,8 +1191,8 @@ async fn two_clients_open_a_p2p_channel_through_the_relay() {
         memory_store(),
     ));
 
-    manager_a.start(&relay, Some(&secret_text)).unwrap();
-    manager_b.start(&relay, Some(&secret_text)).unwrap();
+    manager_a.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
+    manager_b.start(&relay, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let connected = wait_for(
         || {
@@ -1263,9 +1283,15 @@ async fn two_clients_open_a_p2p_channel_through_the_relay() {
     let secret = crypto::decode_pair_secret(&secret_text).unwrap();
     let auth_token = crypto::derive_auth_token(&secret);
     let room_id = crypto::derive_room_id(&secret);
-    let replacement = client::connect(&relay, &room_id, &auth_token, "e2e-p2p-a")
-        .await
-        .unwrap();
+    let replacement = client::connect(
+        &relay,
+        &room_id,
+        &auth_token,
+        e2e_server_token().as_deref(),
+        "e2e-p2p-a",
+    )
+    .await
+    .unwrap();
 
     let replaced = wait_for(
         || p2p_while(&sink_a, "reconnecting").is_some(),
@@ -1355,8 +1381,8 @@ async fn a_file_takes_the_data_channel_and_barely_touches_the_relay() {
         store_b.clone(),
     ));
 
-    manager_a.start(&through_proxy, Some(&secret_text)).unwrap();
-    manager_b.start(&through_proxy, Some(&secret_text)).unwrap();
+    manager_a.start(&through_proxy, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
+    manager_b.start(&through_proxy, Some(&secret_text), e2e_server_password().as_deref()).unwrap();
 
     let connected = wait_for(
         || {

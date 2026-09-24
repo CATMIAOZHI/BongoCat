@@ -29,6 +29,7 @@ pub const AUTH_INFO: &[u8] = b"bongocat-pair-auth-v1";
 pub const E2EE_INFO: &[u8] = b"bongocat-pair-e2ee-v1";
 pub const TRANSFER_INFO: &[u8] = b"bongocat-pair-transfer-v1";
 pub const ROOM_INFO: &[u8] = b"bongocat-pair-room-v1";
+pub const SERVER_INFO: &[u8] = b"bongocat-pair-server-v1";
 pub const PAIR_SECRET_BYTES: usize = 32;
 /// `ROOM_ID` 的文本形态：32 字节的 base64url 无填充，固定 43 个字符。
 pub const ROOM_ID_LENGTH: usize = 43;
@@ -62,6 +63,18 @@ pub fn derive_room_id(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
     URL_SAFE_NO_PAD.encode(hkdf_sha256(secret, ROOM_INFO))
 }
 
+/// 从「服务器密码」派生 `X-Bongo-Server` 里要带的凭据（R36，base64url 无填充，43 字符）。
+///
+/// 注意它的输入与上面那三条**完全不同**：不是 32 字节的 Pair Secret，而是部署者自己
+/// 在服务器上设置的任意长度文本。所以它不参与「两个人是不是同一对」的判断，只回答
+/// 「能不能用这台服务器」。填错了的人连握手都过不去（403），拿不到 `server.welcome`
+/// ——这也就挡住了陌生人白用转发与 TURN 凭据。
+///
+/// 用 HKDF 而不是把密码原文当 token：中继只保存摘要，日志与抓包里都不会出现密码本身。
+pub fn derive_server_token(password: &str) -> String {
+    URL_SAFE_NO_PAD.encode(hkdf_sha256(password.trim().as_bytes(), SERVER_INFO))
+}
+
 /// 每个 transfer 一把临时密钥（R17）：
 /// `HKDF-SHA256(ikm = E2EE_ROOT_KEY, salt = 空, info = "bongocat-pair-transfer-v1" || transferId(8 字节大端))`。
 ///
@@ -76,26 +89,26 @@ pub fn derive_transfer_key(root_key: &[u8; 32], transfer_id: u64) -> [u8; 32] {
     hkdf_sha256(root_key, &info)
 }
 
-/// 解析用户粘贴的联机密钥（base64url，32 字节）
+/// 解析用户粘贴的配对密码（base64url，32 字节）
 ///
-/// §21：用户可见的错误文案一律叫「联机密钥」；`PAIR_SECRET` 只留作内部标识。
+/// §21：用户可见的错误文案一律叫「配对密码」；`PAIR_SECRET` 只留作内部标识。
 pub fn decode_pair_secret(text: &str) -> Result<[u8; PAIR_SECRET_BYTES], String> {
     let trimmed = text.trim();
 
     if trimmed.is_empty() {
-        return Err("联机密钥不能为空".into());
+        return Err("配对密码不能为空".into());
     }
 
     let bytes = URL_SAFE_NO_PAD
         .decode(trimmed)
         .or_else(|_| URL_SAFE.decode(trimmed))
-        .map_err(|_| "联机密钥不是合法的 base64url 文本".to_string())?;
+        .map_err(|_| "配对密码不是合法的 base64url 文本".to_string())?;
 
     let length = bytes.len();
 
     bytes
         .try_into()
-        .map_err(|_| format!("联机密钥应为 {PAIR_SECRET_BYTES} 字节，实际 {length} 字节"))
+        .map_err(|_| format!("配对密码应为 {PAIR_SECRET_BYTES} 字节，实际 {length} 字节"))
 }
 
 /// R17 的核对指纹：`sha256(原始 secret 字节)` 的 hex 前 16 位，每两位之间加一个空格。
@@ -378,6 +391,34 @@ mod tests {
         assert_ne!(
             derive_room_id(&first),
             URL_SAFE_NO_PAD.encode(derive_root_key(&first))
+        );
+    }
+
+    /// R36：服务器密码的派生同样是**固定向量**，而且必须与
+    /// `server-relay/src/auth.rs` 里那份逐字节一致——两个 crate 各写一遍，
+    /// 任何一侧漂移都会在 `cargo test` 里露出来。
+    ///
+    /// 输入与上面几条完全不同：不是 32 字节的 secret，而是部署者自己定的文本
+    /// （中文那一条同时守住「按 UTF-8 字节派生」）。
+    #[test]
+    fn server_token_matches_the_relay_vector() {
+        assert_eq!(
+            derive_server_token("bongo-server-password"),
+            "qi0Bz36jIJ_OpjN86BJihPxefEIuxps8XLYTOBlmEmc"
+        );
+        assert_eq!(
+            derive_server_token("长密码测试-服务器密码"),
+            "Q_HFVsHDdAD1cs13Z806GPaJU9lye7ENW3eKwTEThyU"
+        );
+        // 复制粘贴带上的空白不参与派生
+        assert_eq!(
+            derive_server_token("\t bongo-server-password \r\n"),
+            derive_server_token("bongo-server-password")
+        );
+        // 它与配对密码那三路输出彼此独立（服务器密码不是密钥材料）
+        assert_ne!(
+            derive_server_token("bongo-server-password"),
+            derive_auth_token(&secret([0u8; PAIR_SECRET_BYTES]))
         );
     }
 

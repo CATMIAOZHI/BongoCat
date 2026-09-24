@@ -194,6 +194,9 @@ struct SessionConfig {
     /// 多会话分组用（§20）：从 Pair Secret 派生，不额外持久化第二份
     room_id: String,
     auth_token: String,
+    /// R36：服务器门槛凭据。`None` = 没填（不带 `X-Bongo-Server` 头，官方的
+    /// Cloudflare 中继与更旧的自建中继照旧可用）。
+    server_token: Option<String>,
     root_key: [u8; 32],
     device_id: String,
 }
@@ -442,6 +445,7 @@ impl PairManager {
         self: &Arc<Self>,
         relay_url: &str,
         secret_text: Option<&str>,
+        server_password: Option<&str>,
     ) -> Result<(), String> {
         let trimmed = relay_url.trim();
 
@@ -451,14 +455,27 @@ impl PairManager {
 
         let secret_text = match secret_text {
             Some(secret) => secret.to_string(),
-            None => secret::load_secret()?.ok_or_else(|| "还没有配置联机密钥".to_string())?,
+            None => secret::load_secret()?.ok_or_else(|| "还没有配置配对密码".to_string())?,
         };
         let secret_bytes = crypto::decode_pair_secret(&secret_text)?;
+
+        // R36：服务器密码可以**只用于这一次连接**（界面上还没点「保存」也照样能连），
+        // 字段为空时回落到凭据库里存着的那个；两处都没有就不带这个头。
+        let server_token = match server_password.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(password) => Some(crypto::derive_server_token(password)),
+            // 凭据库读不出来**不该拖垮整次连接**：官方的 Cloudflare 中继根本不需要这个
+            // 值，它连的是别人家的域名，本机凭据库坏没坏与它无关。这里降级成「没有服务器
+            // 密码」，真需要它的自建中继会用 403 说清楚该去问谁要。
+            None => secret::load_server_password()
+                .unwrap_or_default()
+                .map(|password| crypto::derive_server_token(&password)),
+        };
 
         let config = SessionConfig {
             relay_url: trimmed.to_string(),
             room_id: crypto::derive_room_id(&secret_bytes),
             auth_token: crypto::derive_auth_token(&secret_bytes),
+            server_token,
             root_key: crypto::derive_root_key(&secret_bytes),
             device_id: self.device_id(),
         };
@@ -1223,6 +1240,7 @@ async fn run_session(
                 &config.relay_url,
                 &config.room_id,
                 &config.auth_token,
+                config.server_token.as_deref(),
                 &config.device_id,
             ),
         )
@@ -2147,7 +2165,7 @@ fn publish_route(
 fn describe_close(code: Option<u16>) -> PairFailure {
     let message = match code {
         Some(4002) => "这条连接被同一台设备的新连接顶替".to_string(),
-        // §10：同一个联机密钥最多两台设备，第三台在这里被挡下
+        // §10：同一个配对密码最多两台设备，第三台在这里被挡下
         Some(4003) => "该联机会话已有两台设备在线".to_string(),
         Some(4004) => "旧连接因长时间没有活动被顶替".to_string(),
         Some(1008) => "服务器认为数据格式或发送频率异常".to_string(),
@@ -2157,7 +2175,7 @@ fn describe_close(code: Option<u16>) -> PairFailure {
         None => "服务器关闭了连接".to_string(),
     };
 
-    // 只有 `4003` 算 fatal：同一个联机密钥已经有两台设备在线，重连还是被同一对占着，
+    // 只有 `4003` 算 fatal：同一个配对密码已经有两台设备在线，重连还是被同一对占着，
     // 需要用户处理（换密钥或等对方断开）。服务器**容量**满走的是 HTTP 503，那是可重试的。
     PairFailure {
         message,
@@ -5092,14 +5110,14 @@ mod tests {
 
         *PairManager::lock(&manager.sender) = Some(sender);
 
-        manager.fail_hard(0, "鉴权失败：联机密钥与服务器不一致".to_string());
+        manager.fail_hard(0, "鉴权失败：配对密码与服务器不一致".to_string());
 
         let status = manager.status();
 
         assert_eq!(status.state, PairConnectionState::Error);
         assert_eq!(
             status.last_error.as_deref(),
-            Some("鉴权失败：联机密钥与服务器不一致")
+            Some("鉴权失败：配对密码与服务器不一致")
         );
         assert_eq!(sink.payloads(EVENT_ERROR).len(), 1);
         // 旧任务的 sender 已经被清掉：后续发送必须报错，而不是静默成功

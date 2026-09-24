@@ -19,7 +19,7 @@ pub type PairSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// 连接失败的原因。
 ///
-/// `fatal` 表示「重试也不会好」——联机密钥不对、协议版本不对、地址路径写错。
+/// `fatal` 表示「重试也不会好」——配对密码不对、协议版本不对、地址路径写错。
 /// 中继侧一旦给出这类答案，继续按 1/2/5/10/30 秒退避重连只会刷日志，所以
 /// manager 会停在 `Error` 状态等用户处理。
 ///
@@ -140,9 +140,10 @@ pub async fn connect(
     relay_url: &str,
     room_id: &str,
     auth_token: &str,
+    server_token: Option<&str>,
     device_id: &str,
 ) -> Result<PairSocket, PairFailure> {
-    let request = build_request(relay_url, room_id, auth_token, device_id)?;
+    let request = build_request(relay_url, room_id, auth_token, server_token, device_id)?;
 
     let (socket, _response) = connect_async(request)
         .await
@@ -151,20 +152,25 @@ pub async fn connect(
     Ok(socket)
 }
 
-/// 组装升级请求：四个头一次写完，缺一个中继都会拒绝。
+/// 组装升级请求：四到五个头一次写完，缺哪个中继都会拒绝。
 ///
 /// 单独抽出来是为了能被单测直接断言（§31：请求**一定**包含 `X-Bongo-Room`）。
+///
+/// `server_token` 是**可选**的（R36）：它是「能不能用这台服务器」的凭据，只有自建
+/// 中继会要求它。不填时就不发这个头——官方的 Cloudflare 中继（它没有服务器密码这回事）
+/// 与更旧的自建中继都照旧可用，而这一版自建中继会用 `403` 明确地告诉用户缺了什么。
 fn build_request(
     relay_url: &str,
     room_id: &str,
     auth_token: &str,
+    server_token: Option<&str>,
     device_id: &str,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, PairFailure> {
     let url = build_upgrade_url(relay_url).map_err(PairFailure::fatal)?;
 
     if !is_valid_room_id(room_id) {
         return Err(PairFailure::fatal(
-            "联机会话标识不合法：请重新填写联机密钥".to_string(),
+            "联机会话标识不合法：请重新填写配对密码".to_string(),
         ));
     }
 
@@ -175,7 +181,7 @@ fn build_request(
     {
         let headers = request.headers_mut();
         let authorization = HeaderValue::from_str(&format!("Bearer {auth_token}"))
-            .map_err(|_| PairFailure::fatal("联机密钥含非法字符".to_string()))?;
+            .map_err(|_| PairFailure::fatal("配对密码含非法字符".to_string()))?;
         let client = HeaderValue::from_str(device_id)
             .map_err(|_| PairFailure::fatal("设备标识含非法字符".to_string()))?;
         let protocol = HeaderValue::from_str(&PROTOCOL_VERSION.to_string())
@@ -188,6 +194,15 @@ fn build_request(
         headers.insert("x-bongo-protocol", protocol);
         // §4：中继只按它分组，拿不到 Pair Secret，也拿不到 E2EE 根密钥
         headers.insert("x-bongo-room", room);
+
+        // R36：服务器密码的凭据。它是**服务器级**的（谁能用这台服务器），与上面那个
+        // 配对凭据各管一段；没填就不带这个头。
+        if let Some(token) = server_token.map(str::trim).filter(|value| !value.is_empty()) {
+            let server = HeaderValue::from_str(token)
+                .map_err(|_| PairFailure::fatal("服务器密码含非法字符".to_string()))?;
+
+            headers.insert("x-bongo-server", server);
+        }
     }
 
     Ok(request)
@@ -213,11 +228,22 @@ fn describe_connect_error(error: WsError) -> PairFailure {
             let status = response.status();
 
             match status.as_u16() {
-                401 => PairFailure::fatal("联机密钥不正确：请与对方核对是否完全相同".to_string()),
+                401 => PairFailure::fatal("配对密码不正确：请与对方核对是否完全相同".to_string()),
+                // R36：自建中继的「服务器密码」门槛。它**必须**与 401 分开：401 要用户去
+                // 找对方核对，403 要用户去找部署服务器的那个人要密码，两者下一步完全不同。
+                // 也必须是 fatal —— 密码不对时重连一万次都会被同一个 403 挡回来。
+                //
+                // 403 并不只从中继来：前置的 WAF 或企业代理也会拿 403 拦下 `/ws`。这时
+                // 用户手上的密码其实是对的，所以文案留了后半句，别让人一直重填密码。
+                403 => PairFailure::fatal(
+                    "服务器密码不正确或还没填：请向部署这台服务器的人索取（若密码没错，\
+                     多半是服务器前面的代理拦了连接）"
+                        .to_string(),
+                ),
                 426 => PairFailure::fatal("两边版本不一致：请把它们都升级到最新版".to_string()),
                 // §1：别让用户去理解 deviceId / Room —— 说能做什么就行
                 400 => PairFailure::fatal(
-                    "服务器拒绝了这次连接：请检查服务器地址与联机密钥是否和对方完全一致"
+                    "服务器拒绝了这次连接：请检查服务器地址与配对密码是否和对方完全一致"
                         .to_string(),
                 ),
                 404 => PairFailure::fatal("服务器地址路径不对：应该指向 /ws".to_string()),
@@ -239,7 +265,9 @@ fn describe_connect_error(error: WsError) -> PairFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::pair::crypto::{decode_pair_secret, derive_auth_token, derive_room_id};
+    use crate::core::pair::crypto::{
+        decode_pair_secret, derive_auth_token, derive_room_id, derive_server_token,
+    };
 
     const SECRET: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
@@ -359,9 +387,19 @@ mod tests {
 
         assert_eq!(
             unauthorized.message,
-            "联机密钥不正确：请与对方核对是否完全相同"
+            "配对密码不正确：请与对方核对是否完全相同"
         );
         assert!(unauthorized.fatal, "密钥不对时重试没有意义");
+
+        // R36：服务器密码是**另一件事**——401 要去找对方核对，403 要去找部署服务器的人，
+        // 而且它是 fatal（重连一万次都会被同一个 403 挡回来）
+        let forbidden = describe_connect_error(http(403));
+
+        assert_eq!(
+            forbidden.message,
+            "服务器密码不正确或还没填：请向部署这台服务器的人索取（若密码没错，多半是服务器前面的代理拦了连接）"
+        );
+        assert!(forbidden.fatal, "服务器密码不会因为重试而变对");
 
         let full = describe_connect_error(http(503));
 
@@ -382,7 +420,7 @@ mod tests {
 
         assert_eq!(
             bad_request.message,
-            "服务器拒绝了这次连接：请检查服务器地址与联机密钥是否和对方完全一致"
+            "服务器拒绝了这次连接：请检查服务器地址与配对密码是否和对方完全一致"
         );
         assert!(bad_request.fatal);
         // 没见过的状态码才回落成 HTTP 码，并且按可重试处理
@@ -401,6 +439,7 @@ mod tests {
             "cat.example.com",
             &room_id(),
             &derive_auth_token(&decode_pair_secret(SECRET).unwrap()),
+            None,
             "device-1",
         )
         .unwrap();
@@ -416,6 +455,32 @@ mod tests {
         assert_eq!(headers["x-bongo-client"], "device-1");
         assert_eq!(headers["x-bongo-protocol"], "1");
         assert_eq!(request.uri().to_string(), "wss://cat.example.com/ws");
+        // R36：没填服务器密码就不带这个头——官方的 Cloudflare 中继与更旧的自建中继
+        // 都靠这一点继续可用
+        assert!(!headers.contains_key("x-bongo-server"));
+    }
+
+    /// R36：填了服务器密码才带 `X-Bongo-Server`，而且带的是派生出来的凭据（不是密码原文）
+    #[test]
+    fn the_server_password_becomes_a_derived_header() {
+        let token = derive_server_token("bongo-server-password");
+        let request = build_request(
+            "cat.example.com",
+            &room_id(),
+            "token",
+            Some(&token),
+            "device-1",
+        )
+        .unwrap();
+
+        assert_eq!(request.headers()["x-bongo-server"], token);
+        // 密码原文不该出现在任何头里
+        assert!(!format!("{:?}", request.headers()).contains("bongo-server-password"));
+
+        // 空白值等于没填（用户在输入框里敲了个空格不该变成「带了错的密码」）
+        let blank = build_request("cat.example.com", &room_id(), "token", Some("   "), "d").unwrap();
+
+        assert!(!blank.headers().contains_key("x-bongo-server"));
     }
 
     /// 派生漂移 / 有人塞了别的值时必须是 fatal，不能带着非法 Room 去连接
@@ -430,7 +495,7 @@ mod tests {
             // 长度对但混进了 base64url 之外的字符
             "r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97*",
         ] {
-            let failure = build_request("cat.example.com", broken, "token", "device-1")
+            let failure = build_request("cat.example.com", broken, "token", None, "device-1")
                 .expect_err("非法 Room 必须被拒绝");
 
             assert!(failure.fatal, "非法 Room 应当是 fatal：{broken:?}");

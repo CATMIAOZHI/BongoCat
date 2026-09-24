@@ -118,7 +118,7 @@ pub async fn pair_has_secret() -> Result<bool, String> {
     secret::has_secret()
 }
 
-/// 生成一个新的联机密钥（§22）。
+/// 生成一个新的配对密码（§22）。
 ///
 /// 用系统的 CSPRNG 取 32 字节再编成 base64url，**不用** `Math.random`、时间戳或 UUID：
 /// 这个值就是双方的 E2EE 密钥材料，可预测等于没有加密。生成结果只返回给这一次调用
@@ -156,12 +156,50 @@ pub async fn pair_delete_secret() -> Result<(), String> {
     secret::delete_secret()
 }
 
+/// 保存「服务器密码」（R36）。
+///
+/// 它**不是**密钥材料：不参与 E2EE，也不参与「谁是同一对」的判断，只是「能不能用这台
+/// 服务器」的门槛，所以它单独存在另一个凭据条目里——换服务器密码不会连带换掉配对密码
+/// （那会换掉 E2EE 根密钥，等于让对方重新填一次）。
+#[command]
+pub async fn pair_set_server_password(password: String) -> Result<(), String> {
+    let trimmed = password.trim();
+
+    if trimmed.is_empty() {
+        return Err("服务器密码不能为空".into());
+    }
+
+    secret::set_server_password(trimmed)
+}
+
+#[command]
+pub async fn pair_has_server_password() -> Result<bool, String> {
+    secret::has_server_password()
+}
+
+#[command]
+pub async fn pair_delete_server_password() -> Result<(), String> {
+    secret::delete_server_password()
+}
+
+/// 连接中继（R36）。
+///
+/// `secret` / `server_password` 是**这一次连接**要用的值，允许直接来自输入框（还没点过
+/// 「保存」也照样能连）；对应参数为 `None` 时回落到凭据库里存着的那个。两者都为空时
+/// 「配对密码」会给出明确的错误，而「服务器密码」只是不带那个头（官方的 Cloudflare
+/// 中继不需要它）。
 #[command]
 pub async fn pair_connect(
     manager: State<'_, Arc<PairManager>>,
     relay_url: String,
+    secret: Option<String>,
+    server_password: Option<String>,
 ) -> Result<(), String> {
-    Arc::clone(&manager).start(&relay_url, None)
+    Arc::clone(&manager).start(
+        &relay_url,
+        secret.as_deref(),
+        server_password.as_deref(),
+    )
 }
 
 #[command]
