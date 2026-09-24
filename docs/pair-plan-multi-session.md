@@ -183,10 +183,11 @@ X-Bongo-Protocol: 1
 
 | Phase | 内容 | 提交 |
 | --- | --- | --- |
-| A | `derive_room_id` + 固定向量 | 见下 |
-| B | 客户端 `X-Bongo-Room` + `SessionConfig.room_id` | 见下 |
-| C/D/E | `server-relay` 多 Room + 隔离 + 容量 | 见下 |
-| F | 设置页文案 + 生成联机密钥 + 明文提醒 | 见下 |
-| G | 部署简化（direct compose / .env.example / README） | 见下 |
+| A | `derive_room_id` + 固定向量 | `9336db4` |
+| B | 客户端 `X-Bongo-Room` + `SessionConfig.room_id` | `9336db4` |
+| C/D/E | `server-relay` 多 Room + 隔离 + 容量 | `e97d783` |
+| F | 设置页文案 + 生成联机密钥 + 明文提醒 | `2d095e9` |
+| G | 部署简化（direct compose / .env.example / README） | `e97d783` |
 
-（提交哈希在推送后回填。）
+（A/B 合成一个提交，C/D/E 与 G 合成一个提交，F 单独一个；三个提交都已推到
+`origin/feat/pair-desktop-v1`。）
