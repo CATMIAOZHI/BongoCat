@@ -9,7 +9,8 @@ name: BongoCat Release
 #      `tauri.conf.json` 里 `createUpdaterArtifacts: true` 时缺
 #      `TAURI_SIGNING_PRIVATE_KEY` 会让打包报错（「A public key has been found,
 #      but no private key」）。
-#   3. `includeUpdaterJson: false`：没有签名就不生成 `latest.json`。
+#   3. `uploadUpdaterJson: false`：没有签名就不生成 `latest.json`
+#      （这是 tauri-action 现在的 input 名，上游的 `includeUpdaterJson` 早就改名了）。
 # 想恢复「签名 + 自动更新分发」，见文件末尾的说明。
 on:
   push:
@@ -123,7 +124,7 @@ jobs:
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-          includeUpdaterJson: false
+          uploadUpdaterJson: false
           args: --target ${{ matrix.target }} --no-sign
 
 # 以后想恢复「安装包 + 自动更新」的完整分发（四步）：
@@ -132,6 +133,6 @@ jobs:
 #      （现在是上游的公钥，与自己的私钥不匹配，tauri 会直接拒绝）
 #   3. 在仓库 Settings → Secrets 里加 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）
 #      与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（私钥没设密码就留空）
-#   4. 去掉上面的 `--no-sign`、把 `includeUpdaterJson` 改回 `true`，
+#   4. 去掉上面的 `--no-sign`、把 `uploadUpdaterJson` 改回 `true`，
 #      并把 `plugins.updater.endpoints` 指向本仓库的
 #      `releases/latest/download/latest.json`（现在指的是上游，装了这个包会拉到上游版本）
