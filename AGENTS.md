@@ -10,8 +10,9 @@
 ## 工作区结构
 
 - 工作区根目录就是仓库本体（BongoCat 的本地 fork），没有子仓库。
-- 双人联机功能的设计真相来源分三份：`docs/pair-plan.md`（Phase 1~6：多窗口 / Cloudflare Relay / 对方猫 / 聊天 / 附件 / 语音，修订记录 R1~R19）、`docs/pair-plan-cloud-p2p.md`（Phase 7~10：自建中继 / P2P / 60Hz / reliable 通道，修订记录 R20~R33）与 `docs/pair-plan-multi-session.md`（Phase 11：一套服务器承载多个双人会话，修订记录 R34 起）。三份都冲突时以各自的修订记录为准；跨文档冲突以 `pair-plan-multi-session.md` 为准。
-- 中继有两份实现：`server-cloudflare/`（Cloudflare Worker + Durable Object，**一个部署只服务一对用户**，忽略 `X-Bongo-Room`）与 `server-relay/`（自建 Rust 服务，**一套承载多个双人会话**，按 `X-Bongo-Room` 分组）。线上契约以 `server-cloudflare/README.md` 为准，两侧必须一致（自建版多出 `server.welcome` 里可选的 `limits` / `iceServers` 字段、`/health` 的 `mode` 字段、容量满时的 HTTP 503，以及**本版必需**的 `X-Bongo-Room` 头——新客户端连两份中继都行，**旧客户端连自建版会被 HTTP 400 挡住**，所以升级自建版要先升两台设备上的客户端，见 `server-relay/README.md` 的兼容矩阵）。`server-relay/` 是**独立 workspace**（不在根 workspace 里），单独用 `cargo test --manifest-path server-relay/Cargo.toml` 跑测试。
+- 双人联机功能的设计真相来源分三份：`docs/pair-plan.md`（Phase 1~6：多窗口 / Cloudflare Relay / 对方猫 / 聊天 / 附件 / 语音，修订记录 R1~R19）、`docs/pair-plan-cloud-p2p.md`（Phase 7~10：自建中继 / P2P / 60Hz / reliable 通道，修订记录 R20~R33）与 `docs/pair-plan-multi-session.md`（Phase 11：一套服务器承载多个双人会话；Phase 12：服务器密码，修订记录 R34 起）。三份都冲突时以各自的修订记录为准；跨文档冲突以 `pair-plan-multi-session.md` 为准。
+- 联机凭据有两层：**配对密码**（每一对用户自己的，决定「谁是同一对」，同时是 E2EE 密钥材料）与**服务器密码**（部署者在自建中继上设置的 `PAIR_SERVER_PASSWORD`，决定「谁能用这台服务器」，Phase 12 / R36）。客户端设置页因此有三项：服务器地址 / 服务器密码 / 配对密码；两个密码分别存在系统凭据库的两个条目里，且**不填服务器密码时就不发 `X-Bongo-Server` 头**（官方 Cloudflare 中继不需要它）。
+- 中继有两份实现：`server-cloudflare/`（Cloudflare Worker + Durable Object，**一个部署只服务一对用户**，忽略 `X-Bongo-Room` 与 `X-Bongo-Server`）与 `server-relay/`（自建 Rust 服务，**一套承载多个双人会话**，按 `X-Bongo-Room` 分组，并要求服务器密码）。线上契约以 `server-cloudflare/README.md` 为准，两侧必须一致（自建版多出 `server.welcome` 里可选的 `limits` / `iceServers` 字段、`/health` 的 `mode` / `passwordRequired` 字段、服务器密码不对时的 HTTP 403、容量满时的 HTTP 503，以及**本版必需**的 `X-Bongo-Room` 与 `X-Bongo-Server` 头——新客户端连两份中继都行，**旧客户端（或没填服务器密码的新客户端）连自建版会被挡下**，所以升级自建版要先升两台设备上的客户端并填好服务器密码，见 `server-relay/README.md` 的兼容矩阵）。`server-relay/` 是**独立 workspace**（不在根 workspace 里），单独用 `cargo test --manifest-path server-relay/Cargo.toml` 跑测试。
 - `src/`：前端，Vue 3 + TypeScript + Vite + Pinia + UnoCSS + antdv-next。
 - `src-tauri/`：Rust 后端；`src-tauri/src/plugins/` 下是本仓库自带的本地插件（`admin-status`、`window`）。
 - `src-tauri/assets/models`：内置猫咪模型；`scripts/`：图标生成、发布等脚本。
@@ -30,7 +31,7 @@
 - 常用命令：`pnpm install`、`pnpm tauri dev`、`pnpm tauri build`（调试加 `--debug`）、`pnpm lint`、`pnpm test`。
 - 前端改动至少跑 `pnpm lint`；涉及 Rust 或打包配置时说明是否真的跑过 `pnpm tauri build` 或 `cargo check`，没验证的要标注。
 - 前端有 vitest 单测（`pnpm test`，用例在 `src/**/*.spec.ts`，目前覆盖双人联机的纯函数映射），Rust 有 `cargo test --lib` 与 `cargo test --all-targets`。
-- 中继的端到端验证：先起一个中继（`server-relay` 或 `server-cloudflare` 的 `pnpm dev`），再设 `BONGO_PAIR_E2E_RELAY` / `BONGO_PAIR_E2E_SECRET` / `BONGO_PAIR_HEARTBEAT_SECS`，跑 `cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored`。换中继实现时，这套用例必须在两侧都通过。
+- 中继的端到端验证：先起一个中继（`server-relay` 或 `server-cloudflare` 的 `pnpm dev`），再设 `BONGO_PAIR_E2E_RELAY` / `BONGO_PAIR_E2E_SECRET` / `BONGO_PAIR_HEARTBEAT_SECS`（自建中继还要 `BONGO_PAIR_E2E_SERVER_PASSWORD`），跑 `cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored`。换中继实现时，这套用例必须在两侧都通过。
 - `vite build` 不做类型检查，要单独跑 `node node_modules/typescript/bin/tsc --noEmit`；仓库没装 `vue-tsc`，所以这个检查只覆盖 `.ts`，`.vue` 里的类型问题目前只能靠 review 和实际运行发现。
 - 报告里区分静态检查、构建和实际运行三种证据。
 

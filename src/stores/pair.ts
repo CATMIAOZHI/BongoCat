@@ -216,6 +216,13 @@ export const usePairStore = defineStore('pair', () => {
 
   /** 是否已经保存过 Pair Secret（明文永远不会进入这个 store） */
   const hasSecret = ref(false)
+  /**
+   * 是否已经保存过「服务器密码」（R36）。
+   *
+   * 与 `hasSecret` 分开：它只是服务器的门槛凭据，不是密钥材料，换掉它不会动到 E2EE。
+   * 明文同样永远不会进入这个 store。
+   */
+  const hasServerPassword = ref(false)
   /** R17 的核对指纹，只在保存 secret 时由 Rust 回显 */
   const secretFingerprint = ref('')
 
@@ -224,6 +231,7 @@ export const usePairStore = defineStore('pair', () => {
     stats,
     runtime,
     hasSecret,
+    hasServerPassword,
     secretFingerprint,
   }
 }, {

@@ -56,7 +56,7 @@ export function pairHasSecret() {
   return invoke<boolean>(INVOKE_KEY.PAIR_HAS_SECRET)
 }
 
-/** 生成一个新的联机密钥（§22）：Rust 侧用系统 CSPRNG 取 32 字节，前端不自己造 */
+/** 生成一个新的配对密码（§22）：Rust 侧用系统 CSPRNG 取 32 字节，前端不自己造 */
 export function pairGenerateSecret() {
   return invoke<string>(INVOKE_KEY.PAIR_GENERATE_SECRET)
 }
@@ -70,8 +70,31 @@ export function pairDeleteSecret() {
   return invoke<void>(INVOKE_KEY.PAIR_DELETE_SECRET)
 }
 
-export function pairConnect(relayUrl: string) {
-  return invoke<void>(INVOKE_KEY.PAIR_CONNECT, { relayUrl })
+/**
+ * 保存「服务器密码」（R36）：部署服务器的人在 `.env` 里设的那个值。
+ *
+ * 它只存在系统凭据库里（与配对密码分开两个条目），前端拿不回明文。
+ */
+export function pairSetServerPassword(password: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_SET_SERVER_PASSWORD, { password })
+}
+
+export function pairHasServerPassword() {
+  return invoke<boolean>(INVOKE_KEY.PAIR_HAS_SERVER_PASSWORD)
+}
+
+export function pairDeleteServerPassword() {
+  return invoke<void>(INVOKE_KEY.PAIR_DELETE_SERVER_PASSWORD)
+}
+
+/**
+ * 连接中继。
+ *
+ * `secret` / `serverPassword` 是**这次连接**要用的值：可以直接传输入框里的内容，不必
+ * 先点「保存」；不传（`undefined`）时 Rust 回落到凭据库里已经存着的那个。
+ */
+export function pairConnect(relayUrl: string, secret?: string, serverPassword?: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_CONNECT, { relayUrl, secret, serverPassword })
 }
 
 export function pairDisconnect() {

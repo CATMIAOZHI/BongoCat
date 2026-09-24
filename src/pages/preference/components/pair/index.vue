@@ -15,15 +15,18 @@ import {
   ATTACHMENT_MAX_MB,
   pairConnect,
   pairDeleteSecret,
+  pairDeleteServerPassword,
   pairDisconnect,
   pairGenerateSecret,
   pairGetSecretFingerprint,
   pairHasSecret,
+  pairHasServerPassword,
   pairHistoryExport,
   pairHistoryStartNewEpoch,
   pairHistoryStats,
   pairSetMaxAttachmentMb,
   pairSetSecret,
+  pairSetServerPassword,
 } from '@/composables/usePair'
 import { chatExportFileName } from '@/composables/usePairChat'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
@@ -36,7 +39,10 @@ const pairStore = usePairStore()
 const modelStore = useModelStore()
 const { t } = useI18n()
 const secretInput = ref('')
+const serverPasswordInput = ref('')
 const saving = ref(false)
+const savingServerPassword = ref(false)
+const connecting = ref(false)
 const generating = ref(false)
 
 /**
@@ -208,6 +214,15 @@ onMounted(async () => {
       message.error(String(reason))
     })
 
+  // 服务器密码同理：它决定「已配置」标记与删除入口，与配对密码各存一个条目
+  await pairHasServerPassword()
+    .then((hasServerPassword) => {
+      pairStore.hasServerPassword = hasServerPassword
+    })
+    .catch((reason) => {
+      message.error(String(reason))
+    })
+
   await refreshHistoryStats()
 
   // 重启后 Rust 侧回到默认上限，把用户设置补回去
@@ -252,10 +267,42 @@ const modelOptions = computed(() => {
 
 const statusText = computed(() => `pages.preference.pair.status.${status.value.key}`)
 
+/**
+ * 换了任一凭据之后，旧连接上用的凭据已经失效。
+ *
+ * - 本来连着（或正在重连）：用新值重连一次。
+ * - 停在「连接失败」：只清掉那条旧错误并提示再点一次。不清的话用户会以为新值没生效
+ *   ——状态徽标和红字都还是上一次的（只读审计的 P2-1）。
+ * - 没连接过：什么都不做，等用户自己点「立即连接」。
+ */
+async function reconnectAfterCredentialChange() {
+  const { connection } = pairStore.runtime
+  const url = pairStore.settings.relay.url
+
+  if (!url) return
+
+  if (connection === 'error') {
+    pairStore.runtime.lastError = void 0
+    message.info(t('pages.preference.pair.hints.retryAfterSave'))
+
+    return
+  }
+
+  const wasConnected = ['connecting', 'connected', 'peer-offline', 'reconnecting'].includes(connection)
+
+  if (!wasConnected) return
+
+  pairStore.runtime.lastError = void 0
+
+  await pairDisconnect()
+  await pairConnect(url)
+}
+
 async function handleSaveSecret() {
   const secret = secretInput.value.trim()
 
-  if (!secret) return
+  // 连按回车会重入：按钮有 loading 挡着，键盘没有，两次「断开 → 重连」会交错
+  if (!secret || saving.value) return
 
   saving.value = true
 
@@ -267,16 +314,7 @@ async function handleSaveSecret() {
 
     message.success(t('pages.preference.pair.hints.secretSaved'))
 
-    // 换了 secret 之后旧连接上的 token 已经失效：如果本来连着，就用新值重连
-    const { connection } = pairStore.runtime
-    const wasConnected = ['connecting', 'connected', 'peer-offline', 'reconnecting'].includes(connection)
-
-    if (wasConnected && pairStore.settings.relay.url) {
-      pairStore.runtime.lastError = void 0
-
-      await pairDisconnect()
-      await pairConnect(pairStore.settings.relay.url)
-    }
+    await reconnectAfterCredentialChange()
   } catch (reason) {
     message.error(String(reason))
   } finally {
@@ -326,25 +364,147 @@ async function handleCopySecret() {
   }
 }
 
-async function handleDeleteSecret() {
-  try {
-    await pairDisconnect()
-    await pairDeleteSecret()
+/**
+ * 删除配对密码。
+ *
+ * 它是**不可逆**的：凭据库里的明文只能写不能读，删掉之后除了让对方重发一次没有别的
+ * 办法拿回来，所以这里先确认一次。
+ */
+function handleDeleteSecret() {
+  confirmDeleteCredential(
+    t('pages.preference.pair.labels.pairSecret'),
+    t('pages.preference.pair.hints.deleteSecretBody'),
+    async () => {
+      await pairDisconnect()
+      await pairDeleteSecret()
 
-    pairStore.hasSecret = false
-    pairStore.secretFingerprint = ''
+      pairStore.hasSecret = false
+      pairStore.secretFingerprint = ''
+    },
+  )
+}
+
+/**
+ * 保存服务器密码（R36）。
+ *
+ * 与配对密码一样：它只进系统凭据库，保存成功后清空输入框（明文不留在界面上），
+ * 而且**换了要重连**——中继会按新值重新判一次门槛。
+ */
+async function handleSaveServerPassword() {
+  const password = serverPasswordInput.value.trim()
+
+  if (!password || savingServerPassword.value) return
+
+  savingServerPassword.value = true
+
+  try {
+    await pairSetServerPassword(password)
+    pairStore.hasServerPassword = true
+    serverPasswordInput.value = ''
+
+    message.success(t('pages.preference.pair.hints.serverPasswordSaved'))
+
+    await reconnectAfterCredentialChange()
   } catch (reason) {
     message.error(String(reason))
+  } finally {
+    savingServerPassword.value = false
   }
 }
 
+/**
+ * 删除服务器密码：和配对密码一样只写不读，删掉就得再去找部署服务器的人要一次。
+ */
+function handleDeleteServerPassword() {
+  confirmDeleteCredential(
+    t('pages.preference.pair.labels.serverPassword'),
+    t('pages.preference.pair.hints.deleteServerPasswordBody'),
+    async () => {
+      await pairDisconnect()
+      await pairDeleteServerPassword()
+
+      pairStore.hasServerPassword = false
+    },
+  )
+}
+
+/**
+ * 删掉一个凭据前的确认 + 删除后的一句反馈。
+ *
+ * 两个「删除」按钮都是不可逆的（凭据库里的明文只写不读），此前点一下就没了、
+ * 连提示都没有（只读审计的 P2-4）。
+ */
+function confirmDeleteCredential(name: string, body: string, remove: () => Promise<void>) {
+  Modal.confirm({
+    title: t('pages.preference.pair.hints.deleteConfirmTitle', { name }),
+    content: body,
+    okText: t('pages.preference.pair.buttons.delete'),
+    okType: 'danger',
+    async onOk() {
+      try {
+        await remove()
+
+        message.success(t('pages.preference.pair.hints.deleted'))
+      } catch (reason) {
+        message.error(String(reason))
+      }
+    },
+  })
+}
+
 async function handleConnect() {
+  // 连点两次会跑两轮「落盘 → 连接」：第二条 `pair_connect` 会把刚起来的会话取消再重启，
+  // 而且会连出两条一样的提示（落盘本身是幂等的，不会写坏东西）
+  if (connecting.value) return
+
+  connecting.value = true
+
   try {
     pairStore.runtime.lastError = void 0
 
+    const secret = secretInput.value.trim()
+    const serverPassword = serverPasswordInput.value.trim()
+    const replacedSecret = pairStore.hasSecret
+    let remembered = false
+
+    // 连接用的值**就是**记住的值：输入框里填了就先落盘（粘贴完不必先点「保存」）。
+    //
+    // 不这样做会出现自相矛盾的状态：界面显示「已连接」、输入框里明晃晃留着密码，
+    // 但凭据库是空/旧的——重启后自动连接报「还没有配置配对密码」，用户会以为填错了
+    // （只读审计的 P1-1）。
+    if (secret) {
+      // Rust 只回显指纹，不回显 secret 本身（R10 / R17）
+      pairStore.secretFingerprint = await pairSetSecret(secret)
+      pairStore.hasSecret = true
+      secretInput.value = ''
+      remembered = true
+    }
+
+    if (serverPassword) {
+      await pairSetServerPassword(serverPassword)
+      pairStore.hasServerPassword = true
+      serverPasswordInput.value = ''
+      remembered = true
+    }
+
+    // 先把「记住了」说出来再连接：连接失败时用户会看到两个空输入框 + 一条红字，容易
+    // 读成「白填了」。落盘确实已经成功，这句话和后面那条错误不矛盾。
+    if (remembered) {
+      // 本来存过一串、现在又填了新的，就是**替换**——凭据库里的旧值读不回来，
+      // 这件事得明说，否则用户不知道老的那串已经没了
+      message.success(
+        replacedSecret && secret
+          ? t('pages.preference.pair.hints.valuesReplaced')
+          : t('pages.preference.pair.hints.valuesRemembered'),
+      )
+    }
+
+    // 值已经在凭据库里了，这里只交地址：Rust 会用刚存下的那两个
     await pairConnect(pairStore.settings.relay.url)
   } catch (reason) {
     message.error(String(reason))
+  } finally {
+    connecting.value = false
   }
 }
 
@@ -406,6 +566,51 @@ const canPreviewSound = computed(
     </ProListItem>
 
     <ProListItem
+      :description="$t('pages.preference.pair.hints.serverPassword')"
+      :title="$t('pages.preference.pair.labels.serverPassword')"
+      vertical
+    >
+      <Flex
+        align="center"
+        class="w-full"
+        gap="small"
+        wrap
+      >
+        <Input.Password
+          v-model:value="serverPasswordInput"
+          class="w-56"
+          :placeholder="$t('pages.preference.pair.placeholders.serverPassword')"
+          @press-enter="handleSaveServerPassword"
+        />
+
+        <Button
+          :disabled="!serverPasswordInput.trim()"
+          :loading="savingServerPassword"
+          type="primary"
+          @click="handleSaveServerPassword"
+        >
+          {{ $t('pages.preference.pair.buttons.save') }}
+        </Button>
+
+        <Tag
+          v-if="pairStore.hasServerPassword"
+          color="success"
+        >
+          {{ $t('pages.preference.pair.hints.secretConfigured') }}
+        </Tag>
+
+        <Button
+          v-if="pairStore.hasServerPassword"
+          danger
+          type="text"
+          @click="handleDeleteServerPassword"
+        >
+          {{ $t('pages.preference.pair.buttons.delete') }}
+        </Button>
+      </Flex>
+    </ProListItem>
+
+    <ProListItem
       :description="$t('pages.preference.pair.hints.pairSecret')"
       :title="$t('pages.preference.pair.labels.pairSecret')"
       vertical
@@ -420,6 +625,7 @@ const canPreviewSound = computed(
           v-model:value="secretInput"
           class="w-56"
           :placeholder="$t('pages.preference.pair.placeholders.pairSecret')"
+          @press-enter="handleSaveSecret"
         />
 
         <Button
