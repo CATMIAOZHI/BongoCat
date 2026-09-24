@@ -266,7 +266,7 @@
           "serverPasswordSaved": "服务器密码已保存",
           "serverPassword": "部署服务器的那个人在服务器上设置的密码，两个人都要填同一个值，没有它就连不上这台服务器（挡住陌生人白用这台服务器）。用官方 Cloudflare 中继时不用填。",
           "valuesRemembered": "已记住这次填写的值，下次启动会自动用",
-          "valuesReplaced": "已记住这次填写的值；原来保存的配对密码已经被它替换，下次启动用新的",
+          "valuesReplaced": "已记住这次填写的值，并替换掉原来保存的配对密码；下次启动用新的",
           "deleteConfirmTitle": "删除「{name}」？",
           "deleteSecretBody": "删掉之后这串密码就看不到了，只能请对方重新发一次。",
           "deleteServerPasswordBody": "删掉之后要再向部署服务器的人要一次。",

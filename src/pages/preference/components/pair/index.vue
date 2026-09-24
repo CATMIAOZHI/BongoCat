@@ -464,7 +464,8 @@ async function handleConnect() {
 
     const secret = secretInput.value.trim()
     const serverPassword = serverPasswordInput.value.trim()
-    const replacedSecret = pairStore.hasSecret
+    const hadSecret = pairStore.hasSecret
+    let replacedSecret = false
     let remembered = false
 
     // 连接用的值**就是**记住的值：输入框里填了就先落盘（粘贴完不必先点「保存」）。
@@ -474,7 +475,14 @@ async function handleConnect() {
     // （只读审计的 P1-1）。
     if (secret) {
       // Rust 只回显指纹，不回显 secret 本身（R10 / R17）
-      pairStore.secretFingerprint = await pairSetSecret(secret)
+      const fingerprint = await pairSetSecret(secret)
+
+      // 指纹和原来那串一样，就是用户不放心又把同一串粘了一遍：别说「替换」。
+      // 指纹是空的时候（读失败）也不说——宁可不提，别报一句不成立的话。
+      const known = pairStore.secretFingerprint
+
+      replacedSecret = hadSecret && known !== '' && known !== fingerprint
+      pairStore.secretFingerprint = fingerprint
       pairStore.hasSecret = true
       secretInput.value = ''
       remembered = true
@@ -490,10 +498,10 @@ async function handleConnect() {
     // 先把「记住了」说出来再连接：连接失败时用户会看到两个空输入框 + 一条红字，容易
     // 读成「白填了」。落盘确实已经成功，这句话和后面那条错误不矛盾。
     if (remembered) {
-      // 本来存过一串、现在又填了新的，就是**替换**——凭据库里的旧值读不回来，
+      // 本来存过一串、现在填的是**不一样**的，就是替换——凭据库里的旧值读不回来，
       // 这件事得明说，否则用户不知道老的那串已经没了
       message.success(
-        replacedSecret && secret
+        replacedSecret
           ? t('pages.preference.pair.hints.valuesReplaced')
           : t('pages.preference.pair.hints.valuesRemembered'),
       )
