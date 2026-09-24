@@ -246,6 +246,26 @@
 > - 前端本轮**没有改动**，所以没有再跑 `tsc` / `eslint` / `pnpm test`。
 >
 > 11. **仍未做**：**真机双端（两台机器、真实 NAT）验收**——包括「48 KiB 的分片真的过 DataChannel」这一条（假腿单测覆盖不到 SCTP 消息上限与 High/Low 在真实通道上的往返）、「服务器转发量明显下降」的人工观察；自建中继收摊（真机验收之前不收）。
+>
+>     **R33 订正**：上面括号里的两件事**不需要两台机器**，已改成单机自动化；真机项只剩跨 NAT 的打洞成功率（与视觉、打包）。
+
+> **R33（单机验收：48 KiB 分片真的过 DataChannel + 服务器转发量的单机观测）—— 提交 `5f476f5`**
+>
+> 1. **起因**：R32 第 11 条把「48 KiB 的分片真的过 DataChannel」与「服务器转发量明显下降」一起归给了「两台机器、真实 NAT」的人工验收，而用户只有一台机器。这两件事要分开看：**跨 NAT 的打洞成功率**只能人工双端；而「这一帧过不过得了真的 SCTP / DataChannel」「走 DC 的那一单中继到底经手了多少字节」在本机就能自动化。
+> 2. **`p2p` 层的三个单机用例**（`src-tauri/src/core/pair/p2p.rs`，不走中继、不需要第二台机器、跑在默认的 `cargo test --lib` 里）：同一进程里的两条 `P2pLink` 互喂信令，用的仍然是真的 host candidate、真的 ICE、真的 DataChannel；分片按 `TransferChunk` + 48 KiB 明文 + 真的 `PairCipher` 封帧，接收侧解密后再比对字节。
+>    - `the_reliable_lane_carries_real_48kib_chunks`：24 块整块 + 尾巴上 1 个**1 字节的短块**（真实附件的最后一块总是短块）；断言两种上线长度（48 KiB + 帧头 + nonce + tag / 1 字节 + 帧头 + nonce + tag）、seq 严格递增、拼回来逐字节一致（补 R32 的「48 KiB 真的能过 SCTP」缺口，顺带把短帧也过一遍）。
+>    - `the_send_buffer_really_fills_and_drains`：一口气灌 200 块（约 9.4 MiB，远多于 192 KiB 的发送缓冲上限）；断言 `writable` 真的翻假、9.4 MiB 全部逐字节到达、排空之后 `writable` 真的翻回真（补 R32 第 6 / 7 条只在假腿上量过的缺口：High / Low 事件在真通道上真的会来）。
+>    - `dropping_the_leg_mid_burst_never_delivers_a_torn_chunk`：收到 2 块之后**真的拔掉发起方的腿**（`Drop` → 驱动循环收摊 → 关掉 PeerConnection）；断言窗口内到的每一块都是整块、有序、且是源字节的前缀——没有任何半块 / 错位块上线（V1 没有断点续传，一条被截断的帧会让接收侧把整单判废）。接收侧**多久**才发现对端没了由 ICE 的 consent freshness 决定（几十秒量级）、不由这一层决定，所以这里只做有界窗口的观察。
+> 3. **文件走 DC 的 e2e**（`src-tauri/src/core/pair/e2e.rs`，`#[ignore]`，需要本机 relay）：`a_file_takes_the_data_channel_and_barely_touches_the_relay` 在真中继前面挡一个**纯 TCP 的字节计数器**（不解析 WebSocket，只数两个方向的字节），两个 `PairManager` 都连到它上面；等两边 `p2p` 都 `connected`、再等 2 秒（`reliable` 那条腿要自己 ping / pong 回来才算验过；UI 的 `p2p` 只描述可覆盖腿）后，发一个 1.5 MiB + 1 字节的附件。计数器的读法：传输窗口**前**已经 > 0（握手与 ICE 信令真的走过它，证明它在链路上），窗口内的增量就是「这条文件让服务器经手了多少字节」。**这条用例只在 `http://host:port` 形态的 relay 上真跑**：换成已经部署好的 https 中继它只会打印一行然后跳过（而 `--ignored` 全跑时跳过的用例仍算通过），所以那种情况下的「7/7」不代表这条量过。
+> 4. **实测（本机自建中继 `127.0.0.1:8798`，心跳 2 秒）**：文件 **1,572,865 字节**（32 块整块 + 1 字节短块），传输窗口内中继经手 **0 字节（0%）**；传完两边 `p2p` 仍是 `connected`。
+>
+>    **反向对照（同一套计数方法）**：把同一个 1.5 MiB 负载交给 `two_clients_exchange_a_file_through_the_relay`（那条用例在 offer 之前**不等 P2P**，所以 `StartTransfer` 时 `reliable_verified` 还是假、这一单钉在中继上；用例自己不校验路由），中继经手 **1,572,864 字节的文件 + 约 5 KB 开销**（独立量到两次：1,577,789 与 1,578,024，差额是心跳落在窗口里的条数）。两侧合起来才能说明：计数器真的会看见走中继的那一单，而「0 字节」是真没走。
+>
+> 5. **仍然只能人工做的**：跨 NAT 的打洞成功率（UDP 封锁 / 跨境抖动下的真实成功率）、真机上「明显更跟手」的目视、`pnpm tauri build`。会话层「拔腿之后那一单失败、中继上补一条 cancel、中继那一单不受影响」的收尾现在有直接调用 `direct_lost()` 的单测（`losing_the_direct_leg_fails_its_transfer_and_cancels_it_over_the_relay`）——会话层没有真的拔腿入口，真拔腿只能在 `p2p.rs` 那一层做，两边合起来才是完整的那条路径。**残余**：`direct_lost()` 的两个触发点（`ChannelClosed(Reliable)` 与探针超时）本身仍没有用例驱动，那是 `live` 循环里的接线，本轮只钉住了动作本身。
+> 6. **没有改产品代码**：本轮只加测试与文档。`SIGNAL_VERSION`、线上帧格式、pacer 参数、DC 的缓冲阈值一律未动。
+> 7. **验证**：单测 **124 passed / 8 ignored / 0 failed**（+4）；真中继 e2e **7/7**（+1）；`cargo check --lib` 0 warning；`cargo fmt --check` 37 处（既有基线，本轮新增代码 0 处）。独立只读审计（**新开的代理**：两轮代码审计 + 一轮数字复核）**无 P0 / 无 P1**，两轮 P2 已修（对照句缺实测、短块没覆盖、注释精度、「7 条」在 CF 上会误导、本条的审计数字与对照字节数表述）。它自己跑到的数字：第一轮 **123 / 7 / 0 / 37**（那一轮还没有 `direct_lost()` 的用例），第二轮 **124 / 7 / 0 / 37**；两轮都复现了「窗口内中继 0 字节」，并独立量到反向对照 1,578,024 字节。
+>
+>    规划评审（只读代理）一轮 `CHANGES REQUIRED` 后 `REVIEW: AGREED`：它抓到 R33 初稿里那句「会话层收尾由假腿单测覆盖」是**假话**（`direct_lost()` 全仓只有生产调用点、一处测试都没有），要求补上面第 5 条那条单测——口径因此从「加强」变成「补上真缺口」。
 
 ---
 
@@ -482,7 +502,8 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
   2. **越界的 offer 回 reject，而不是本机报错**（§7 那条的落地形状）：参数校验失败以前只在本机 `emit_error`，发送方会停在 `AwaitingAccept` 等一个永远不来的回执（V1 没有停滞超时）；现在回一条 `transfer.reject`，两端立刻按 §43 收尾。
   3. **背压标志在轮次边界复位**（`Leg::reset()`）：新通道的 SCTP 发送缓冲从 0 开始只增不减，而 High / Low 都是跨阈值的**边沿**事件，不复位的话一轮重协商之后标志会永远停在 `false`，钉在 DC 上的那一单再也发不出分片。
 - **验证（R32）**：单测 **120 passed / 7 ignored / 0 failed**（新增 8 条、重写 1 条：`coverable_frames_take_the_data_channel_and_chat_never_does` 改成 `each_lane_keeps_its_own_stream_off_the_relay`，因为 Phase 10 之后聊天也走 DC）；真中继 e2e **6/6**；`cargo check --lib` 0 warning；`cargo fmt --check` 37 处（基线 46 处，新增代码无差异）。独立只读审计（新代理，两轮）：**AUDIT: CLEAN**（第一轮的 1 个 P1 + 2 个 P2 已全部修掉并复审通过）。
-  - **诚实缺口**：48 KiB 的分片真的过 DataChannel 这条路径只有**假腿**单测覆盖；真中继 e2e 只发了小的 pet-state / ping。也就是「一块 48 KiB 的 SCTP 消息 + `writable` 背压 + High/Low 事件真的能翻回来」在真实通道上还没有自动化用例跑过，这一段留给 §10 的真机双端附件验收。
+  - **诚实缺口（R32 当时）**：48 KiB 的分片真的过 DataChannel 这条路径只有**假腿**单测覆盖；真中继 e2e 只发了小的 pet-state / ping。也就是「一块 48 KiB 的 SCTP 消息 + `writable` 背压 + High/Low 事件真的能翻回来」在真实通道上还没有自动化用例跑过。
+  - **R33 补上（单机，不需要第二台机器）**：上面这条缺口已经用三个本机用例盖掉——24 块 48 KiB + 1 个 1 字节短块真的过 DataChannel 并逐字节比对、192 KiB 发送缓冲真的会压满并在排空后翻回 `writable`（200 块 ≈ 9.4 MiB）、拔腿时不会有半块上线；另外加了「文件走 DC，中继在那个窗口里经手 0 字节」的 e2e（中继前挂一个纯 TCP 字节计数器，反向对照约 1.58 MB：两轮分别量到 1,577,789 / 1,578,024）。会话层那半（`direct_lost()` 收尾 + 中继上补 cancel）由 `manager.rs` 的单测直接钉住。跨 NAT 的成功率仍是人工项。
 
 ---
 
@@ -502,6 +523,8 @@ perf(pair): raise the pet state ceiling and interpolate remotely
 
 Phase 9a 与 9b 也拆成了两个提交（R31）：`5f36bd8`（`feat(pair): give the data channel its own pacing budget and a 60hz ceiling`）与 `8b49a50`（`feat(pair): interpolate the remote cat between snapshots`）。上限契约与渲染插值是两件独立的事，放在一起反而看不清各自的验证面。
 
+单机验收（R33）同样拆成两条：`test(pair): ...`（三个 `p2p` 用例 + 一条 `direct_lost()` 的 `manager` 用例 + 一条挂字节计数器的 e2e）与 `docs(pair): record the phase 10 single-machine acceptance`（本条记录与 §8 / §10 / §11 / §12 的订正）。测试与文档分开的理由是两者跑的地方不同：前者进 CI（`cargo test --lib`），后者的价值只在读文档时体现。
+
 Phase 10 落成**一个**提交（R32）：`c7c9334`（`feat(pair): carry the reliable streams over a second data channel`）。`chunk_count` / `flush` / `handle_binary` / `send_next_chunk` 的签名改动是跨文件的，按「传输层 / 路由」拆会在中间留下不可编译的点，所以没有拆——一条能编译的提交比两条好看但不能编译的强。
 
 ---
@@ -516,12 +539,14 @@ Phase 10 落成**一个**提交（R32）：`c7c9334`（`feat(pair): carry the re
 
 **P2P**
 
-- 打洞成功时，猫咪状态与聊天不经服务器；服务器转发量可观察到明显下降。
+- 打洞成功时，猫咪状态与聊天不经服务器；服务器转发量可观察到明显下降。**（R33：单机可量化——中继前面挂一个纯 TCP 字节计数器，走 DC 的 1.5 MiB 附件实测窗口内中继经手 0 字节。）**
 - 打洞失败时自动走中继，用户无感知。
 - 对面是**旧客户端**时不发起 ICE（旧中继不影响，`pair.signal` 走 kind 8 本来就转发），行为与 v1 一致。
 - P2P 掉线后能自动回落中继，聊天不丢、附件按 §43 收尾。
 
-**适用范围（R30 补，R32 再补）**：8c 之后，上面第一条只有**猫咪状态与输入统计**成立。**Phase 10 落地（R32）之后，「聊天不经服务器」与「附件不经服务器」也成立**——条件是 `reliable` 那条腿 open + verified；对端是旧客户端、打洞失败、探针超时、或背压挡住的那些时刻自动回落中继（用户无感知，聊天靠 DB 补发、附件按 §43 收尾）。第三条（旧客户端行为与 v1 一致）与第四条（掉线回落、聊天不丢）不受影响：前者靠 `hello` 的可选能力字段，后者今天本来就是这样。
+**适用范围（R30 补，R32 再补，R33 定终）**：8c 之后，上面第一条只有**猫咪状态与输入统计**成立。**Phase 10 落地（R32）之后，「聊天不经服务器」与「附件不经服务器」也成立**——条件是 `reliable` 那条腿 open + verified；对端是旧客户端、打洞失败、探针超时、或背压挡住的那些时刻自动回落中继（用户无感知，聊天靠 DB 补发、附件按 §43 收尾）。第三条（旧客户端行为与 v1 一致）与第四条（掉线回落、聊天不丢）不受影响：前者靠 `hello` 的可选能力字段，后者今天本来就是这样。
+
+**「48 KiB 分片真的过 DataChannel」与「服务器转发量下降」已经是单机自动化证据（R33）**，不再需要两台机器：三个 `p2p` 层用例（跑在默认的 `cargo test --lib` 里，含 1 字节短块的尾帧）+ 一条挂字节计数器的中继 e2e（`--ignored`，只在 `http://host:port` 的自建中继上真跑；反向对照用同一套方法量到约 1.58 MB 过服务器：两轮分别 1,577,789 / 1,578,024）+ 一条直接调 `direct_lost()` 的单测（会话层收尾）。**真机双端只剩跨 NAT 的打洞成功率**，以及「更跟手」的目视与 `pnpm tauri build`。
 
 **60Hz**
 
@@ -537,13 +562,14 @@ Phase 10 落成**一个**提交（R32）：`c7c9334`（`feat(pair): carry the re
 
 # 11. 测试与验证
 
-| 层       | 手段                                                                                             |
-| -------- | ------------------------------------------------------------------------------------------------ |
-| 静态     | `cargo check --lib`、`cargo fmt --check`（注意仓库既有差异）、`eslint src`、`tsc --noEmit`       |
-| 单元     | `cargo test --lib`（含新增的额度、夹紧、信令编码用例）、`vitest run`（前端 mapper 与插值纯函数） |
-| 中继 e2e | 对 CF 与自建两份中继各跑一次 `cargo test --lib pair::e2e -- --ignored`                           |
-| 真机     | 双端跑 `pnpm tauri dev`（或安装包），验证 P2P 打通、回落、60Hz 视觉                              |
-| 打包     | `pnpm tauri build --debug`；确认体积与编译时间变化                                               |
+| 层       | 手段                                                                                                                                                                                                                            |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 静态     | `cargo check --lib`、`cargo fmt --check`（注意仓库既有差异）、`eslint src`、`tsc --noEmit`                                                                                                                                      |
+| 单元     | `cargo test --lib`（含新增的额度、夹紧、信令编码用例）、`vitest run`（前端 mapper 与插值纯函数）                                                                                                                                |
+| 中继 e2e | 对 CF 与自建两份中继各跑一次 `cargo test --lib pair::e2e -- --ignored`（7 条，含「走 DC 的附件让中继经手多少字节」那条：中继前挂纯 TCP 字节计数器。**那条只认 `http://host:port`**，CF 那种 https 部署上它会跳过、仍记作 pass） |
+| 单机 P2P | `cargo test --lib pair::p2p`（真 DataChannel 上的 48 KiB 分片 + 1 字节短块、192 KiB 背压压满 / 排空、拔腿时不会有半块；不需要中继与第二台机器）                                                                                 |
+| 真机     | 双端跑 `pnpm tauri dev`（或安装包），验证跨 NAT 的打洞成功率、60Hz 视觉                                                                                                                                                         |
+| 打包     | `pnpm tauri build --debug`；确认体积与编译时间变化                                                                                                                                                                              |
 
 新增的 CI job 已在 `.github/workflows/client-ci.yml` 落地（R24-2、R27），单元层与静态层的 `tsc` 现在会在 PR 上自动跑（`cargo fmt --check` 与 `eslint src` 仍不在门禁内）。触发用 `push` + `pull_request` + `workflow_dispatch`，`paths` 过滤 `src/**`、`src-tauri/**`、`scripts/**`、`pnpm-workspace.yaml`、`Cargo.toml`、`Cargo.lock`、`package.json`、`pnpm-lock.yaml`、`tsconfig*.json`、`vitest.config.ts` 和 workflow 自身。**不**过滤 `vite.config.ts` / `uno.config.ts`——这两个 job 都不读它们（`vitest run` 只读 `vitest.config.ts`）。`scripts/**` 与 `pnpm-workspace.yaml` 必须留在列表里：前者是 `pnpm build:icon` 直接执行的东西，后者决定 `pnpm install` 能否成功。
 
@@ -569,7 +595,9 @@ Phase 10 落成**一个**提交（R32）：`c7c9334`（`feat(pair): carry the re
 | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `webrtc-rs` 在 3 个 Windows release 目标上编译失败    | Phase 8 无法交付                                                                                         | 编译 spike 已过（R24-1）；4 个非 Windows 目标已用 `cfg` 门控排除                                                                                                                                                                                 |
 | Windows 定时器精度 15.6ms 影响 60Hz                   | 发不出真正 60Hz                                                                                          | 事件驱动而非固定 16ms 定时器                                                                                                                                                                                                                     |
-| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB）        | 附件分片在 P2P 上失败                                                                                    | 48 KiB 保守默认 + 真机大文件验证                                                                                                                                                                                                                 |
+| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB）        | 附件分片在 P2P 上失败                                                                                    | 48 KiB 保守默认 + 单机真 DataChannel 用例（**R33**：24 块 48 KiB + 1 字节短块逐字节比对、200 块 ≈ 9.4 MiB 压满再排空）                                                                                                                           |
+| 可靠腿掉了之后在传的附件没人收尾                      | 会话永久留在表里：发送方停在 `AwaitingAccept` / 接收方等分片，V1 没有停滞超时                            | **已落地（R32 / R33）**：`direct_lost()` 本地判失败 + 中继上补 `transfer.cancel`；`manager.rs` 的单测直接调用它钉住「Direct 那单失败、中继那单不受影响、cancel 只走中继腿」                                                                      |
+| 「服务器转发量下降」没有可复现的观测手段              | 这条验收只能靠目视，改坏了也看不出来                                                                     | **已落地（R33）**：单机在中继前挂一个纯 TCP 字节计数器，走 DC 的 1.5 MiB 附件实测窗口内中继经手 0 字节（`a_file_takes_the_data_channel_and_barely_touches_the_relay`）                                                                           |
 | `panic = "abort"` 下 webrtc 内部 panic 会带走整个 App | 一条 P2P 连接的问题升级成整个应用崩溃                                                                    | `p2p.rs` 里对 webrtc 的 `Result` 一律不许 `unwrap` / `expect`，DC / ICE 失败只走回落                                                                                                                                                             |
 | 自签 / 裸 IP 无法连自建中继                           | 部署文档承诺的「compose up 就能用」落空                                                                  | 文档强制域名 + Caddy；可选自签开关                                                                                                                                                                                                               |
 | UDP 被封 / 跨境抖动                                   | P2P 打洞失败率高                                                                                         | TURN 备 TCP/443；打不通就走中继                                                                                                                                                                                                                  |
