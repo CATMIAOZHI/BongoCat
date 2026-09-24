@@ -126,6 +126,11 @@ export interface PairRuntime {
   connection: PairConnectionState
   /** P2P 这条腿：`off` / `connecting` / `connected`，纯显示用 */
   p2p: P2pState
+  /**
+   * 桌宠快照的发送上限（Hz），由 Rust 按当前生效传输给出（§6 / R23）。
+   * `0` = 还没拿到：发送侧按 v1 的 3Hz 兜底（见 `usePairState`）。
+   */
+  petStateHz: number
   peerOnline: boolean
   peerName?: string
   remotePresence: RemotePresenceState
@@ -190,6 +195,7 @@ export const usePairStore = defineStore('pair', () => {
   const runtime = reactive<PairRuntime>({
     connection: 'disabled',
     p2p: 'off',
+    petStateHz: 0,
     peerOnline: false,
     peerName: void 0,
     remotePresence: 'offline',

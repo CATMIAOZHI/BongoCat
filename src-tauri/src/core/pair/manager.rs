@@ -71,6 +71,16 @@ const OUTBOUND_BURST: f64 = 20.0;
 /// 家用上行，用户感知不到差别。
 const OUTBOUND_CHUNKS_PER_SECOND: f64 = 15.0;
 const OUTBOUND_CHUNK_BURST: f64 = 10.0;
+/// DC 那条腿自己的帧额度（R23）：P2P 下没有中继的令牌桶可依，这条腿的预算就是 §6 的
+/// 60Hz 上限本身。它**不是** `OUTBOUND_*` 的缩放，也不参与 `retune`——DC 上的帧压根
+/// 不经过中继的计费点，拿中继额度去压它正好会毁掉 60Hz。
+const DIRECT_FRAMES_PER_SECOND: f64 = 60.0;
+const DIRECT_BURST: f64 = 60.0;
+/// 桌宠快照的发送上限（§6 / R23）：只有当前生效传输能承载时才提上去。
+const MAX_PET_STATE_HZ: f64 = 60.0;
+/// R4 以来（也就是 v1）的缺省快照上限：传输承载不了 60Hz 时保持它，
+/// 所以 CF 版拿到缺省推导值（30 × 2/3 = 20）时行为与今天一字不变。
+const DEFAULT_PET_STATE_HZ: f64 = 3.0;
 const RECENT_MESSAGE_LIMIT: usize = 256;
 pub const HEARTBEAT_ENV: &str = "BONGO_PAIR_HEARTBEAT_SECS";
 const DEFAULT_HEARTBEAT_SECS: u64 = 60;
@@ -114,6 +124,10 @@ pub struct PairStatus {
     /// P2P 这条腿的状态（R21 / R28）。**只影响显示与 Phase 8c 的切换决策**：中继上的
     /// 功能（聊天、附件、语音、信令、重连）与它无关，所以它失败时用户不该看到任何降级。
     pub p2p: P2pState,
+    /// 前端该按多少 Hz 发桌宠快照（§6 / R23）。由**当前生效传输**的额度决定，见
+    /// [`pet_state_hz`]：P2P 下是 60，自建中继广告额度够时是 60，其余（含 CF 缺省）是 3。
+    /// 前端只消费这个数字，不再自己判断该用哪个上限。
+    pub pet_state_hz: f64,
 }
 
 /// P2P 这条腿的状态
@@ -326,6 +340,7 @@ impl PairManager {
                 relay_url: None,
                 last_error: None,
                 p2p: P2pState::Off,
+                pet_state_hz: DEFAULT_PET_STATE_HZ,
             }),
             sender: Mutex::new(None),
             pending: Mutex::new(PendingReplaceable::default()),
@@ -439,6 +454,8 @@ impl PairManager {
             // 新会话还没起腿：上一轮的 `Connected` 必须立刻消失，否则「立即连接」
             // 之后的十几秒里偏好页会显示「正在连接」+「已直连」
             status.p2p = P2pState::Off;
+            // 同理，快照上限也回到缺省：新会话还没读到中继广告的额度
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
         });
 
         tauri::async_runtime::spawn(async move {
@@ -461,6 +478,7 @@ impl PairManager {
             status.remote_stats = None;
             // 会话没了，P2P 那条腿也跟着没了：不复位的话 UI 会一直显示「已直连」
             status.p2p = P2pState::Off;
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
         });
     }
 
@@ -798,6 +816,7 @@ impl PairManager {
             status.remote_stats = None;
             status.last_error = Some(message.clone());
             status.p2p = P2pState::Off;
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
         });
 
         self.sink.emit(EVENT_ERROR, json!({ "message": message }));
@@ -1199,6 +1218,7 @@ async fn run_session(
             // 腿已经随 `live` 返回被 Drop 掉了，而退避（最长 30 秒）+ 连接与 welcome
             // 超时（15 + 10 秒）里不会再有任何 P2P 事件：不复位就会「重连中」+「已直连」
             status.p2p = P2pState::Off;
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
         });
 
         // 退避期间仍然接收命令：排队，或在用户手动断开时立即退出
@@ -1337,6 +1357,10 @@ where
     let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
     // 附件分片另有一层额度（R18）：两套都放行才发一块
     let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+    // DC 那条腿自己的额度（R23）。它**既不吃 `pacer` 也不吃 `chunk_pacer`**：DC 上的帧
+    // 根本不经过中继的计费点，拿中继额度去压它正好会把可覆盖流压到 20 帧/秒，
+    // 与 60Hz 的目标冲突。所以这条腿的预算就是 §6 的上限本身。
+    let mut direct_pacer = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
 
     // R20：先读掉 `server.welcome` 再开始补发（额度与 ICE 广告都在它里面）
     let config = match read_welcome(&mut stream, manager, generation).await {
@@ -1356,7 +1380,9 @@ where
     }
 
     // 退避期间攒下的可覆盖帧在这里兜底：那时腿还不存在，所以按中继发（`None`）
-    if let Err(error) = flush_replaceable(&mut sink, None, state, &mut pacer).await {
+    if let Err(error) =
+        flush_replaceable(&mut sink, None, state, &mut pacer, &mut direct_pacer).await
+    {
         return Outcome::Lost(PairFailure {
             message: error,
             fatal: false,
@@ -1376,7 +1402,13 @@ where
     let mut link_events = Some(link_events);
 
     // 每次（重）连都从 `Off` 开始：上一轮留下的 `Connected` 在腿重新协商成功之前都是假的
-    manager.publish(generation, |status| status.p2p = P2pState::Off);
+    publish_route(
+        manager,
+        generation,
+        P2pState::Off,
+        false,
+        outbound.frames_per_second,
+    );
 
     // 中继腿的探针：永远是 WS Ping，中继自己回 Pong（R28）。它只由中继入站清除。
     let mut relay_awaiting_pong = false;
@@ -1452,7 +1484,15 @@ where
 
                     let leg = coverable_leg(dc_open, dc_verified, &link);
 
-                    if let Err(error) = flush_replaceable(&mut sink, leg, state, &mut pacer).await {
+                    if let Err(error) = flush_replaceable(
+                        &mut sink,
+                        leg,
+                        state,
+                        &mut pacer,
+                        &mut direct_pacer,
+                    )
+                    .await
+                    {
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
                 }
@@ -1607,6 +1647,12 @@ where
                                     outbound.chunks_burst,
                                 );
 
+                                // 额度变了，快照上限可能跟着变（R23）。这里只重算它，
+                                // `p2p` 由腿自己的事件负责，别在这一支里动。
+                                let hz = pet_state_hz(dc_open && dc_verified, outbound.frames_per_second);
+
+                                manager.publish(generation, |status| status.pet_state_hz = hz);
+
                                 // `iceServers` 只在会话建立时读一次：协商用的 STUN/TURN 中途
                                 // 换掉会让两侧的候选对不上，要换得等下一轮协商
                             }
@@ -1650,7 +1696,13 @@ where
                         // `abort_transfers`，砍掉正在传的附件（R21 修正 3）。
                         dc_open = false;
                         dc_verified = false;
-                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                        publish_route(
+                            manager,
+                            generation,
+                            P2pState::Connecting,
+                            false,
+                            outbound.frames_per_second,
+                        );
                     } else {
                         match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
                         {
@@ -1702,7 +1754,13 @@ where
                         }
                     }
                     Some(link::P2pEvent::Negotiating) => {
-                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                        publish_route(
+                            manager,
+                            generation,
+                            P2pState::Connecting,
+                            false,
+                            outbound.frames_per_second,
+                        );
                     }
                     Some(link::P2pEvent::ChannelOpen) => {
                         dc_open = true;
@@ -1722,14 +1780,26 @@ where
                             Err(error) => manager.emit_error(generation, error),
                         }
 
-                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                        publish_route(
+                            manager,
+                            generation,
+                            P2pState::Connecting,
+                            false,
+                            outbound.frames_per_second,
+                        );
                     }
                     Some(link::P2pEvent::ChannelClosed) => {
                         dc_open = false;
                         dc_verified = false;
 
                         // 腿会自己重试，所以是「正在协商」而不是「关闭」
-                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
+                        publish_route(
+                            manager,
+                            generation,
+                            P2pState::Connecting,
+                            false,
+                            outbound.frames_per_second,
+                        );
                     }
                     Some(link::P2pEvent::Inbound(bytes)) => {
                         // DC 腿的入站（§4.2 / R28）：只清 DC 腿**自己的**标志。**不要**动
@@ -1746,7 +1816,13 @@ where
                         // 会在选路已经回到中继的情况下又亮起「已直连」，而且不会再自动复位。
                         if dc_open && !dc_verified {
                             dc_verified = true;
-                            manager.publish(generation, |status| status.p2p = P2pState::Connected);
+                            publish_route(
+                                manager,
+                                generation,
+                                P2pState::Connected,
+                                true,
+                                outbound.frames_per_second,
+                            );
                         }
 
                         if bytes.len() > MAX_BINARY_FRAME_SIZE {
@@ -1770,6 +1846,42 @@ where
             },
         }
     }
+}
+
+/// 前端该按多少 Hz 发桌宠快照（§6 / R23）。
+///
+/// 只看**当前生效传输**的额度：DC 那条腿没有中继的令牌桶，直接用 60Hz 上限；中继腿用
+/// `server.welcome` 广告值推导出的帧额度，够 60 才提到上限（自建中继广告 90 帧/秒 →
+/// 推导 60，§10 的那条验收就是它）。两条都不满足就退回 v1 的 3Hz —— CF 缺省 30 →
+/// 推导 20，所以「CF 版行为一字不变」。
+///
+/// `direct` 指的是**桌宠快照真正要走的**那条腿（DC 的 `pet-state` 通道），不是 DC 上的
+/// `reliable` 通道：两者的可用性各自独立，后者只影响聊天与附件走哪条腿（Phase 10）。
+fn pet_state_hz(direct: bool, relay_frames_per_second: f64) -> f64 {
+    if direct || relay_frames_per_second >= MAX_PET_STATE_HZ {
+        MAX_PET_STATE_HZ
+    } else {
+        DEFAULT_PET_STATE_HZ
+    }
+}
+
+/// 一起发布「当前生效传输」派生出来的两个字段（§6 / R23）。
+///
+/// 它们由同一对标志决定，所以必须同一次写完：分开写会造出「已直连但仍然按 3Hz 发」
+/// 或者反过来的中间态，而前端是各读各的。
+fn publish_route(
+    manager: &Arc<PairManager>,
+    generation: u64,
+    p2p: P2pState,
+    direct: bool,
+    relay_frames_per_second: f64,
+) {
+    let hz = pet_state_hz(direct, relay_frames_per_second);
+
+    manager.publish(generation, |status| {
+        status.p2p = p2p;
+        status.pet_state_hz = hz;
+    });
 }
 
 /// 中继主动关闭时，把关闭码翻译成人能看懂的原因（取值见 server-cloudflare/src/protocol.ts）
@@ -1827,8 +1939,9 @@ fn coverable_leg<'a>(
 
 /// 排**可覆盖**流（宠物快照、统计）：DC 可用时走它，否则照旧走中继。
 ///
-/// 走 DC 时**不占中继的 pacer**：单一 pacer 会把 DC 上的可覆盖流压到中继的 20 帧/秒，
-/// 与 60Hz 的目标直接冲突（R23）。DC 侧自己也没有 pacing——那是 Phase 9a 的事。
+/// 走 DC 时**不占中继的 pacer**，改用那条腿自己的 `direct_pacer`（R23）：单一 pacer 会把
+/// DC 上的可覆盖流压到中继的 20 帧/秒，与 60Hz 的目标直接冲突。DC 的预算就是 §6 的
+/// 60Hz 上限本身（`DIRECT_FRAMES_PER_SECOND`），与中继广告的额度无关。
 ///
 /// 写 `state.replaceable` 的只有两处（退避期的 `FlushReplaceable`、`live` 里同一个
 /// 分支），所以只有这两个地方需要调用本函数；会话开始那次是给退避期攒下的帧兜底。
@@ -1837,6 +1950,7 @@ async fn flush_replaceable<S>(
     leg: Option<&dyn link::CoverableLeg>,
     state: &mut SessionState,
     pacer: &mut Pacer,
+    direct_pacer: &mut Pacer,
 ) -> Result<(), String>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -1844,6 +1958,10 @@ where
 {
     while let Some((key, frame)) = state.replaceable.pop_first() {
         if let Some(leg) = leg {
+            // DC 那条腿有自己的额度（R23）。这里**不**吃中继的 pacer：DC 上的帧不经过
+            // 中继的计费点，用中继额度去压它就会把 60Hz 压回 20 帧/秒。
+            direct_pacer.acquire().await;
+
             // 可覆盖流是绝对值快照：发失败就丢，等下一帧盖掉它
             leg.send(frame);
 
@@ -3259,6 +3377,7 @@ mod tests {
     async fn coverable_frames_take_the_data_channel_and_chat_never_does() {
         let mut state = SessionState::new(&ROOT_KEY);
         let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut direct_pacer = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
         let mut socket = RecordingSocket::default();
         let leg = FakeLeg::default();
 
@@ -3279,14 +3398,34 @@ mod tests {
 
         // 顺序与 `live` 一致：先可靠队列，后可覆盖队列
         flush(&mut socket, &mut state, &mut pacer).await.unwrap();
-        flush_replaceable(&mut socket, Some(&leg), &mut state, &mut pacer)
-            .await
-            .unwrap();
+        flush_replaceable(
+            &mut socket,
+            Some(&leg),
+            &mut state,
+            &mut pacer,
+            &mut direct_pacer,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(socket.sent.len(), 1, "中继那条线上应当只有聊天");
         assert_eq!(frame_kind(&socket.sent[0]), FrameKind::Chat.as_byte());
         assert_eq!(leg.frames().len(), 1);
         assert_eq!(leg.frames()[0][0], FrameKind::PetState.as_byte());
+
+        // R23：走 DC 的那一帧**不吃中继的 pacer** —— 中继额度只被上面那一条聊天消耗，
+        // 否则 DC 上的可覆盖流会被压回 20 帧/秒、与 60Hz 冲突；反过来 DC 那条腿的
+        // 额度被扣了一枚。
+        assert!(
+            (pacer.tokens - (OUTBOUND_BURST - 1.0)).abs() < 0.05,
+            "走 DC 的可覆盖帧不该消耗中继的令牌: {}",
+            pacer.tokens
+        );
+        assert!(
+            direct_pacer.tokens <= DIRECT_BURST - 1.0 + 0.05,
+            "DC 那条腿的额度应当被扣掉一枚: {}",
+            direct_pacer.tokens
+        );
 
         // 腿不可用（DC 掉了、或者探针还没验过）：可覆盖流回到中继
         state
@@ -3297,7 +3436,7 @@ mod tests {
             )
             .unwrap();
 
-        flush_replaceable(&mut socket, None, &mut state, &mut pacer)
+        flush_replaceable(&mut socket, None, &mut state, &mut pacer, &mut direct_pacer)
             .await
             .unwrap();
 
@@ -3754,6 +3893,47 @@ mod tests {
         assert_eq!(frame.rate, 60.0);
         assert_eq!(frame.burst, 60.0);
         assert!(frame.tokens <= frame.burst);
+    }
+
+    /// R23：DC 那条腿的额度就是 §6 的上限本身，与中继广告的额度**无关**，也不参与
+    /// `retune`——那条腿上的帧压根不经过中继的计费点。
+    #[test]
+    fn the_direct_pacer_carries_the_sixty_hertz_budget() {
+        let direct = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
+
+        assert_eq!(direct.rate, MAX_PET_STATE_HZ);
+        assert_eq!(direct.burst, MAX_PET_STATE_HZ);
+        assert!(direct.rate > OUTBOUND_FRAMES_PER_SECOND);
+    }
+
+    /// §6 / R23：快照上限只跟**当前生效传输**的额度走。CF 缺省（30 → 推导 20）必须留在
+    /// 3Hz —— 这一条就是「CF 版行为一字不变」；自建中继广告 90（推导 60）与 P2P 才是 60。
+    #[test]
+    fn the_pet_state_ceiling_follows_the_effective_transport() {
+        let cloudflare = RelayLimits::cloudflare().outbound();
+        let self_hosted = RelayLimits {
+            frames_per_second: 90.0,
+            ..RelayLimits::cloudflare()
+        }
+        .outbound();
+
+        assert_eq!(
+            pet_state_hz(false, cloudflare.frames_per_second),
+            DEFAULT_PET_STATE_HZ
+        );
+        assert_eq!(
+            pet_state_hz(false, self_hosted.frames_per_second),
+            MAX_PET_STATE_HZ
+        );
+        assert_eq!(
+            pet_state_hz(true, cloudflare.frames_per_second),
+            MAX_PET_STATE_HZ
+        );
+
+        // 离谱的广告值既不能推成 0，也不能超过上限
+        assert_eq!(pet_state_hz(false, 0.0), DEFAULT_PET_STATE_HZ);
+        assert_eq!(pet_state_hz(false, 240.0), MAX_PET_STATE_HZ);
+        assert_eq!(pet_state_hz(false, f64::NAN), DEFAULT_PET_STATE_HZ);
     }
 
     /// 缩容时不能留着超过容量的令牌，否则一次补发就能把中继的桶扣穿

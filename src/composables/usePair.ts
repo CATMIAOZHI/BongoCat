@@ -20,6 +20,13 @@ export interface PairStatus {
   lastError?: string
   /** P2P 这条腿的状态（R21 / R28）：只用于显示，掉线不影响中继上的任何功能 */
   p2p?: P2pState
+  /**
+   * 前端该按多少 Hz 发桌宠快照（§6 / R23）。
+   *
+   * 上限由 Rust 按**当前生效传输**的额度算好：P2P 与「额度够的自建中继」是 60，
+   * CF 缺省与其它情况是 3（v1 的老行为）。前端不再自己判断该用哪个上限。
+   */
+  petStateHz?: number
 }
 
 export type P2pState = 'off' | 'connecting' | 'connected'

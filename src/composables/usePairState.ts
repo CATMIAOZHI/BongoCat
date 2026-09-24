@@ -18,8 +18,13 @@ import {
 } from './usePairActivity'
 import { usePairStatus } from './usePairStatus'
 
-/** R4：持续活动时最多 3Hz 刷新，状态变化立即发送 */
-const SNAPSHOT_INTERVAL_MS = 333
+/**
+ * 拿不到 Rust 给的上限时的兜底：v1 的 3Hz（R4）。
+ *
+ * 真正使用的间隔由 `store.runtime.petStateHz` 决定（§6 / R23）——P2P 与额度够的自建
+ * 中继是 60Hz，CF 缺省仍是 3Hz。这里只负责兜住「状态还没到」的那一小段。
+ */
+const FALLBACK_SNAPSHOT_INTERVAL_MS = 333
 /** §25：统计最多每 30 秒一次 */
 const STATS_INTERVAL_MS = 30_000
 /** §27：鼠标累计移动超过 4px 才算「真的回来了」 */
@@ -71,6 +76,13 @@ export function usePairState() {
     return canSendActivity() && store.settings.privacy.shareInputStats
   }
 
+  /** 当前生效传输允许的快照间隔（毫秒）。上限只由 Rust 给，这里只做兜底。 */
+  const snapshotIntervalMs = () => {
+    const hz = store.runtime.petStateHz
+
+    return hz > 0 ? 1000 / hz : FALLBACK_SNAPSHOT_INTERVAL_MS
+  }
+
   /** 隐私开关为关闭时，对应部分一律发「空值」，而不是发出去再让对端忽略 */
   const applyPrivacy = (snapshot: PetSnapshot): PetSnapshot => {
     const { shareTypingActivity, sharePointer } = store.settings.privacy
@@ -101,7 +113,9 @@ export function usePairState() {
 
     const elapsed = now - lastSentAt
 
-    if (!force && elapsed < SNAPSHOT_INTERVAL_MS) {
+    const interval = snapshotIntervalMs()
+
+    if (!force && elapsed < interval) {
       // 变化发生了但还没到刷新间隔：补一次尾随发送，保证最终状态一定会送达
       if (trailingTimer) clearTimeout(trailingTimer)
 
@@ -109,7 +123,7 @@ export function usePairState() {
         trailingTimer = void 0
 
         sendSnapshot()
-      }, SNAPSHOT_INTERVAL_MS - elapsed)
+      }, interval - elapsed)
 
       return
     }
