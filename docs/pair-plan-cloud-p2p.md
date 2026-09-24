@@ -226,6 +226,27 @@
 >    - **没跑到**：真机双端目视「更跟手」（§10 的人工项）、`pnpm tauri build`。60Hz 是**上限**而不是目标（量化本身就是限流），所以「包量对比」也只在真机上有人工意义。
 > 7. **仍未做**：Phase 10（`reliable` 通道 + 附件分片走 P2P，见 §8 的落地形状）、真机双端验收。
 
+> **R32（Phase 10 落地：`reliable` 通道 + 附件分片走 P2P）—— 提交 `c7c9334`**
+>
+> 1. **分片大小成为「这一单的属性」**：`chunk_size` 从全局常量变成 `OutgoingTransfer` / `IncomingTransfer` 自己的字段（中继 512 KiB、DC 48 KiB），读块、seek、算「这一块该多少字节」全部用它；接收侧按 offer 的值 + 范围校验（`[4 KiB, min(512 KiB, 帧上限推导值)]`）**拒绝**而不是夹紧（§7），两侧的上界是同一个来源（`transfer::MIN_CHUNK_SIZE` 与 `transfer::max_chunk_size()`）。**校验失败从「本机报错」改成回一条 `transfer.reject`**：本地报错会让发送方停在 `AwaitingAccept` 等一个永远不来的回执（V1 没有停滞超时），而对未知 `transferId` 的 reject 在对端是 no-op，重复无害。
+> 2. **能力门控**：`hello` 加可选 `features`（`reliable-channel`），`SIGNAL_VERSION` **保持 1**（硬相等判断，bump 会把新旧客户端之间的 `pet-state` P2P 一起关掉）；双向门控——offerer 只在对面声明过才建、answerer 只在对面声明过才认领，未知 label 一律不接管（8c 的 `on_data_channel` 是无条件认领，多给它一条通道会让它 last-wins 抢走 `pet-state` 的出站方向）。
+> 3. **两条 lane 的探针与标志各自独立**：`reliable` 在自己的 `ChannelOpen` 时补一枚 `pair.ping`，由**它自己**的入站置 `reliable_verified`；入站产生的回执按原路返回（R30 的规矩）。UI 的 `p2p == connected` 仍然只表示**可覆盖流**在 DC 上，第二条腿不进 UI 状态。
+> 4. **route 钉在传输会话上**（§8 形状 3，也就是「在途时延后切换」）：offer、分片、`transfer.complete` **以及回执**都走这一单的那条腿。收尾帧与 offer 走 `flush(..., leg, force = true)` **绕过背压判断**——背压恰好在最后一块之后翻假、完成帧绕了中继的话，接收侧会先看到「分片没收齐」把这一单判废（跨 lane 没有顺序保证）。回执按**这一单钉的 route** 选腿（`reply_leg` / `transfer_route`）：钉在**中继**上的一单绝不走 DC——DC 上丢一帧只有 `direct_lost()` 收尾，而它只管 `Route::Direct` 的会话，发送方会永远停在 `AwaitingAccept`（这一条是独立审计的 P1，见第 10 条）。
+> 5. **失败收敛两处都接上**（§8 形状 4）：`ChannelClosed(Lane::Reliable)` 与探针超时都调 `direct_lost()`——按 §43 失败所有 `route == Direct` 的会话、在**中继**上显式发 `transfer.cancel`、并 `resend_pending_chat()`（库里 `pending` / `sent` 的聊天经中继重发，对端按 message id 去重并补 ack → 线上 at-least-once、UI / DB exactly-once）。只挂「通道关闭」不够：探针超时那一刻通道还是 open 的，只判不可用不关通道。
+> 6. **DC 上的分片有自己的额度与背压**（§7 / §8 形状 6）：`DIRECT_CHUNKS_PER_SECOND = 160` / `DIRECT_CHUNK_BURST = 16`（= 15 × 512 KiB ÷ 48 KiB，与中继那条路同样的字节速率），**不与 60Hz 快照共用桶**、也不动中继的 `pacer` / `chunk_pacer`；发送缓冲 192 KiB（high = limit、low = 48 KiB；**`0` 等于无界，所以不传 0**），`writable` 是由 `OnBufferedAmountHigh/Low` 驱动的**同步**布尔标志——crate 的 `writable()` 是 async 的「等到有空间」，在 `live` 的 `select!` 分支里 await 它会把中继腿的入站读取一起挡住。背压只挡**注入**、不跳号：`mark_sent` 在真的交出帧之后才调用，被拒的那一块下次还是同一个 seq。
+> 7. **背压标志在轮次边界复位**：`Leg::reset()` 里置回 `true`。新通道的 SCTP 发送缓冲从 0 开始只增不减，而 High / Low 都是跨阈值的**边沿**事件——不复位的话一轮重协商之后标志会永远停在 `false`：可靠帧只是绕回中继（无害），但钉在 DC 上的那一单再也发不出分片，而那条腿 open + verified、探针正常，`direct_lost()` 两个触发点都到不了。**残余**：上一轮的泵在通道关闭前后可能投一枚迟到的边沿事件（亚毫秒级，要两个任务正好交错），要彻底消掉得给 `pump` 传一枚 epoch，本轮不做。
+> 8. **`chunk_wait` 的不变量**（§8 形状 7）：算 wait 与真正发帧用同一个 `next_sending_route()`；Direct 那一单在「背压翻假」或「腿不在」时给 `DIRECT_RETRY_INTERVAL = 5ms` 而不是 `ZERO`（`ZERO` 只留给「令牌够且背压允许」），否则 `select!` 会在 `Ok(false)` 与 `ZERO` 之间空转。
+> 9. **没有拆提交**：`chunk_count` / `flush` / `handle_binary` / `send_next_chunk` 的签名改动是跨文件的，按「传输层 / 路由」拆会在中间留下不可编译的点，所以落成一个提交（§9 记一条）。
+> 10. **验证**：
+>
+> - 单测 **120 passed / 7 ignored / 0 failed**（+9：新增 8 条 + 重写 1 条）。改名的 `coverable_frames_take_the_data_channel_and_chat_never_does` → `each_lane_keeps_its_own_stream_off_the_relay` 是**必须的**：Phase 10 之后聊天在可靠腿可用时也走 DC，「聊天永远只走中继」那条断言已经不成立；新断言是「两条腿都在时中继那条线上什么都没有」「背压翻假时聊天退回中继且照常扣中继额度」。
+> - 真中继 e2e **6/6**（心跳 2 秒）。
+> - `cargo check --lib` 0 warning；`cargo fmt --check` **37 处**（基线 46 处；逐行比对后本轮新增的代码没有一处落进去，反而顺手收掉了 9 处既有的）。
+> - 独立只读审计（**新开的代理**，两轮）：**AUDIT: CLEAN**。第一轮 1 个 P1（回执绕 lane，见第 4 条）+ 2 个 P2（背压标志未在轮次边界复位、`MIN_CHUNK_SIZE` 只在测试里用导致 `cargo check` 报警），三条都已修并复审通过。
+> - 前端本轮**没有改动**，所以没有再跑 `tsc` / `eslint` / `pnpm test`。
+>
+> 11. **仍未做**：**真机双端（两台机器、真实 NAT）验收**——包括「48 KiB 的分片真的过 DataChannel」这一条（假腿单测覆盖不到 SCTP 消息上限与 High/Low 在真实通道上的往返）、「服务器转发量明显下降」的人工观察；自建中继收摊（真机验收之前不收）。
+
 ---
 
 # 1. 目标与非目标
@@ -391,9 +412,9 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 见 R22 的清单。要点：
 
 - `TransferOfferPayload.chunk_size` 早已存在，协议不动；
-- 接收侧从「必须等于本机常量」改成**用 offer 的值 + 范围校验**（`[4 KiB, min(512 KiB, 帧上限推导值)]`），越界就**拒绝这条 offer**（R31 的订正：夹紧会让两端的分块长度算法不一致，每一块都会报「附件分片大小不对」，比早失败更难查）；「夹紧」落在**发送侧**选 `chunk_size` 时。两侧的范围必须是**同一对常量**（单一来源：`transfer::MIN_CHUNK_SIZE` 与 `transfer::max_chunk_size()`）。
+- 接收侧从「必须等于本机常量」改成**用 offer 的值 + 范围校验**（`[4 KiB, min(512 KiB, 帧上限推导值)]`），越界就**拒绝这条 offer**（R31 的订正：夹紧会让两端的分块长度算法不一致，每一块都会报「附件分片大小不对」，比早失败更难查）；「夹紧」落在**发送侧**选 `chunk_size` 时。两侧的范围必须是**同一对常量**（单一来源：`transfer::MIN_CHUNK_SIZE` 与 `transfer::max_chunk_size()`）。**已落地（R32）**：校验失败回一条 `transfer.reject`（不是只在本机 `emit_error`），否则发送方会停在 `AwaitingAccept` 等一个永远不来的回执。
 - 中继 512 KiB / P2P 48 KiB（`P2P_CHUNK_SIZE`）；
-- 分片 Pace 随传输层参数化（R23）：中继那条路仍是「通用额度 + 分片额度」两套；**DC 那条路有自己的分片额度**（`DIRECT_CHUNKS_PER_SECOND` / `DIRECT_CHUNK_BURST`），按「与中继那条路同样的字节速率」推导——15 × 512 KiB ÷ 48 KiB = 160，即 160 × 48 KiB/s ≈ 7.5 MiB/s，与今天中继那条路的天花板持平，不是新引入的激进值。它**不与 60Hz 快照共用桶**，否则 48 KiB 的块会把 60 枚/秒吃光、对端猫在整段传输里冻住。两条都落地在 Phase 10。
+- 分片 Pace 随传输层参数化（R23）：中继那条路仍是「通用额度 + 分片额度」两套；**DC 那条路有自己的分片额度**（`DIRECT_CHUNKS_PER_SECOND` / `DIRECT_CHUNK_BURST`），按「与中继那条路同样的字节速率」推导——15 × 512 KiB ÷ 48 KiB = 160，即 160 × 48 KiB/s ≈ 7.5 MiB/s，与今天中继那条路的天花板持平，不是新引入的激进值。它**不与 60Hz 快照共用桶**，否则 48 KiB 的块会把 60 枚/秒吃光、对端猫在整段传输里冻住。**已落地（R32）**：两条按 `TransferSession.route` 二选一，**绝不两套都扣**——DC 上的分片一枚中继令牌都不吃，中继那条路的帧也照旧不吃 DC 的桶。
 
 ---
 
@@ -456,6 +477,13 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
   8. **背压拒绝绝不能造成跳号**：有序可靠通道上唯一的「丢」只能来自我们自己的拒绝，而接收侧要求 seq 严格递增。源头（writable 标志）负责挡住注入；万一 `try_send` 仍然满载，按「这一单失败 + cancel」处理，**不跳过、也不重发同一 seq**。
   9. **两条已知取舍**：`Input::Failed` 来自**任一** lane 的泵退出，所以一条通道关闭也会触发整条腿重协商（可接受：关掉的通道本来就要重开一轮）；未知 label 的通道在 webrtc 下仍会缓冲对端发来的数据（风险表已记）。Phase 10 之后 `p2p == connected` 仍然只表示**可覆盖流**在 DC 上，第二条腿不暴露成 UI 状态。
 
+- **落地（R32）—— 提交 `c7c9334`**：上面 9 条的形状逐条落地。落地的过程中又补了三处形状里没写到、但同源的东西，都写进 R32 了：
+  1. **收尾帧与回执也必须跟着这一单的 route**：`transfer.complete` 与 offer 走 `flush(..., leg, force)` 的**强制**路径（`force` 绕过背压判断）——背压恰好在最后一块之后翻假、完成帧却绕了中继的话，接收侧会先看到「分片没收齐」把这一单判废（跨 lane 没有顺序保证）。accept / reject / cancel 按**这一单钉的 route** 选腿（`reply_leg` + `transfer_route`），钉在中继上的一单绝不走 DC：DC 上丢一帧只有 `direct_lost()` 收尾，而它只管 `Route::Direct` 的会话，发送方会永远停在 `AwaitingAccept`。
+  2. **越界的 offer 回 reject，而不是本机报错**（§7 那条的落地形状）：参数校验失败以前只在本机 `emit_error`，发送方会停在 `AwaitingAccept` 等一个永远不来的回执（V1 没有停滞超时）；现在回一条 `transfer.reject`，两端立刻按 §43 收尾。
+  3. **背压标志在轮次边界复位**（`Leg::reset()`）：新通道的 SCTP 发送缓冲从 0 开始只增不减，而 High / Low 都是跨阈值的**边沿**事件，不复位的话一轮重协商之后标志会永远停在 `false`，钉在 DC 上的那一单再也发不出分片。
+- **验证（R32）**：单测 **120 passed / 7 ignored / 0 failed**（新增 8 条、重写 1 条：`coverable_frames_take_the_data_channel_and_chat_never_does` 改成 `each_lane_keeps_its_own_stream_off_the_relay`，因为 Phase 10 之后聊天也走 DC）；真中继 e2e **6/6**；`cargo check --lib` 0 warning；`cargo fmt --check` 37 处（基线 46 处，新增代码无差异）。独立只读审计（新代理，两轮）：**AUDIT: CLEAN**（第一轮的 1 个 P1 + 2 个 P2 已全部修掉并复审通过）。
+  - **诚实缺口**：48 KiB 的分片真的过 DataChannel 这条路径只有**假腿**单测覆盖；真中继 e2e 只发了小的 pet-state / ping。也就是「一块 48 KiB 的 SCTP 消息 + `writable` 背压 + High/Low 事件真的能翻回来」在真实通道上还没有自动化用例跑过，这一段留给 §10 的真机双端附件验收。
+
 ---
 
 # 9. 提交拆分建议
@@ -474,6 +502,8 @@ perf(pair): raise the pet state ceiling and interpolate remotely
 
 Phase 9a 与 9b 也拆成了两个提交（R31）：`5f36bd8`（`feat(pair): give the data channel its own pacing budget and a 60hz ceiling`）与 `8b49a50`（`feat(pair): interpolate the remote cat between snapshots`）。上限契约与渲染插值是两件独立的事，放在一起反而看不清各自的验证面。
 
+Phase 10 落成**一个**提交（R32）：`c7c9334`（`feat(pair): carry the reliable streams over a second data channel`）。`chunk_count` / `flush` / `handle_binary` / `send_next_chunk` 的签名改动是跨文件的，按「传输层 / 路由」拆会在中间留下不可编译的点，所以没有拆——一条能编译的提交比两条好看但不能编译的强。
+
 ---
 
 # 10. 验收标准
@@ -491,7 +521,7 @@ Phase 9a 与 9b 也拆成了两个提交（R31）：`5f36bd8`（`feat(pair): giv
 - 对面是**旧客户端**时不发起 ICE（旧中继不影响，`pair.signal` 走 kind 8 本来就转发），行为与 v1 一致。
 - P2P 掉线后能自动回落中继，聊天不丢、附件按 §43 收尾。
 
-**适用范围（R30 补）**：8c 之后，上面第一条只有**猫咪状态与输入统计**成立；「聊天不经服务器」要等 §8 的 **Phase 10**（`reliable` 通道 + 附件分片走 P2P）。而「P2P 掉线后自动回落、聊天不丢」今天本来就是这样（聊天全程在中继），附件那条一直按 §43 收尾，与 P2P 无关。
+**适用范围（R30 补，R32 再补）**：8c 之后，上面第一条只有**猫咪状态与输入统计**成立。**Phase 10 落地（R32）之后，「聊天不经服务器」与「附件不经服务器」也成立**——条件是 `reliable` 那条腿 open + verified；对端是旧客户端、打洞失败、探针超时、或背压挡住的那些时刻自动回落中继（用户无感知，聊天靠 DB 补发、附件按 §43 收尾）。第三条（旧客户端行为与 v1 一致）与第四条（掉线回落、聊天不丢）不受影响：前者靠 `hello` 的可选能力字段，后者今天本来就是这样。
 
 **60Hz**
 
@@ -535,21 +565,23 @@ Phase 9a 与 9b 也拆成了两个提交（R31）：`5f36bd8`（`feat(pair): giv
 
 # 12. 风险与未决
 
-| 风险                                                  | 影响                                                                                                   | 缓解                                                                                                                                                                                                                                             |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `webrtc-rs` 在 3 个 Windows release 目标上编译失败    | Phase 8 无法交付                                                                                       | 编译 spike 已过（R24-1）；4 个非 Windows 目标已用 `cfg` 门控排除                                                                                                                                                                                 |
-| Windows 定时器精度 15.6ms 影响 60Hz                   | 发不出真正 60Hz                                                                                        | 事件驱动而非固定 16ms 定时器                                                                                                                                                                                                                     |
-| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB）        | 附件分片在 P2P 上失败                                                                                  | 48 KiB 保守默认 + 真机大文件验证                                                                                                                                                                                                                 |
-| `panic = "abort"` 下 webrtc 内部 panic 会带走整个 App | 一条 P2P 连接的问题升级成整个应用崩溃                                                                  | `p2p.rs` 里对 webrtc 的 `Result` 一律不许 `unwrap` / `expect`，DC / ICE 失败只走回落                                                                                                                                                             |
-| 自签 / 裸 IP 无法连自建中继                           | 部署文档承诺的「compose up 就能用」落空                                                                | 文档强制域名 + Caddy；可选自签开关                                                                                                                                                                                                               |
-| UDP 被封 / 跨境抖动                                   | P2P 打洞失败率高                                                                                       | TURN 备 TCP/443；打不通就走中继                                                                                                                                                                                                                  |
-| STUN 暴露公网 IP 与 README 隐私承诺                   | 隐私承诺被质疑                                                                                         | 默认不填公共 STUN，设置页写明                                                                                                                                                                                                                    |
-| `webrtc` 拉长编译与体积                               | 发布耗时、安装包变大                                                                                   | 依赖落地那一刻量一次（R24-6），必要时按 feature 门控                                                                                                                                                                                             |
-| 两条腿的心跳探针共用一个标志                          | 中继静默半死被 DC 流量掩盖：DC 上 pet-state 照常流动，聊天 / 信令 / 离线检测全哑却看起来正常，也不重连 | 两条独立标志——中继腿只由中继入站清除；DC 腿超时只回落（R21「心跳归属」第二条、R28 第 3 条）                                                                                                                                                      |
-| DC 已 open 但打不通（ICE connected 之后半死）         | 可覆盖流灌进黑洞：对端猫冻住，而两边 UI 都显示「已直连」                                               | 切换门要 `dc_open && dc_verified`（DC 入站才算验过），`ChannelOpen` 立刻补一枚 ping，`p2p = connected` 与选路用同一对标志；**验过之后又静默半死**的那一半靠 R28 的 DC 探针超时兜底（窗口最长约 2 个心跳，默认 120 秒），这期间选路仍在 DC（R30） |
-| DC 的发送缓冲不设上限就不阻塞（R31 记）               | 慢链路下注入量只受令牌桶约束，缓冲无界增长                                                             | 配 `with_data_channel_send_buffer_limit` + writable 背压，源头挡住注入（Phase 10，见 §8）                                                                                                                                                        |
-| 未知 label 的 DataChannel 仍会被 webrtc 缓冲          | 恶意对端可以多开通道占内存                                                                             | 只认领声明过的两条；不认领的通道不 poll（对端发来的数据仍会被缓冲，所以记在这里）                                                                                                                                                                |
-| 任一条 DC 通道的泵退出会重开整条腿                    | 一次重协商（十几秒），期间可靠流全部回中继                                                             | 可接受：两条通道在同一条 SCTP 关联上，关掉的那条本来就要重开一轮                                                                                                                                                                                 |
+| 风险                                                  | 影响                                                                                                     | 缓解                                                                                                                                                                                                                                             |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `webrtc-rs` 在 3 个 Windows release 目标上编译失败    | Phase 8 无法交付                                                                                         | 编译 spike 已过（R24-1）；4 个非 Windows 目标已用 `cfg` 门控排除                                                                                                                                                                                 |
+| Windows 定时器精度 15.6ms 影响 60Hz                   | 发不出真正 60Hz                                                                                          | 事件驱动而非固定 16ms 定时器                                                                                                                                                                                                                     |
+| SCTP 消息上限（实测默认 256 KiB，不是 64 KiB）        | 附件分片在 P2P 上失败                                                                                    | 48 KiB 保守默认 + 真机大文件验证                                                                                                                                                                                                                 |
+| `panic = "abort"` 下 webrtc 内部 panic 会带走整个 App | 一条 P2P 连接的问题升级成整个应用崩溃                                                                    | `p2p.rs` 里对 webrtc 的 `Result` 一律不许 `unwrap` / `expect`，DC / ICE 失败只走回落                                                                                                                                                             |
+| 自签 / 裸 IP 无法连自建中继                           | 部署文档承诺的「compose up 就能用」落空                                                                  | 文档强制域名 + Caddy；可选自签开关                                                                                                                                                                                                               |
+| UDP 被封 / 跨境抖动                                   | P2P 打洞失败率高                                                                                         | TURN 备 TCP/443；打不通就走中继                                                                                                                                                                                                                  |
+| STUN 暴露公网 IP 与 README 隐私承诺                   | 隐私承诺被质疑                                                                                           | 默认不填公共 STUN，设置页写明                                                                                                                                                                                                                    |
+| `webrtc` 拉长编译与体积                               | 发布耗时、安装包变大                                                                                     | 依赖落地那一刻量一次（R24-6），必要时按 feature 门控                                                                                                                                                                                             |
+| 两条腿的心跳探针共用一个标志                          | 中继静默半死被 DC 流量掩盖：DC 上 pet-state 照常流动，聊天 / 信令 / 离线检测全哑却看起来正常，也不重连   | 两条独立标志——中继腿只由中继入站清除；DC 腿超时只回落（R21「心跳归属」第二条、R28 第 3 条）                                                                                                                                                      |
+| DC 已 open 但打不通（ICE connected 之后半死）         | 可覆盖流灌进黑洞：对端猫冻住，而两边 UI 都显示「已直连」                                                 | 切换门要 `dc_open && dc_verified`（DC 入站才算验过），`ChannelOpen` 立刻补一枚 ping，`p2p = connected` 与选路用同一对标志；**验过之后又静默半死**的那一半靠 R28 的 DC 探针超时兜底（窗口最长约 2 个心跳，默认 120 秒），这期间选路仍在 DC（R30） |
+| DC 的发送缓冲不设上限就不阻塞（R31 记）               | 慢链路下注入量只受令牌桶约束，缓冲无界增长                                                               | **已落地（R32）**：`with_data_channel_send_buffer_limit` 192 KiB（high = limit、low = 48 KiB）+ 由 High/Low 事件驱动的同步 `writable` 标志，源头挡住注入；背压翻假时聊天退回中继、分片那一单等 5ms 再试（`force` 只用在收尾帧与 offer 上）       |
+| 回执走错 lane 会让发送方无超时死等（R32 的 P1）       | 钉在中继上的一单，它的 accept 走 DC 一旦丢帧就没人收尾（`direct_lost` 只管 Direct 的会话），两端永久挂起 | 回执按**这一单钉的 route** 选腿（`reply_leg` / `transfer_route`），中继那一单绝不给 DC 腿；Direct 那一单给腿但被背压挡回中继也不影响正确性（那一侧本来就有 `direct_lost`）                                                                       |
+| DC 那条腿的背压标志跨轮次残留（R32）                  | 一轮重协商之后标志永远为假：钉在 DC 上的那一单再也发不出分片，而探针/可用性一切正常                      | `Leg::reset()` 里置回 `true`（轮次边界）；残余「上一轮的泵投来一枚迟到边沿」要彻底消掉需给 `pump` 传 epoch，本轮不做（R32-7）                                                                                                                    |
+| 未知 label 的 DataChannel 仍会被 webrtc 缓冲          | 恶意对端可以多开通道占内存                                                                               | 只认领声明过的两条；不认领的通道不 poll（对端发来的数据仍会被缓冲，所以记在这里）                                                                                                                                                                |
+| 任一条 DC 通道的泵退出会重开整条腿                    | 一次重协商（十几秒），期间可靠流全部回中继                                                               | 可接受：两条通道在同一条 SCTP 关联上，关掉的那条本来就要重开一轮                                                                                                                                                                                 |
 
 未决：自建中继是否默认广告 60 帧/秒（还是留给环境变量）。 另一个未决：探针超时之后那条腿要不要自愈回 DC（今天不自愈，要等通道真的关闭重开；保守方向的取舍，9a 再定，见 R30）。
 
