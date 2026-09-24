@@ -14,6 +14,31 @@ pub use super::p2p::{P2pEvent, P2pLink};
 #[cfg(not(windows))]
 pub use stub::{P2pEvent, P2pLink};
 
+/// 可覆盖流（宠物快照、统计）可以走的第二条腿。
+///
+/// 抽成 trait 只为一件事：`flush_replaceable` 的**选路**要能被单测直接验证——真的
+/// [`P2pLink`] 需要一条真的 DataChannel，而「按 kind 与两个标志选腿」这件事不该依赖它。
+/// `Send + Sync`：它要在 `live` 的 `select!` 里跨 `await` 存活，而 `live` 跑在一个
+/// `Send` 的 task 上。
+pub trait CoverableLeg: Send + Sync {
+    /// 发一帧。**失败即丢帧**：可覆盖流是绝对值快照，下一帧会盖掉它，所以这里不返回
+    /// 错误、也不回队重发。
+    fn send(&self, frame: Vec<u8>);
+}
+
+#[cfg(windows)]
+impl CoverableLeg for P2pLink {
+    fn send(&self, frame: Vec<u8>) {
+        P2pLink::send(self, frame);
+    }
+}
+
+/// 非 Windows 目标上这条腿永远不会 `open`（stub 不产生任何事件），所以这里什么都不做。
+#[cfg(not(windows))]
+impl CoverableLeg for P2pLink {
+    fn send(&self, _frame: Vec<u8>) {}
+}
+
 /// 非 Windows 目标上的空实现：一条永远不会就绪、也不会回话的腿。
 ///
 /// 存在的意义只有一个——让 `manager.rs` 里 `live` 的调用点保持 cfg 中立。

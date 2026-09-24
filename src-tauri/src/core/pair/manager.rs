@@ -1355,6 +1355,14 @@ where
         });
     }
 
+    // 退避期间攒下的可覆盖帧在这里兜底：那时腿还不存在，所以按中继发（`None`）
+    if let Err(error) = flush_replaceable(&mut sink, None, state, &mut pacer).await {
+        return Outcome::Lost(PairFailure {
+            message: error,
+            fatal: false,
+        });
+    }
+
     let heartbeat = heartbeat_interval();
     let mut ticker = tokio::time::interval(heartbeat);
 
@@ -1371,12 +1379,17 @@ where
     manager.publish(generation, |status| status.p2p = P2pState::Off);
 
     // 中继腿的探针：永远是 WS Ping，中继自己回 Pong（R28）。它只由中继入站清除。
-    let mut awaiting_pong = false;
-    let mut last_inbound = tokio::time::Instant::now();
+    let mut relay_awaiting_pong = false;
+    let mut relay_last_inbound = tokio::time::Instant::now();
 
     // DC 腿的探针：应用级 `pair.ping`，**独立标志**（R28）。共用一个标志会造出
     // 「中继静默半死、却被 DC 的 pet-state 流量掩盖」的死角。
     let mut dc_open = false;
+    // R30：`dc_open` 只说明 SCTP 协商完了，`dc_verified` 才是「这条腿真的过过数据」的
+    // 证据（DC 入站置位）。可覆盖流要两个都满足才切过去——只认 `dc_open` 会把快照灌进
+    // 一条 open 但打不通的通道，对端猫冻住整整一个探针超时（默认两分钟），而两边 UI
+    // 都写着「已直连」。
+    let mut dc_verified = false;
     let mut dc_awaiting_pong = false;
     let mut dc_last_inbound = tokio::time::Instant::now();
 
@@ -1432,7 +1445,14 @@ where
                         }
                     }
 
+                    // 顺序与拆分前一致：先可靠队列、后可覆盖队列
                     if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                        return Outcome::Lost(PairFailure { message: error, fatal: false });
+                    }
+
+                    let leg = coverable_leg(dc_open, dc_verified, &link);
+
+                    if let Err(error) = flush_replaceable(&mut sink, leg, state, &mut pacer).await {
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
                 }
@@ -1531,8 +1551,8 @@ where
                     return Outcome::Lost(describe_close(None));
                 };
 
-                last_inbound = tokio::time::Instant::now();
-                awaiting_pong = false;
+                relay_last_inbound = tokio::time::Instant::now();
+                relay_awaiting_pong = false;
 
                 match incoming {
                     Err(error) => return Outcome::Lost(PairFailure {
@@ -1604,14 +1624,14 @@ where
             _ = ticker.tick() => {
                 // 中继腿的探针**保持不动**：WS Ping 由中继自己回 Pong，与对端在线与否
                 // 无关（R28 推翻了 R21 的初版写法）。超时就是整条会话的失败。
-                if awaiting_pong && last_inbound.elapsed() >= heartbeat * 2 {
+                if relay_awaiting_pong && relay_last_inbound.elapsed() >= heartbeat * 2 {
                     return Outcome::Lost(PairFailure {
                         message: "心跳超时".into(),
                         fatal: false,
                     });
                 }
 
-                awaiting_pong = true;
+                relay_awaiting_pong = true;
 
                 if let Err(error) = send_frame(&mut sink, Message::Ping(Vec::new().into())).await {
                     return Outcome::Lost(PairFailure {
@@ -1625,10 +1645,11 @@ where
                 // 的目标直接冲突（R23）。
                 if dc_open {
                     if dc_awaiting_pong && dc_last_inbound.elapsed() >= heartbeat * 2 {
-                        // 只把这条腿判为不可用（Phase 8c 起在这里回落中继）。**绝不返回
+                        // 只把这条腿判为不可用（R30：可覆盖流在这里回落中继）。**绝不返回
                         // `Outcome::Lost`**：那会让 `run_session` 重连整条会话并
                         // `abort_transfers`，砍掉正在传的附件（R21 修正 3）。
                         dc_open = false;
+                        dc_verified = false;
                         manager.publish(generation, |status| status.p2p = P2pState::Connecting);
                     } else {
                         match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
@@ -1685,23 +1706,48 @@ where
                     }
                     Some(link::P2pEvent::ChannelOpen) => {
                         dc_open = true;
+                        // 刚 open 的通道还没过过任何数据，先不当它可用（R30）
+                        dc_verified = false;
                         dc_awaiting_pong = false;
                         dc_last_inbound = tokio::time::Instant::now();
 
-                        manager.publish(generation, |status| status.p2p = P2pState::Connected);
+                        // 立刻验一次：等一个 tick（默认 60 秒）才验到的话，可覆盖流会白等
+                        // 一分钟才切过去。`dc_verified` 由 DC 入站置位。
+                        match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
+                        {
+                            Ok(frame) => {
+                                dc_awaiting_pong = true;
+                                link.send(frame);
+                            }
+                            Err(error) => manager.emit_error(generation, error),
+                        }
+
+                        manager.publish(generation, |status| status.p2p = P2pState::Connecting);
                     }
                     Some(link::P2pEvent::ChannelClosed) => {
                         dc_open = false;
+                        dc_verified = false;
 
                         // 腿会自己重试，所以是「正在协商」而不是「关闭」
                         manager.publish(generation, |status| status.p2p = P2pState::Connecting);
                     }
                     Some(link::P2pEvent::Inbound(bytes)) => {
                         // DC 腿的入站（§4.2 / R28）：只清 DC 腿**自己的**标志。**不要**动
-                        // 中继腿的 `awaiting_pong` / `last_inbound`——让 DC 的流量去清中继
+                        // 中继腿的 `relay_awaiting_pong` / `relay_last_inbound`——让 DC 的流量去清中继
                         // 腿的标志，正是「中继静默半死被掩盖」的成因。
                         dc_last_inbound = tokio::time::Instant::now();
                         dc_awaiting_pong = false;
+
+                        // R30：**任何** DC 入站都算一次成功的往返（探针的 pong 只是其中一种），
+                        // 这是「这条腿真的能过数据」的唯一证据。只有它才允许可覆盖流切过去。
+                        //
+                        // 发布也要卡在 `dc_open` 上：探针超时只把腿判为不可用、并没有关掉通道
+                        // （超时 ≠ 关闭），所以超时之后对端恢复的流量照样会进来；不卡的话 UI
+                        // 会在选路已经回到中继的情况下又亮起「已直连」，而且不会再自动复位。
+                        if dc_open && !dc_verified {
+                            dc_verified = true;
+                            manager.publish(generation, |status| status.p2p = P2pState::Connected);
+                        }
 
                         if bytes.len() > MAX_BINARY_FRAME_SIZE {
                             // 超限只丢这一帧：DC 是我们自己的通道，不必像中继那样断线
@@ -1746,6 +1792,8 @@ fn describe_close(code: Option<u16>) -> PairFailure {
     }
 }
 
+/// 排**可靠**队列（聊天、控制、附件、分片）。它永远走中继：接收侧要求分片序号严格
+/// 递增，而 `pet-state` 那条 DC 是 `ordered = false, max_retransmits = 0`（R21）。
 async fn flush<S>(sink: &mut S, state: &mut SessionState, pacer: &mut Pacer) -> Result<(), String>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -1761,7 +1809,47 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// 可覆盖流（宠物快照、统计）能不能走 DC：两个条件都满足才算（R30）。
+///
+/// `dc_open` 只说明 SCTP 协商完了；`dc_verified` 才是「这条腿真的过过数据」的证据
+/// （见 `live` 的 DC 入站分支）。只认 `dc_open` 会把快照灌进一条 open 但打不通的通道：
+/// 默认心跳下探针超时是两分钟，这段时间里对端猫是冻住的，而两边 UI 都写着「已直连」。
+fn coverable_leg<'a>(
+    dc_open: bool,
+    dc_verified: bool,
+    link: &'a link::P2pLink,
+) -> Option<&'a dyn link::CoverableLeg> {
+    (dc_open && dc_verified).then_some(link as &dyn link::CoverableLeg)
+}
+
+/// 排**可覆盖**流（宠物快照、统计）：DC 可用时走它，否则照旧走中继。
+///
+/// 走 DC 时**不占中继的 pacer**：单一 pacer 会把 DC 上的可覆盖流压到中继的 20 帧/秒，
+/// 与 60Hz 的目标直接冲突（R23）。DC 侧自己也没有 pacing——那是 Phase 9a 的事。
+///
+/// 写 `state.replaceable` 的只有两处（退避期的 `FlushReplaceable`、`live` 里同一个
+/// 分支），所以只有这两个地方需要调用本函数；会话开始那次是给退避期攒下的帧兜底。
+async fn flush_replaceable<S>(
+    sink: &mut S,
+    leg: Option<&dyn link::CoverableLeg>,
+    state: &mut SessionState,
+    pacer: &mut Pacer,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
     while let Some((key, frame)) = state.replaceable.pop_first() {
+        if let Some(leg) = leg {
+            // 可覆盖流是绝对值快照：发失败就丢，等下一帧盖掉它
+            leg.send(frame);
+
+            continue;
+        }
+
         pacer.acquire().await;
 
         if let Err(error) = send_frame(sink, Message::Binary(frame.clone().into())).await {
@@ -3128,6 +3216,104 @@ mod tests {
             .unwrap();
 
         assert!(matches!(receiver.try_recv(), Ok(Command::FlushReplaceable)));
+    }
+
+    /// 假的可覆盖腿：只记下收到的帧
+    #[derive(Default)]
+    struct FakeLeg {
+        frames: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl FakeLeg {
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.frames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl link::CoverableLeg for FakeLeg {
+        fn send(&self, frame: Vec<u8>) {
+            self.frames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(frame);
+        }
+    }
+
+    /// 只发二进制应用帧：第一字节就是明文的帧 kind（帧头是 AEAD 的 associated data）
+    fn frame_kind(message: &Message) -> u8 {
+        match message {
+            Message::Binary(bytes) => bytes[0],
+            other => panic!("应当只发二进制应用帧: {other:?}"),
+        }
+    }
+
+    /// R30：可覆盖流在 DC 可用时**只**走 DC（**不出现**在中继那条线上），聊天永远只走
+    /// 中继；腿不可用时全部回中继。
+    ///
+    /// 「这一帧没有经过服务器」这条负向断言只能在这里做：真中继看到的是密文，分不出帧
+    /// kind，也没有任何计数器。
+    #[tokio::test]
+    async fn coverable_frames_take_the_data_channel_and_chat_never_does() {
+        let mut state = SessionState::new(&ROOT_KEY);
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut socket = RecordingSocket::default();
+        let leg = FakeLeg::default();
+
+        state
+            .queue(
+                FrameKind::PetState,
+                &AppEnvelope::new(message_type::PET_STATE, 0, json!({})),
+                true,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::Chat,
+                &AppEnvelope::new(message_type::CHAT_TEXT, 1, json!({ "text": "hi" })),
+                false,
+            )
+            .unwrap();
+
+        // 顺序与 `live` 一致：先可靠队列，后可覆盖队列
+        flush(&mut socket, &mut state, &mut pacer).await.unwrap();
+        flush_replaceable(&mut socket, Some(&leg), &mut state, &mut pacer)
+            .await
+            .unwrap();
+
+        assert_eq!(socket.sent.len(), 1, "中继那条线上应当只有聊天");
+        assert_eq!(frame_kind(&socket.sent[0]), FrameKind::Chat.as_byte());
+        assert_eq!(leg.frames().len(), 1);
+        assert_eq!(leg.frames()[0][0], FrameKind::PetState.as_byte());
+
+        // 腿不可用（DC 掉了、或者探针还没验过）：可覆盖流回到中继
+        state
+            .queue(
+                FrameKind::Stats,
+                &AppEnvelope::new(message_type::STATS, 2, json!({})),
+                true,
+            )
+            .unwrap();
+
+        flush_replaceable(&mut socket, None, &mut state, &mut pacer)
+            .await
+            .unwrap();
+
+        assert_eq!(socket.sent.len(), 2);
+        assert_eq!(frame_kind(&socket.sent[1]), FrameKind::Stats.as_byte());
+        assert_eq!(leg.frames().len(), 1, "腿不该再收到任何东西");
+    }
+
+    /// R30 的不变量：只有 `dc_open` 不够，必须同时 `dc_verified` 才把可覆盖流切过去
+    #[tokio::test]
+    async fn the_coverable_leg_needs_both_flags() {
+        let (link, _events) = link::P2pLink::spawn("coverable-leg".into(), Vec::new());
+
+        assert!(coverable_leg(true, false, &link).is_none());
+        assert!(coverable_leg(false, true, &link).is_none());
+        assert!(coverable_leg(true, true, &link).is_some());
     }
 
     #[test]

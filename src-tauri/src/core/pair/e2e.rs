@@ -24,9 +24,11 @@ use super::manager::OutgoingRequest;
 use super::transfer::{TransferStore, sha256_file};
 use super::manager::{
     EVENT_CONNECTION_CHANGED, EVENT_MESSAGE_RECEIVED, EVENT_MESSAGE_UPDATED, EVENT_PEER_CHANGED,
-    EVENT_PRESENCE, PairConnectionState, PairManager,
+    EVENT_PET_STATE, EVENT_PRESENCE, PairConnectionState, PairManager,
 };
-use super::protocol::{FrameKind, PresencePayload, PresenceState, TransferKind, message_type};
+use super::protocol::{
+    FrameKind, PetSnapshot, PresencePayload, PresenceState, TransferKind, message_type,
+};
 
 /// 记录所有事件的测试用 sink
 #[derive(Default)]
@@ -898,6 +900,32 @@ async fn two_clients_open_a_p2p_channel_through_the_relay() {
     // 中继那条腿不受影响：整条会话不该发生重连
     assert_eq!(sink_a.last_state(), Some(PairConnectionState::Connected));
     assert_eq!(sink_b.last_state(), Some(PairConnectionState::Connected));
+
+    // R30：DC 验过之后可覆盖流走 DC。这里只做冒烟（A 发、B 收到、两边仍 `connected`）——
+    // 「这一帧没经过中继」只能由单测的负向断言证明（真中继看到的是密文，分不出帧 kind，
+    // 也没有计数器），见 `manager.rs` 的
+    // `coverable_frames_take_the_data_channel_and_chat_never_does`。
+    manager_a
+        .send_replaceable(
+            FrameKind::PetState,
+            message_type::PET_STATE,
+            serde_json::to_value(PetSnapshot::default()).unwrap(),
+        )
+        .unwrap();
+
+    let snapshot = wait_for(
+        || !sink_b.status_events(EVENT_PET_STATE).is_empty(),
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(
+        snapshot,
+        "B 没有收到 A 的宠物快照：errors={:?}",
+        sink_b.errors()
+    );
+    assert_eq!(last_p2p(&sink_a).as_deref(), Some("connected"));
+    assert_eq!(last_p2p(&sink_b).as_deref(), Some("connected"));
 
     // 退避期间 `p2p` 必须已经复位（只读审计提出的 P1）：中继腿一掉，腿就被 Drop 了，
     // 而退避（最长 30 秒）+ 连接与 welcome 超时（15 + 10 秒）里不会再有 P2P 事件。
