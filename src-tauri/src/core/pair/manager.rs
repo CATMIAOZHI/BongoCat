@@ -34,8 +34,9 @@ use super::protocol::{
 };
 use super::secret;
 use super::transfer::{
-    CHUNK_SIZE, DEFAULT_MAX_SIZE, IncomingTransfer, OutgoingTransfer, TransferStore, chunk_count,
-    clamp_limit, needs_confirmation, sanitize_file_name, sanitize_mime,
+    CHUNK_SIZE, DEFAULT_MAX_SIZE, IncomingTransfer, OutgoingTransfer, P2P_CHUNK_SIZE,
+    TransferStore, chunk_count, chunk_size_is_valid, clamp_limit, needs_confirmation,
+    sanitize_file_name, sanitize_mime,
 };
 
 pub const EVENT_CONNECTION_CHANGED: &str = "pair-connection-changed";
@@ -76,6 +77,20 @@ const OUTBOUND_CHUNK_BURST: f64 = 10.0;
 /// 不经过中继的计费点，拿中继额度去压它正好会毁掉 60Hz。
 const DIRECT_FRAMES_PER_SECOND: f64 = 60.0;
 const DIRECT_BURST: f64 = 60.0;
+/// DC 上的**附件分片**另有一套额度（§7 / R23 / R32）：绝不能和 60Hz 的快照共用桶，
+/// 否则 48 KiB 的块会把 60 枚/秒吃光、对端猫在整段传输里冻住。
+///
+/// 数值取「与中继那条路同样的字节速率」：中继是 512 KiB × 15 ≈ 7.5 MiB/s，DC 的分片
+/// 小 512/48 倍，速率就按同一比例放大（15 × 512 ÷ 48 = 160）。它**不是**中继的桶，
+/// 没有 20 个/秒的平台上限，所以放大是安全的。
+const DIRECT_CHUNKS_PER_SECOND: f64 = 160.0;
+const DIRECT_CHUNK_BURST: f64 = 16.0;
+/// Direct 那条路上「这一轮发不出去」时的轮询间隔（R32）。
+///
+/// 附件分片那条 `select!` 分支有个不变量：`chunk_wait == ZERO` 必须意味着紧接着一定
+/// 发得出去，否则就会在 `Ok(false)` 与 `ZERO` 之间空转。背压（`writable`）不像令牌那样
+/// 有可计算的剩余时间，所以它翻假时用这个固定间隔轮询。
+const DIRECT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 /// 桌宠快照的发送上限（§6 / R23）：只有当前生效传输能承载时才提上去。
 const MAX_PET_STATE_HZ: f64 = 60.0;
 /// R4 以来（也就是 v1）的缺省快照上限：传输承载不了 60Hz 时保持它，
@@ -261,6 +276,8 @@ struct TransferSession {
     chunk_size: u32,
     chunks: u32,
     phase: TransferPhase,
+    /// 这一单钉在哪条腿上（§8 Phase 10）：offer 时定下来，全程不改。
+    route: link::Route,
     outgoing: Option<OutgoingTransfer>,
     incoming: Option<IncomingTransfer>,
     /// 进度节流：每个 transfer 最多 150ms 报一次
@@ -930,6 +947,17 @@ impl SessionState {
             .map(|(id, _)| *id)
     }
 
+    /// 下一次该发分片的那一单钉在哪条腿上（§8 Phase 10）。`None` = 没有待发分片。
+    ///
+    /// `chunk_wait_duration` 必须和 `send_next_chunk` 算出**同一个** transfer，否则
+    /// 「`ZERO` 就意味着立刻发得出去」那条不变量会被打破（等的是中继的令牌、发的却是
+    /// DC 那一单，于是空转）。
+    fn next_sending_route(&self) -> Option<link::Route> {
+        self.next_sending_transfer()
+            .and_then(|transfer_id| self.transfers.get(&transfer_id))
+            .map(|session| session.route)
+    }
+
     /// 收下所有传输会话（连接结束时用来收尾）
     fn take_transfers(&mut self) -> Vec<TransferSession> {
         self.transfers.drain().map(|(_, session)| session).collect()
@@ -1080,6 +1108,22 @@ impl Pacer {
         }
 
         Duration::from_secs_f64((1.0 - self.tokens) / self.rate)
+    }
+
+    /// 取一枚令牌，取不到就立刻返回 `false`（不等待）。
+    ///
+    /// 附件分片那条分支必须用非阻塞的取法：`acquire` 会睡到下一枚令牌补充出来，一次
+    /// 传输里每几毫秒睡一次，把 `live` 的入站读取一起挡住。
+    fn try_acquire(&mut self) -> bool {
+        self.refill_now();
+
+        if self.tokens < 1.0 {
+            return false;
+        }
+
+        self.tokens -= 1.0;
+
+        true
     }
 
     /// 换一套额度（R20）：中继在 `server.welcome` 里广告了自己的限流上限时按它重设。
@@ -1251,7 +1295,11 @@ async fn run_session(
                     }
                     Some(Command::StartTransfer(request)) => {
                         // 没连着也先把 offer 排进队列，重连后随第一次 flush 发出去
-                        if let Err(error) = start_outgoing_transfer(&manager, &mut state, *request) {
+                        // 退避期间**没有腿**（`live` 一返回就把 `P2pLink` Drop 了），所以这一单
+                        // 只能按中继钉（§8 Phase 10：分片大小必须在 offer 之前定下来）。
+                        if let Err(error) =
+                            start_outgoing_transfer(&manager, &mut state, *request, link::Route::Relay)
+                        {
                             manager.emit_error(generation, error);
                         }
                     }
@@ -1361,6 +1409,9 @@ where
     // 根本不经过中继的计费点，拿中继额度去压它正好会把可覆盖流压到 20 帧/秒，
     // 与 60Hz 的目标冲突。所以这条腿的预算就是 §6 的上限本身。
     let mut direct_pacer = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
+    // DC 上的**附件分片**再单独一套（R23 / R32）：48 KiB 的块绝不能不限量地塞进
+    // 那条既跑聊天又跑控制的通道，也不能去蹭 60Hz 那个桶（会把快照饿死）。
+    let mut direct_chunk_pacer = Pacer::new(DIRECT_CHUNKS_PER_SECOND, DIRECT_CHUNK_BURST);
 
     // R20：先读掉 `server.welcome` 再开始补发（额度与 ICE 广告都在它里面）
     let config = match read_welcome(&mut stream, manager, generation).await {
@@ -1372,7 +1423,8 @@ where
     pacer.retune(outbound.frames_per_second, outbound.frames_burst);
     chunk_pacer.retune(outbound.chunks_per_second, outbound.chunks_burst);
 
-    if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+    // 退避期间攒下的聊天与附件控制帧还在这里，但那时腿还不存在，只能按中继发（`None`）
+    if let Err(error) = flush(&mut sink, state, &mut pacer, None, false).await {
         return Outcome::Lost(PairFailure {
             message: error,
             fatal: false,
@@ -1425,11 +1477,25 @@ where
     let mut dc_awaiting_pong = false;
     let mut dc_last_inbound = tokio::time::Instant::now();
 
+    // 可靠那条腿（`reliable` 通道）的探针与标志（Phase 10 / R32）。与 `dc_*` 同样是
+    // **独立的一套**：那条通道承载聊天与附件分片，可用性判断错一次就会把附件判死
+    // （`direct_lost`），不能拿可覆盖腿的探针结果替它背书。
+    let mut reliable_open = false;
+    let mut reliable_verified = false;
+    let mut reliable_awaiting_pong = false;
+    let mut reliable_last_inbound = tokio::time::Instant::now();
+
     loop {
         // 附件分片走单独一条分支：每次最多发一块，且必须拿到 pacing 令牌（R18）。
         // 这样一次几百块的传输不会像补发队列那样长时间挡住入站读取。
         let chunk_wait = if state.has_pending_chunks() {
-            Some(pacer.wait_duration().max(chunk_pacer.wait_duration()))
+            chunk_wait_duration(
+                state.next_sending_route(),
+                reliable_leg(reliable_open, reliable_verified, &link),
+                &pacer,
+                &chunk_pacer,
+                &direct_chunk_pacer,
+            )
         } else {
             None
         };
@@ -1441,7 +1507,17 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                match send_next_chunk(&mut sink, manager, state, &mut pacer, &mut chunk_pacer).await {
+                match send_next_chunk(
+                    &mut sink,
+                    manager,
+                    state,
+                    &mut pacer,
+                    &mut chunk_pacer,
+                    &mut direct_chunk_pacer,
+                    reliable_leg(reliable_open, reliable_verified, &link),
+                )
+                .await
+                {
                     Ok(_) => {}
                     Err(error) => return Outcome::Lost(PairFailure { message: error, fatal: false }),
                 }
@@ -1464,7 +1540,17 @@ where
                                 retry_dropped_chat(manager, state, &dropped);
                             }
 
-                            if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                            // 聊天（与它的 ack）在可靠腿可用时走 DC（Phase 10）：这条腿有
+                            // DB 的补发兜底，丢了不会进终态。
+                            if let Err(error) = flush(
+                                &mut sink,
+                                state,
+                                &mut pacer,
+                                reliable_leg(reliable_open, reliable_verified, &link),
+                                false,
+                            )
+                            .await
+                            {
                                 return Outcome::Lost(PairFailure { message: error, fatal: false });
                             }
                         }
@@ -1478,7 +1564,15 @@ where
                     }
 
                     // 顺序与拆分前一致：先可靠队列、后可覆盖队列
-                    if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                    if let Err(error) = flush(
+                        &mut sink,
+                        state,
+                        &mut pacer,
+                        reliable_leg(reliable_open, reliable_verified, &link),
+                        false,
+                    )
+                    .await
+                    {
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
 
@@ -1497,13 +1591,41 @@ where
                     }
                 }
                 Some(Command::StartTransfer(request)) => {
-                    if let Err(error) = start_outgoing_transfer(manager, state, *request) {
+                    // 这一单钉在哪条腿上，在 offer 之前就定下来（§8 Phase 10）：分片大小要
+                    // 跟着它走，而且这一单的后半程不能换腿。
+                    let leg = reliable_leg(reliable_open, reliable_verified, &link);
+                    let route = if leg.is_some() {
+                        link::Route::Direct
+                    } else {
+                        link::Route::Relay
+                    };
+
+                    if let Err(error) = start_outgoing_transfer(manager, state, *request, route) {
                         manager.emit_error(generation, error);
-                    } else if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                    } else if let Err(error) = flush(
+                        &mut sink,
+                        state,
+                        &mut pacer,
+                        leg,
+                        // offer 也要和这一单走同一条腿：接收侧正是按 offer 来的 lane 钉 route
+                        route == link::Route::Direct,
+                    )
+                    .await
+                    {
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
                 }
                 Some(Command::AcceptTransfer { transfer_id }) => {
+                    // 回执按**这一单钉的 route** 选腿（见 `reply_leg`）：钉在中继上的一单，
+                    // 它的 accept 绝不能走 DC——DC 上丢了只有 `direct_lost()` 收尾，而它只管
+                    // Direct 的会话，发送方会永远停在 `AwaitingAccept`。
+                    let leg = reply_leg(
+                        transfer_route(state, transfer_id),
+                        reliable_open,
+                        reliable_verified,
+                        &link,
+                    );
+
                     match accept_incoming_transfer(manager, state, transfer_id) {
                         Ok(Some((kind, reply))) => {
                             if let Err(error) = enqueue_reply(
@@ -1511,6 +1633,7 @@ where
                                 manager,
                                 state,
                                 &mut pacer,
+                                leg,
                                 generation,
                                 kind,
                                 reply,
@@ -1525,6 +1648,13 @@ where
                     }
                 }
                 Some(Command::RejectTransfer { transfer_id }) => {
+                    // `close_transfer` 会把会话摘掉，所以 route 必须先读
+                    let leg = reply_leg(
+                        transfer_route(state, transfer_id),
+                        reliable_open,
+                        reliable_verified,
+                        &link,
+                    );
                     let reply = AppEnvelope::new(
                         message_type::TRANSFER_REJECT,
                         manager.next_envelope_seq(),
@@ -1547,6 +1677,7 @@ where
                         manager,
                         state,
                         &mut pacer,
+                        leg,
                         generation,
                         FrameKind::TransferControl,
                         reply,
@@ -1557,6 +1688,13 @@ where
                     }
                 }
                 Some(Command::CancelTransfer { transfer_id }) => {
+                    // 同上：会话马上就被 `close_transfer` 摘掉，route 先读
+                    let leg = reply_leg(
+                        transfer_route(state, transfer_id),
+                        reliable_open,
+                        reliable_verified,
+                        &link,
+                    );
                     let reply = AppEnvelope::new(
                         message_type::TRANSFER_CANCEL,
                         manager.next_envelope_seq(),
@@ -1576,6 +1714,7 @@ where
                         manager,
                         state,
                         &mut pacer,
+                        leg,
                         generation,
                         FrameKind::TransferControl,
                         reply,
@@ -1607,7 +1746,9 @@ where
                             });
                         }
 
-                        match handle_binary(manager, generation, state, &bytes, Some(&link)) {
+                        // 中继来的帧没有 lane（`None`）；回执也照原路回中继——中继腿的探针
+                        // 结果绝不能让 DC 那条腿替它背书（R28），所以 pong 必须走中继。
+                        match handle_binary(manager, generation, state, &bytes, Some(&link), None) {
                             Err(error) => manager.emit_error(generation, error),
                             Ok(Some((kind, reply))) => {
                                 match state.queue(kind, &reply, false) {
@@ -1621,7 +1762,9 @@ where
                                             retry_dropped_chat(manager, state, &dropped);
                                         }
 
-                                        if let Err(error) = flush(&mut sink, state, &mut pacer).await {
+                                        if let Err(error) =
+                                            flush(&mut sink, state, &mut pacer, None, false).await
+                                        {
                                             return Outcome::Lost(PairFailure {
                                                 message: error,
                                                 fatal: false,
@@ -1708,7 +1851,41 @@ where
                         {
                             Ok(frame) => {
                                 dc_awaiting_pong = true;
-                                link.send(frame);
+                                link.send(link::Lane::Replaceable, frame);
+                            }
+                            Err(error) => manager.emit_error(generation, error),
+                        }
+                    }
+                }
+
+                // 可靠那条腿的探针（Phase 10 / R32）。和可覆盖腿一样**独立**，理由也一样：
+                // 这条腿承载聊天与在传的附件，探针漏判一次就会把附件整单判死。
+                if reliable_open {
+                    if reliable_awaiting_pong && reliable_last_inbound.elapsed() >= heartbeat * 2
+                    {
+                        reliable_open = false;
+                        reliable_verified = false;
+                        reliable_awaiting_pong = false;
+
+                        // 半死的腿必须**两处**一起收尾（另一处是 `ChannelClosed(Reliable)`）：
+                        // 只挂「关闭」会让这一单永远留在表里，V1 没有任何停滞超时。
+                        if let Err(error) =
+                            direct_lost(&mut sink, manager, generation, state, &mut pacer).await
+                        {
+                            return Outcome::Lost(PairFailure {
+                                message: error,
+                                fatal: false,
+                            });
+                        }
+
+                        // 这条腿上发出、还没等到 ack 的聊天退回「等待发送」（§32）
+                        manager.resend_pending_chat();
+                    } else {
+                        match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
+                        {
+                            Ok(frame) => {
+                                reliable_awaiting_pong = true;
+                                link.send(link::Lane::Reliable, frame);
                             }
                             Err(error) => manager.emit_error(generation, error),
                         }
@@ -1762,80 +1939,145 @@ where
                             outbound.frames_per_second,
                         );
                     }
-                    Some(link::P2pEvent::ChannelOpen) => {
-                        dc_open = true;
-                        // 刚 open 的通道还没过过任何数据，先不当它可用（R30）
-                        dc_verified = false;
-                        dc_awaiting_pong = false;
-                        dc_last_inbound = tokio::time::Instant::now();
+                    Some(link::P2pEvent::ChannelOpen(lane)) => match lane {
+                        link::Lane::Replaceable => {
+                            dc_open = true;
+                            // 刚 open 的通道还没过过任何数据，先不当它可用（R30）
+                            dc_verified = false;
+                            dc_awaiting_pong = false;
+                            dc_last_inbound = tokio::time::Instant::now();
 
-                        // 立刻验一次：等一个 tick（默认 60 秒）才验到的话，可覆盖流会白等
-                        // 一分钟才切过去。`dc_verified` 由 DC 入站置位。
-                        match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
-                        {
-                            Ok(frame) => {
-                                dc_awaiting_pong = true;
-                                link.send(frame);
+                            // 立刻验一次：等一个 tick（默认 60 秒）才验到的话，可覆盖流会白等
+                            // 一分钟才切过去。`dc_verified` 由 DC 入站置位。
+                            match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
+                            {
+                                Ok(frame) => {
+                                    dc_awaiting_pong = true;
+                                    link.send(link::Lane::Replaceable, frame);
+                                }
+                                Err(error) => manager.emit_error(generation, error),
                             }
-                            Err(error) => manager.emit_error(generation, error),
-                        }
 
-                        publish_route(
-                            manager,
-                            generation,
-                            P2pState::Connecting,
-                            false,
-                            outbound.frames_per_second,
-                        );
-                    }
-                    Some(link::P2pEvent::ChannelClosed) => {
-                        dc_open = false;
-                        dc_verified = false;
-
-                        // 腿会自己重试，所以是「正在协商」而不是「关闭」
-                        publish_route(
-                            manager,
-                            generation,
-                            P2pState::Connecting,
-                            false,
-                            outbound.frames_per_second,
-                        );
-                    }
-                    Some(link::P2pEvent::Inbound(bytes)) => {
-                        // DC 腿的入站（§4.2 / R28）：只清 DC 腿**自己的**标志。**不要**动
-                        // 中继腿的 `relay_awaiting_pong` / `relay_last_inbound`——让 DC 的流量去清中继
-                        // 腿的标志，正是「中继静默半死被掩盖」的成因。
-                        dc_last_inbound = tokio::time::Instant::now();
-                        dc_awaiting_pong = false;
-
-                        // R30：**任何** DC 入站都算一次成功的往返（探针的 pong 只是其中一种），
-                        // 这是「这条腿真的能过数据」的唯一证据。只有它才允许可覆盖流切过去。
-                        //
-                        // 发布也要卡在 `dc_open` 上：探针超时只把腿判为不可用、并没有关掉通道
-                        // （超时 ≠ 关闭），所以超时之后对端恢复的流量照样会进来；不卡的话 UI
-                        // 会在选路已经回到中继的情况下又亮起「已直连」，而且不会再自动复位。
-                        if dc_open && !dc_verified {
-                            dc_verified = true;
                             publish_route(
                                 manager,
                                 generation,
-                                P2pState::Connected,
-                                true,
+                                P2pState::Connecting,
+                                false,
                                 outbound.frames_per_second,
                             );
+                        }
+                        link::Lane::Reliable => {
+                            reliable_open = true;
+                            reliable_verified = false;
+                            reliable_awaiting_pong = false;
+                            reliable_last_inbound = tokio::time::Instant::now();
+
+                            // 同样立刻验一次：`reliable_verified` 由这条 lane 的入站置位
+                            match build_frame(manager, state, FrameKind::Ping, message_type::PING, json!({}))
+                            {
+                                Ok(frame) => {
+                                    reliable_awaiting_pong = true;
+                                    link.send(link::Lane::Reliable, frame);
+                                }
+                                Err(error) => manager.emit_error(generation, error),
+                            }
+
+                            // UI 的 `p2p` 只描述可覆盖腿（§8 Phase 10）：可靠腿起来不改它
+                        }
+                    },
+                    Some(link::P2pEvent::ChannelClosed(lane)) => match lane {
+                        link::Lane::Replaceable => {
+                            dc_open = false;
+                            dc_verified = false;
+
+                            // 腿会自己重试，所以是「正在协商」而不是「关闭」
+                            publish_route(
+                                manager,
+                                generation,
+                                P2pState::Connecting,
+                                false,
+                                outbound.frames_per_second,
+                            );
+                        }
+                        link::Lane::Reliable => {
+                            reliable_open = false;
+                            reliable_verified = false;
+                            reliable_awaiting_pong = false;
+
+                            // 钉在这条腿上的附件全部收尾（§43）：通道没了就再也收不到分片了
+                            if let Err(error) =
+                                direct_lost(&mut sink, manager, generation, state, &mut pacer).await
+                            {
+                                return Outcome::Lost(PairFailure {
+                                    message: error,
+                                    fatal: false,
+                                });
+                            }
+
+                            manager.resend_pending_chat();
+                        }
+                    },
+                    Some(link::P2pEvent::Inbound(lane, bytes)) => {
+                        // DC 腿的入站（§4.2 / R28）：只清 DC 腿**自己的**标志。**不要**动
+                        // 中继腿的 `relay_awaiting_pong` / `relay_last_inbound`——让 DC 的流量去清中继
+                        // 腿的标志，正是「中继静默半死被掩盖」的成因。
+                        //
+                        // R32：两条 lane 的「真的过过数据」证据**各自独立**。`pet-state` 上
+                        // 收到的东西不能替 `reliable` 背书（那条腿承载在传的附件，判错一次
+                        // 就是整单报废），反之亦然。
+                        match lane {
+                            link::Lane::Replaceable => {
+                                dc_last_inbound = tokio::time::Instant::now();
+                                dc_awaiting_pong = false;
+
+                                // R30：**任何** DC 入站都算一次成功的往返（探针的 pong 只是其中
+                                // 一种），这是「这条腿真的能过数据」的唯一证据。只有它才允许可
+                                // 覆盖流切过去。
+                                //
+                                // 发布也要卡在 `dc_open` 上：探针超时只把腿判为不可用、并没有关
+                                // 掉通道（超时 ≠ 关闭），所以超时之后对端恢复的流量照样会进来；
+                                // 不卡的话 UI 会在选路已经回到中继的情况下又亮起「已直连」，而且
+                                // 不会再自动复位。
+                                if dc_open && !dc_verified {
+                                    dc_verified = true;
+                                    publish_route(
+                                        manager,
+                                        generation,
+                                        P2pState::Connected,
+                                        true,
+                                        outbound.frames_per_second,
+                                    );
+                                }
+                            }
+                            link::Lane::Reliable => {
+                                reliable_last_inbound = tokio::time::Instant::now();
+                                reliable_awaiting_pong = false;
+
+                                if reliable_open {
+                                    reliable_verified = true;
+                                }
+                            }
                         }
 
                         if bytes.len() > MAX_BINARY_FRAME_SIZE {
                             // 超限只丢这一帧：DC 是我们自己的通道，不必像中继那样断线
                             manager.emit_error(generation, "收到超过上限的帧".into());
                         } else {
-                            match handle_binary(manager, generation, state, &bytes, Some(&link)) {
+                            match handle_binary(
+                                manager,
+                                generation,
+                                state,
+                                &bytes,
+                                Some(&link),
+                                Some(lane),
+                            ) {
                                 Err(error) => manager.emit_error(generation, error),
                                 Ok(Some((kind, reply))) => {
                                     // 请求从 DC 来、回复也从 DC 回去，否则探针的 pong 会绕
-                                    // 中继，「DC 腿的探针」就名不副实了
+                                    // 中继，「DC 腿的探针」就名不副实了；两条 lane 同理，各回
+                                    // 各的（`reliable` 上的 offer / 分片回执绝不能绕中继）
                                     if let Ok(frame) = state.encode(kind, &reply) {
-                                        link.send(frame);
+                                        link.send(lane, frame);
                                     }
                                 }
                                 Ok(None) => {}
@@ -1904,14 +2146,49 @@ fn describe_close(code: Option<u16>) -> PairFailure {
     }
 }
 
-/// 排**可靠**队列（聊天、控制、附件、分片）。它永远走中继：接收侧要求分片序号严格
-/// 递增，而 `pet-state` 那条 DC 是 `ordered = false, max_retransmits = 0`（R21）。
-async fn flush<S>(sink: &mut S, state: &mut SessionState, pacer: &mut Pacer) -> Result<(), String>
+/// 排**可靠**队列（聊天、presence、控制、附件分片）。
+///
+/// 默认走中继。`leg = Some` 时走 DC 的 `reliable` 通道（Phase 10 / R32）——那是**有序
+/// 且可靠**的一条通道，所以分片可以走它；`pet-state` 那条（`ordered = false,
+/// max_retransmits = 0`）永远不承载分片（R21）。
+///
+/// 走 DC 时**不占中继的 `pacer`**：那条通道不经过中继的计费点（R23）。这里也不给它
+/// 单独设桶——可靠帧小且稀，而 `writable` 标志 + DC 的发送缓冲上限已经在源头封住了内存。
+///
+/// **腿的背压翻假就整体回退中继**（R32）：DC 的 `send` 会一直等到缓冲降到低水位才返回，
+/// 而本函数在 `live` 的 `select!` 分支里被 await——等下去会把中继腿的入站读取、连心跳
+/// 一起挡住。退回中继腿一条帧都不会丢（中继有序，聊天顺序照样对）。
+///
+/// `force` **绕过背压判断**（`leg` 有就给 `leg`）：只有「这一批帧必须和某个已钉 route 的
+/// 传输走同一条 lane」时才用一次——`transfer.complete` 排在那条腿的分片后面，跨 lane 没有
+/// 顺序保证（见 `send_next_chunk`）。`leg.send` 只是往那条腿的队列里投一帧、不阻塞，
+/// 所以这里绕过的只是「源头拒绝注入」，不是「把 `live` 睡死」。
+async fn flush<S>(
+    sink: &mut S,
+    state: &mut SessionState,
+    pacer: &mut Pacer,
+    leg: Option<&dyn link::ReliableLeg>,
+    force: bool,
+) -> Result<(), String>
 where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    let leg = if force {
+        leg
+    } else {
+        leg.filter(|leg| leg.writable())
+    };
+
     while let Some((frame, envelope)) = state.reliable.pop_front() {
+        if let Some(leg) = leg {
+            // 失败即丢：这条腿上的帧丢了靠中继兜底——聊天有 DB 的补发
+            // （`resend_pending_chat`），在传的附件由 `direct_lost()` 按 §43 判失败
+            leg.send(frame);
+
+            continue;
+        }
+
         pacer.acquire().await;
 
         if let Err(error) = send_frame(sink, Message::Binary(frame.clone().into())).await {
@@ -1935,6 +2212,78 @@ fn coverable_leg<'a>(
     link: &'a link::P2pLink,
 ) -> Option<&'a dyn link::CoverableLeg> {
     (dc_open && dc_verified).then_some(link as &dyn link::CoverableLeg)
+}
+
+/// 可靠流（聊天、presence、控制、附件分片）能不能走 DC 的第二条通道（R32）。
+///
+/// 与 `coverable_leg` 同一个形状，但读的是**另一条通道**的两个标志：`reliable_open` 只
+/// 说明 SCTP 协商完了，`reliable_verified` 才是「这条通道真的往返过一次」的证据（而且
+/// 那次往返必须是**我们发出去的探针被答复**——我们要用的正是出站方向）。
+fn reliable_leg<'a>(
+    reliable_open: bool,
+    reliable_verified: bool,
+    link: &'a link::P2pLink,
+) -> Option<&'a dyn link::ReliableLeg> {
+    (reliable_open && reliable_verified).then_some(link as &dyn link::ReliableLeg)
+}
+
+/// 一单的**回执**（accept / reject / cancel）该走哪条腿（R32）。
+///
+/// **按这一单钉住的 `route` 选，不是按「此刻哪条腿可用」**。走 DC 的帧失败即丢（这是设计），
+/// 而「丢了」的收尾只挂在 `direct_lost()` 上——它只管 `route == Direct` 的会话。所以钉在
+/// **中继**上的那一单，它的回执绝不能走 DC：万一那枚帧撞上「通道已经关了、但
+/// `ChannelClosed(Reliable)` 还没被 `live` 处理」的窗口（`select!` 在多个就绪分支里随机选，
+/// 命令那一支完全可能先跑），发送方会永远停在 `AwaitingAccept`（V1 没有任何停滞超时），
+/// 而中继那条腿心跳一切正常，两边就这么挂着。
+///
+/// `Direct` 那一单反过来优先走那条腿（offer 就是从那儿来的）；即便它被背压挡回中继也不
+/// 影响正确性——那一侧本来就有 `direct_lost()` 收敛。
+fn reply_leg<'a>(
+    route: link::Route,
+    reliable_open: bool,
+    reliable_verified: bool,
+    link: &'a link::P2pLink,
+) -> Option<&'a dyn link::ReliableLeg> {
+    match route {
+        link::Route::Direct => reliable_leg(reliable_open, reliable_verified, link),
+        link::Route::Relay => None,
+    }
+}
+
+/// 某一单钉在哪条腿上；会话已经收掉（未知 id）就按中继——回执宁愿绕中继也不能丢。
+fn transfer_route(state: &SessionState, transfer_id: u64) -> link::Route {
+    state
+        .transfers
+        .get(&transfer_id)
+        .map(|session| session.route)
+        .unwrap_or_default()
+}
+
+/// 附件分片那条 `select!` 分支的等待时长（R18 / R32）。
+///
+/// **不变量**：返回 `ZERO` 必须意味着紧接着的 `send_next_chunk` 一定发得出去，否则
+/// `select!` 会在 `Ok(false)` 与 `ZERO` 之间空转。所以这里要把那一单真正需要的每一项
+/// 都算进来：中继那一单是「通用额度 + 分片额度」，Direct 那一单是「分片额度 + 背压」。
+/// 背压没有可计算的剩余时间，翻假时就用 [`DIRECT_RETRY_INTERVAL`] 轮询。
+fn chunk_wait_duration(
+    route: Option<link::Route>,
+    direct: Option<&dyn link::ReliableLeg>,
+    pacer: &Pacer,
+    chunk_pacer: &Pacer,
+    direct_chunk_pacer: &Pacer,
+) -> Option<Duration> {
+    Some(match route? {
+        link::Route::Relay => pacer.wait_duration().max(chunk_pacer.wait_duration()),
+        link::Route::Direct => {
+            let wait = direct_chunk_pacer.wait_duration();
+
+            if wait == Duration::ZERO && direct.is_some_and(|leg| leg.writable()) {
+                Duration::ZERO
+            } else {
+                wait.max(DIRECT_RETRY_INTERVAL)
+            }
+        }
+    })
 }
 
 /// 排**可覆盖**流（宠物快照、统计）：DC 可用时走它，否则照旧走中继。
@@ -1986,6 +2335,7 @@ async fn enqueue_reply<S>(
     manager: &Arc<PairManager>,
     state: &mut SessionState,
     pacer: &mut Pacer,
+    leg: Option<&dyn link::ReliableLeg>,
     generation: u64,
     kind: FrameKind,
     envelope: AppEnvelope,
@@ -2009,7 +2359,7 @@ where
                 retry_dropped_chat(manager, state, &dropped);
             }
 
-            flush(sink, state, pacer).await
+            flush(sink, state, pacer, leg, false).await
         }
     }
 }
@@ -2195,11 +2545,76 @@ fn abort_transfers(manager: &Arc<PairManager>, state: &mut SessionState) {
     }
 }
 
+/// 可靠那条腿不可用时的收尾（R32）。
+///
+/// **触发点有两个，必须都接上**：通道真的关闭（`ChannelClosed(Reliable)`）与探针超时。
+/// 只挂「关闭」会让半死的腿把 `route == Direct` 的传输会话**永久留在表里**——V1 没有
+/// 任何停滞超时，`abort_transfers` 只在整条会话结束时才跑。
+///
+/// 除了本地判失败，还要在**中继上显式发一条 `transfer.cancel`**：不能假定两端在同一
+/// 时刻拿到同一个事件，而半死的腿正是「一端以为还在传、另一端什么都没收到」的形状。
+/// 对端收到未知 `transferId` 的 cancel 是 no-op（`close_transfer` 找不到会话就直接返回），
+/// 所以重复无害。
+async fn direct_lost<S>(
+    sink: &mut S,
+    manager: &Arc<PairManager>,
+    generation: u64,
+    state: &mut SessionState,
+    pacer: &mut Pacer,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let direct: Vec<u64> = state
+        .transfers
+        .iter()
+        .filter(|(_, session)| session.route == link::Route::Direct)
+        .map(|(id, _)| *id)
+        .collect();
+
+    if direct.is_empty() {
+        return Ok(());
+    }
+
+    for transfer_id in direct {
+        let envelope = AppEnvelope::new(
+            message_type::TRANSFER_CANCEL,
+            manager.next_envelope_seq(),
+            json!(TransferIdPayload { transfer_id }),
+        );
+
+        match state.queue(FrameKind::TransferControl, &envelope, false) {
+            Ok(Some(dropped)) => {
+                manager.emit_error(
+                    generation,
+                    "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
+                );
+                retry_dropped_chat(manager, state, &dropped);
+            }
+            Ok(None) => {}
+            Err(error) => manager.emit_error(generation, error),
+        }
+
+        close_transfer(
+            manager,
+            state,
+            transfer_id,
+            TransferOutcome::Failed,
+            "P2P 通路断开，传输已中断",
+        );
+    }
+
+    // cancel 只能走中继腿：这条腿按定义已经不可用了（`None`）
+    flush(sink, state, pacer, None, false).await
+}
+
 /// 发送方：发起一次附件 offer（附件与消息行已经落库）
 fn start_outgoing_transfer(
     manager: &Arc<PairManager>,
     state: &mut SessionState,
     request: OutgoingRequest,
+    route: link::Route,
 ) -> Result<(), String> {
     if request.size > manager.max_attachment_size() {
         return Err(format!(
@@ -2212,12 +2627,20 @@ fn start_outgoing_transfer(
         return Err("同时进行的附件传输太多，请等一会儿再发".to_string());
     }
 
+    // 分片大小随传输层走（§7 / R22 / R32）：DC 那条路用 48 KiB，中继那条路仍是 512 KiB。
+    // 这个值写进 offer，接收侧按它算每一块的长度，所以**这一单的后半程不能换腿**。
+    let chunk_size = match route {
+        link::Route::Direct => P2P_CHUNK_SIZE,
+        link::Route::Relay => CHUNK_SIZE,
+    };
+
     let outgoing = OutgoingTransfer::with_digest(
         request.path.clone(),
         &request.name,
         &request.mime,
         request.size,
         request.sha256.clone(),
+        chunk_size,
     );
 
     let session = TransferSession {
@@ -2229,9 +2652,10 @@ fn start_outgoing_transfer(
         mime: outgoing.mime.clone(),
         size: outgoing.size,
         sha256: outgoing.sha256.clone(),
-        chunk_size: CHUNK_SIZE as u32,
+        chunk_size: outgoing.chunk_size as u32,
         chunks: outgoing.chunks,
         phase: TransferPhase::AwaitingAccept,
+        route,
         outgoing: Some(outgoing),
         incoming: None,
         last_progress_at: None,
@@ -2300,6 +2724,7 @@ fn accept_incoming_transfer(
         session.size,
         &session.sha256,
         session.chunks,
+        session.chunk_size as usize,
     )?;
 
     session.incoming = Some(incoming);
@@ -2428,6 +2853,7 @@ fn handle_transfer_offer(
     manager: &Arc<PairManager>,
     state: &mut SessionState,
     payload: TransferOfferPayload,
+    lane: Option<link::Lane>,
 ) -> Result<Reply, String> {
     let reject = |reason: &str| {
         Ok(Some((
@@ -2443,13 +2869,32 @@ fn handle_transfer_offer(
         )))
     };
 
-    if payload.chunk_size != CHUNK_SIZE as u32
-        || payload.chunks != chunk_count(payload.size)
+    // `chunk_size` 是**对端给的**（§7 / R32）：中继 512 KiB、P2P 48 KiB，两种都合法，所以
+    // 不能只认本机常量，但也不能照单全收——超范围 / 和 `size` 对不上就**回一条 reject**，
+    // **不做夹紧**（夹紧会让两侧用不同的分块长度，每一块都被判「大小不对」，比早失败更难查）。
+    //
+    // 这里回 reject 而不是像以前那样只在本机 `emit_error`：本地报错的话发送方会一直停在
+    // `AwaitingAccept` 等一个永远不来的回执（V1 没有超时），回一条 reject 让它立刻按 §43 收尾。
+    // 对未知 `transferId` 的 reject 在对端是 no-op，所以重复回也无害。
+    let chunk_size = payload.chunk_size as usize;
+
+    if !chunk_size_is_valid(payload.chunk_size as u64)
+        || payload.chunks != chunk_count(payload.size, chunk_size)
         || payload.sha256.len() != 64
-        || !payload.sha256.chars().all(|character| character.is_ascii_hexdigit())
+        || !payload
+            .sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
     {
-        return Err("附件 offer 的参数不合法".to_string());
+        return reject("附件 offer 的参数不合法");
     }
+
+    // 这一单钉在哪条腿上（§8 Phase 10）：offer 从哪条 lane 来就从哪条 lane 走。DC 的
+    // `reliable` 能把 offer 送过来，本身就证明那条腿通（与入站数据同一条路），不必再问标志。
+    let route = match lane {
+        Some(link::Lane::Reliable) => link::Route::Direct,
+        _ => link::Route::Relay,
+    };
 
     if state.transfers.contains_key(&payload.transfer_id) {
         return Ok(None);
@@ -2523,6 +2968,7 @@ fn handle_transfer_offer(
         } else {
             TransferPhase::Receiving
         },
+        route,
         outgoing: None,
         incoming: None,
         last_progress_at: None,
@@ -2534,6 +2980,7 @@ fn handle_transfer_offer(
             session.size,
             &session.sha256,
             session.chunks,
+            session.chunk_size as usize,
         )?);
     }
 
@@ -2575,6 +3022,8 @@ async fn send_next_chunk<S>(
     state: &mut SessionState,
     pacer: &mut Pacer,
     chunk_pacer: &mut Pacer,
+    direct_chunk_pacer: &mut Pacer,
+    direct_leg: Option<&dyn link::ReliableLeg>,
 ) -> Result<bool, String>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -2584,11 +3033,38 @@ where
         return Ok(false);
     };
 
-    // 两套额度都拿到才发（R18）：通用帧额度防止补发把中继扣穿，分片额度再留一层余量，
-    // 否则 20/s 对 20/s 零余量，网络抖动一压缩到达间隔就会被 `close 1008` 打断
-    if !Pacer::try_acquire_pair(pacer, chunk_pacer) {
-        return Ok(false);
-    }
+    let route = state
+        .transfers
+        .get(&transfer_id)
+        .map(|session| session.route)
+        .unwrap_or_default();
+
+    // 额度按**这一单钉住的那条腿**二选一（§7 / R23 / R32）。绝不两套都扣：DC 上的分片不
+    // 经过中继的计费点，拿中继额度去压它会把 60Hz 的可覆盖流一起压死。
+    let direct_leg = match route {
+        link::Route::Relay => {
+            // 两套额度都拿到才发（R18）：通用帧额度防止补发把中继扣穿，分片额度再留一层
+            // 余量，否则 20/s 对 20/s 零余量，网络抖动一压缩到达间隔就会被 `close 1008` 打断
+            if !Pacer::try_acquire_pair(pacer, chunk_pacer) {
+                return Ok(false);
+            }
+
+            None
+        }
+        link::Route::Direct => {
+            // 背压（R32）：翻假说明发送缓冲里已经积了几块，那条腿的 `send` 会**等**。
+            // 这里是 `live` 的 `select!` 分支，等下去会把入站读取一起挡住，所以源头就不注入。
+            let Some(leg) = direct_leg.filter(|leg| leg.writable()) else {
+                return Ok(false);
+            };
+
+            if !direct_chunk_pacer.try_acquire() {
+                return Ok(false);
+            }
+
+            Some(leg)
+        }
+    };
 
     let (frame, sent_bytes, complete) = {
         let session = state
@@ -2616,13 +3092,19 @@ where
         let frame = state.transfer_cipher(transfer_id).seal(&header, &chunk)?;
 
         if frame.len() > MAX_BINARY_FRAME_SIZE {
-            return Err("待发送的附件分片超过中继允许的大小".to_string());
+            return Err("待发送的附件分片超过允许的大小".to_string());
         }
 
         (frame, chunk.len(), index + 1 >= outgoing.chunks)
     };
 
-    send_frame(sink, Message::Binary(frame.into())).await?;
+    match direct_leg {
+        // `send` 是尽力而为、失败即丢（丢一帧 = 接收侧少一块 = 这一单报废），但它在源头
+        // 已经被 `writable` 挡过：`High` 事件之后我们一块都不再注入，所以最多只会有一块
+        // 在途。真正的收尾交给 `direct_lost()`（探针超时 / 通道关闭两处触发）。
+        Some(leg) => leg.send(frame),
+        None => send_frame(sink, Message::Binary(frame.into())).await?,
+    }
 
     let Some(session) = state.transfers.get_mut(&transfer_id) else {
         return Ok(true);
@@ -2651,7 +3133,11 @@ where
                     retry_dropped_chat(manager, state, &dropped);
                 }
 
-                flush(sink, state, pacer).await?;
+                // `transfer.complete` 必须走**同一单的**那条腿，而且要**绕过背压**：接收侧
+                // 先看「分片收齐了没」，而两条腿之间没有顺序保证——最后一块还在 DC 的缓冲里、
+                // 完成帧却从中继先到（背压在这几微秒里翻假就会这样），就会被判「缺分片」，
+                // 一单白废。一帧的量交给那条腿排队即可，绝不绕路。
+                flush(sink, state, pacer, direct_leg, direct_leg.is_some()).await?;
             }
             Err(error) => manager.emit_error(manager.generation(), error),
         }
@@ -2704,6 +3190,7 @@ fn handle_binary(
     state: &mut SessionState,
     bytes: &[u8],
     link: Option<&link::P2pLink>,
+    lane: Option<link::Lane>,
 ) -> Result<Reply, String> {
     // 附件分片用 per-transfer 密钥（R17），所以先按明文帧头里的 kind / transferId 选密钥。
     // 帧头是 AEAD 的 associated data，选错密钥只会解密失败，不会绕过认证。
@@ -2869,7 +3356,7 @@ fn handle_binary(
                 return Ok(None);
             };
 
-            handle_transfer_offer(manager, state, payload)
+            handle_transfer_offer(manager, state, payload, lane)
         }
         message_type::TRANSFER_ACCEPT => {
             let Ok(payload) = serde_json::from_value::<TransferIdPayload>(envelope.payload.clone())
@@ -3103,7 +3590,7 @@ fn publish_peer(manager: &Arc<PairManager>, generation: u64, online: bool) {
 mod tests {
     use super::*;
     use crate::core::pair::protocol::{PetKeyboardState, PetPointerState};
-    use crate::core::pair::transfer::sha256_file;
+    use crate::core::pair::transfer::{MIN_CHUNK_SIZE, sha256_file};
 
     const ROOT_KEY: [u8; 32] = [11u8; 32];
 
@@ -3173,7 +3660,7 @@ mod tests {
             .seal(&FrameHeader::new(kind, 0), &envelope.to_bytes().unwrap())
             .unwrap();
 
-        handle_binary(manager, 0, state, &frame, None)
+        handle_binary(manager, 0, state, &frame, None, None)
     }
 
     #[test]
@@ -3368,18 +3855,66 @@ mod tests {
         }
     }
 
-    /// R30：可覆盖流在 DC 可用时**只**走 DC（**不出现**在中继那条线上），聊天永远只走
-    /// 中继；腿不可用时全部回中继。
+    /// 假的可靠腿：记下收到的帧，并带一个可切换的背压标志（R32）
+    struct FakeReliableLeg {
+        frames: Mutex<Vec<Vec<u8>>>,
+        writable: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeReliableLeg {
+        fn new(writable: bool) -> Self {
+            Self {
+                frames: Mutex::new(Vec::new()),
+                writable: std::sync::atomic::AtomicBool::new(writable),
+            }
+        }
+
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.frames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        /// 把背压翻假：发送缓冲积够了，源头该停手
+        fn block(&self) {
+            self.writable
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// 缓冲排空了，重新放行
+        fn unblock(&self) {
+            self.writable
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl link::ReliableLeg for FakeReliableLeg {
+        fn send(&self, frame: Vec<u8>) {
+            self.frames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(frame);
+        }
+
+        fn writable(&self) -> bool {
+            self.writable.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// R30 / R32：可覆盖流在 `pet-state` 那条腿可用时**只**走它；聊天在 `reliable` 那条腿
+    /// 可用时只走它、背压翻假就退回中继；腿不可用时全部回中继。
     ///
     /// 「这一帧没有经过服务器」这条负向断言只能在这里做：真中继看到的是密文，分不出帧
     /// kind，也没有任何计数器。
     #[tokio::test]
-    async fn coverable_frames_take_the_data_channel_and_chat_never_does() {
+    async fn each_lane_keeps_its_own_stream_off_the_relay() {
         let mut state = SessionState::new(&ROOT_KEY);
         let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
         let mut direct_pacer = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
         let mut socket = RecordingSocket::default();
         let leg = FakeLeg::default();
+        let reliable = FakeReliableLeg::new(true);
 
         state
             .queue(
@@ -3396,8 +3931,10 @@ mod tests {
             )
             .unwrap();
 
-        // 顺序与 `live` 一致：先可靠队列，后可覆盖队列
-        flush(&mut socket, &mut state, &mut pacer).await.unwrap();
+        // 顺序与 `live` 一致：先可靠队列（聊天走可靠腿），后可覆盖队列（快照走可覆盖腿）
+        flush(&mut socket, &mut state, &mut pacer, Some(&reliable), false)
+            .await
+            .unwrap();
         flush_replaceable(
             &mut socket,
             Some(&leg),
@@ -3408,23 +3945,51 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(socket.sent.len(), 1, "中继那条线上应当只有聊天");
-        assert_eq!(frame_kind(&socket.sent[0]), FrameKind::Chat.as_byte());
+        assert!(
+            socket.sent.is_empty(),
+            "两条腿都在时中继那条线上什么都不该有"
+        );
+        assert_eq!(reliable.frames().len(), 1);
+        assert_eq!(reliable.frames()[0][0], FrameKind::Chat.as_byte());
         assert_eq!(leg.frames().len(), 1);
         assert_eq!(leg.frames()[0][0], FrameKind::PetState.as_byte());
 
-        // R23：走 DC 的那一帧**不吃中继的 pacer** —— 中继额度只被上面那一条聊天消耗，
-        // 否则 DC 上的可覆盖流会被压回 20 帧/秒、与 60Hz 冲突；反过来 DC 那条腿的
-        // 额度被扣了一枚。
+        // R23：走 DC 的那两帧**都不吃中继的 pacer** —— 否则 DC 上的流会被压回 20 帧/秒、
+        // 与 60Hz 冲突，而聊天在链路上根本不经过中继的计费点。反过来 DC 那条腿的额度
+        // 被扣了一枚。
         assert!(
-            (pacer.tokens - (OUTBOUND_BURST - 1.0)).abs() < 0.05,
-            "走 DC 的可覆盖帧不该消耗中继的令牌: {}",
+            (pacer.tokens - OUTBOUND_BURST).abs() < 0.05,
+            "走 DC 的帧不该消耗中继的令牌: {}",
             pacer.tokens
         );
         assert!(
             direct_pacer.tokens <= DIRECT_BURST - 1.0 + 0.05,
             "DC 那条腿的额度应当被扣掉一枚: {}",
             direct_pacer.tokens
+        );
+
+        // R32 背压：可靠腿的发送缓冲积够了就退回中继，聊天一帧不丢
+        state
+            .queue(
+                FrameKind::Chat,
+                &AppEnvelope::new(message_type::CHAT_TEXT, 2, json!({ "text": "yo" })),
+                false,
+            )
+            .unwrap();
+
+        reliable.block();
+
+        flush(&mut socket, &mut state, &mut pacer, Some(&reliable), false)
+            .await
+            .unwrap();
+
+        assert_eq!(socket.sent.len(), 1, "背压时聊天必须退回中继");
+        assert_eq!(frame_kind(&socket.sent[0]), FrameKind::Chat.as_byte());
+        assert_eq!(reliable.frames().len(), 1, "背压时不该再往腿里塞");
+        assert!(
+            (pacer.tokens - (OUTBOUND_BURST - 1.0)).abs() < 0.05,
+            "退回中继的帧必须照常吃中继的令牌: {}",
+            pacer.tokens
         );
 
         // 腿不可用（DC 掉了、或者探针还没验过）：可覆盖流回到中继
@@ -3445,6 +4010,56 @@ mod tests {
         assert_eq!(leg.frames().len(), 1, "腿不该再收到任何东西");
     }
 
+    /// R32：一单的**收尾帧**（`transfer.complete`）必须和分片走同一条 lane——背压翻假也
+    /// 不能绕中继，否则「最后一块还在那条腿上、完成帧已从中继先到」会被判「缺分片」，
+    /// 一单白废。普通帧仍然按背压回退中继。
+    #[tokio::test]
+    async fn a_closing_frame_stays_on_the_lane_it_was_pinned_to() {
+        let mut state = SessionState::new(&ROOT_KEY);
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut socket = RecordingSocket::default();
+        let leg = FakeReliableLeg::new(true);
+
+        let complete = |seq: u64| {
+            AppEnvelope::new(
+                message_type::TRANSFER_COMPLETE,
+                seq,
+                json!(TransferIdPayload { transfer_id: 5 }),
+            )
+        };
+
+        // 腿被背压挡住：普通路径整体回退中继
+        leg.block();
+
+        state
+            .queue(FrameKind::TransferControl, &complete(1), false)
+            .unwrap();
+
+        flush(&mut socket, &mut state, &mut pacer, Some(&leg), false)
+            .await
+            .unwrap();
+
+        assert_eq!(socket.sent.len(), 1);
+        assert_eq!(
+            frame_kind(&socket.sent[0]),
+            FrameKind::TransferControl.as_byte()
+        );
+        assert!(leg.frames().is_empty(), "背压时普通帧不该再往腿里塞");
+
+        // 同一帧、同一条腿，但这一批是「钉住的那一单的收尾」：必须走腿，绝不绕中继
+        state
+            .queue(FrameKind::TransferControl, &complete(2), false)
+            .unwrap();
+
+        flush(&mut socket, &mut state, &mut pacer, Some(&leg), true)
+            .await
+            .unwrap();
+
+        assert_eq!(socket.sent.len(), 1, "收尾帧不该绕中继");
+        assert_eq!(leg.frames().len(), 1);
+        assert_eq!(leg.frames()[0][0], FrameKind::TransferControl.as_byte());
+    }
+
     /// R30 的不变量：只有 `dc_open` 不够，必须同时 `dc_verified` 才把可覆盖流切过去
     #[tokio::test]
     async fn the_coverable_leg_needs_both_flags() {
@@ -3453,6 +4068,198 @@ mod tests {
         assert!(coverable_leg(true, false, &link).is_none());
         assert!(coverable_leg(false, true, &link).is_none());
         assert!(coverable_leg(true, true, &link).is_some());
+    }
+
+    /// R32 的不变量：可靠腿和可覆盖腿一样要**两个**标志（读的是另一条通道的那一对）
+    #[tokio::test]
+    async fn the_reliable_leg_needs_both_flags() {
+        let (link, _events) = link::P2pLink::spawn("reliable-leg".into(), Vec::new());
+
+        assert!(reliable_leg(true, false, &link).is_none());
+        assert!(reliable_leg(false, true, &link).is_none());
+        assert!(reliable_leg(true, true, &link).is_some());
+    }
+
+    /// R32：一单的**回执**按它钉住的 route 选腿，不看「此刻哪条腿可用」——钉在中继上的
+    /// 那一单，它的 accept / reject / cancel 走 DC 一旦丢帧就没人收尾（`direct_lost()` 只管
+    /// Direct 的会话），发送方会永远停在 `AwaitingAccept`。
+    #[tokio::test]
+    async fn replies_follow_the_route_the_transfer_was_pinned_to() {
+        let (link, _events) = link::P2pLink::spawn("reply-leg".into(), Vec::new());
+
+        // 中继那一单：可靠腿可用也不许走
+        assert!(reply_leg(link::Route::Relay, true, true, &link).is_none());
+
+        // Direct 那一单：两个标志都得满足（和选路同一把门）
+        assert!(reply_leg(link::Route::Direct, true, true, &link).is_some());
+        assert!(reply_leg(link::Route::Direct, true, false, &link).is_none());
+        assert!(reply_leg(link::Route::Direct, false, true, &link).is_none());
+
+        // 会话已经被收掉（未知 id）：按中继，回执宁愿绕路也不能丢
+        let state = SessionState::new(&ROOT_KEY);
+
+        assert_eq!(transfer_route(&state, 7), link::Route::Relay);
+    }
+
+    /// R32 / §8 的形状 3：offer 从哪条 lane 来，这一单就钉哪条（接收侧记下 lane），
+    /// 回执也跟着它走同一条腿
+    #[tokio::test]
+    async fn an_offer_pins_the_transfer_to_the_lane_it_arrived_on() {
+        let store = TransferStore::new(temp_root("offer-lane"));
+        let (manager, _sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        let (_source, size, sha256) = source_file(&root, &vec![3u8; 4096]);
+        // 线上形状：走可靠腿的这一单就是 48 KiB（helper 只是通用，参数由调用方给）
+        let offer = offer_with_chunk_size(
+            41,
+            TransferKind::File,
+            "x.bin",
+            size,
+            &sha256,
+            P2P_CHUNK_SIZE,
+        );
+        let frame = PairCipher::new(&ROOT_KEY)
+            .seal(
+                &FrameHeader::new(FrameKind::TransferControl, 0),
+                &offer.to_bytes().unwrap(),
+            )
+            .unwrap();
+
+        // 从可靠腿进来：小文件自动接收，回一条 accept
+        let reply = handle_binary(
+            &manager,
+            0,
+            &mut state,
+            &frame,
+            None,
+            Some(link::Lane::Reliable),
+        )
+        .unwrap()
+        .expect("小文件应当自动接收并回 accept");
+
+        assert_eq!(reply.1.message_type, message_type::TRANSFER_ACCEPT);
+        assert_eq!(
+            transfer_route(&state, 41),
+            link::Route::Direct,
+            "offer 从可靠腿来，这一单就钉可靠腿"
+        );
+
+        // 这一单的回执因此也钉在可靠腿上（两个标志都满足时）
+        let (link, _events) = link::P2pLink::spawn("offer-lane".into(), Vec::new());
+
+        assert!(reply_leg(transfer_route(&state, 41), true, true, &link).is_some());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// R23 / R32：DC 上的分片额度与中继那两套桶完全独立，数值按「同样的字节速率」推导
+    #[test]
+    fn the_direct_chunk_budget_matches_the_relay_byte_rate() {
+        // 15 × 512 KiB / 48 KiB = 160：DC 的分片小 512/48 倍，速率就按同一比例放大
+        assert!(
+            (DIRECT_CHUNKS_PER_SECOND
+                - OUTBOUND_CHUNKS_PER_SECOND * CHUNK_SIZE as f64 / P2P_CHUNK_SIZE as f64)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(DIRECT_CHUNK_BURST, 16.0);
+        // 三套桶的数值必须两两不同，否则某一天有人「顺手」把它们合并了也测不出来
+        assert_ne!(DIRECT_CHUNKS_PER_SECOND, OUTBOUND_CHUNKS_PER_SECOND);
+        assert_ne!(DIRECT_FRAMES_PER_SECOND, DIRECT_CHUNKS_PER_SECOND);
+    }
+
+    /// R18 / R32 的不变量：`chunk_wait_duration` 返回 `ZERO` 必须意味着紧接着一定发得出去
+    #[test]
+    fn the_chunk_wait_follows_the_route_that_is_actually_pinned() {
+        let pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+        let direct_chunk_pacer = Pacer::new(DIRECT_CHUNKS_PER_SECOND, DIRECT_CHUNK_BURST);
+        let leg = FakeReliableLeg::new(true);
+
+        // 没有待发分片：那一支直接 `pending()`，不看任何额度
+        assert!(
+            chunk_wait_duration(None, Some(&leg), &pacer, &chunk_pacer, &direct_chunk_pacer)
+                .is_none()
+        );
+
+        // 桶是满的 → 立刻能发
+        assert_eq!(
+            chunk_wait_duration(
+                Some(link::Route::Relay),
+                None,
+                &pacer,
+                &chunk_pacer,
+                &direct_chunk_pacer
+            ),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            chunk_wait_duration(
+                Some(link::Route::Direct),
+                Some(&leg),
+                &pacer,
+                &chunk_pacer,
+                &direct_chunk_pacer
+            ),
+            Some(Duration::ZERO)
+        );
+
+        // Direct 那一单**不看**中继的两个桶（它一个令牌都不该被扣）：把中继桶抽干，
+        // 等的时间仍然只由 DC 的分片额度决定
+        let empty_relay = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, 0.0);
+
+        let wait = chunk_wait_duration(
+            Some(link::Route::Direct),
+            Some(&leg),
+            &empty_relay,
+            &chunk_pacer,
+            &direct_chunk_pacer,
+        )
+        .unwrap();
+
+        assert_eq!(wait, Duration::ZERO, "Direct 不该等中继的额度");
+
+        // 背压翻假：没有可计算的剩余时间，按固定间隔轮询（**不能**返回 ZERO，
+        // 否则 `select!` 会在 `Ok(false)` 与 `ZERO` 之间空转）
+        leg.block();
+
+        assert_eq!(
+            chunk_wait_duration(
+                Some(link::Route::Direct),
+                Some(&leg),
+                &pacer,
+                &chunk_pacer,
+                &direct_chunk_pacer
+            ),
+            Some(DIRECT_RETRY_INTERVAL)
+        );
+
+        // 腿整个不见了（通道已关）：同样不能返回 ZERO
+        assert_eq!(
+            chunk_wait_duration(
+                Some(link::Route::Direct),
+                None,
+                &pacer,
+                &chunk_pacer,
+                &direct_chunk_pacer
+            ),
+            Some(DIRECT_RETRY_INTERVAL)
+        );
+
+        // 中继那一单看的是两个桶里更晚的那一个
+        let slow = Pacer::new(1.0, 0.0);
+
+        assert_eq!(
+            chunk_wait_duration(
+                Some(link::Route::Relay),
+                None,
+                &slow,
+                &chunk_pacer,
+                &direct_chunk_pacer
+            ),
+            Some(slow.wait_duration().max(chunk_pacer.wait_duration()))
+        );
     }
 
     #[test]
@@ -3755,6 +4562,7 @@ mod tests {
                 sha256,
                 path: source,
             },
+            link::Route::Relay,
         )
         .unwrap();
 
@@ -4335,6 +5143,18 @@ mod tests {
         size: u64,
         sha256: &str,
     ) -> AppEnvelope {
+        offer_with_chunk_size(transfer_id, kind, name, size, sha256, CHUNK_SIZE)
+    }
+
+    /// 指定分片大小的 offer（§7 / R32）：中继 512 KiB、P2P 48 KiB 都要能走
+    fn offer_with_chunk_size(
+        transfer_id: u64,
+        kind: TransferKind,
+        name: &str,
+        size: u64,
+        sha256: &str,
+        chunk_size: usize,
+    ) -> AppEnvelope {
         AppEnvelope::new(
             message_type::TRANSFER_OFFER,
             1,
@@ -4347,8 +5167,8 @@ mod tests {
                 size,
                 mime: "application/octet-stream".into(),
                 sha256: sha256.into(),
-                chunk_size: CHUNK_SIZE as u32,
-                chunks: chunk_count(size),
+                chunk_size: chunk_size as u32,
+                chunks: chunk_count(size, chunk_size),
             })
             .unwrap(),
         )
@@ -4372,7 +5192,7 @@ mod tests {
             .seal(&header, bytes)
             .unwrap();
 
-        handle_binary(manager, 0, state, &frame, None)
+        handle_binary(manager, 0, state, &frame, None, None)
     }
 
     fn count_part_files(root: &std::path::Path) -> usize {
@@ -4416,12 +5236,13 @@ mod tests {
             MessageStatus::Pending
         );
 
-        for index in 0..chunk_count(size) {
+        for index in 0..chunk_count(size, CHUNK_SIZE) {
             let start = index as usize * CHUNK_SIZE;
             let end = (start + CHUNK_SIZE).min(payload.len());
-            let reply = deliver_chunk(&manager, &mut state, 77, index, &payload[start..end]).unwrap();
+            let reply =
+                deliver_chunk(&manager, &mut state, 77, index, &payload[start..end]).unwrap();
 
-            if index + 1 < chunk_count(size) {
+            if index + 1 < chunk_count(size, CHUNK_SIZE) {
                 assert!(reply.is_none(), "中间的分片不该有回执");
             } else {
                 let (_, verified) = reply.expect("最后一块应当回 verified");
@@ -4653,6 +5474,7 @@ mod tests {
         let mut socket = RecordingSocket::default();
         let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
         let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+        let mut direct_chunk_pacer = Pacer::new(DIRECT_CHUNKS_PER_SECOND, DIRECT_CHUNK_BURST);
 
         manager
             .history
@@ -4692,6 +5514,7 @@ mod tests {
                 sha256,
                 path: source,
             },
+            link::Route::Relay,
         )
         .unwrap();
 
@@ -4702,7 +5525,9 @@ mod tests {
         );
 
         // 真实流程里连接任务在处理 StartTransfer 之后立刻 flush：offer 先出去
-        flush(&mut socket, &mut state, &mut pacer).await.unwrap();
+        flush(&mut socket, &mut state, &mut pacer, None, false)
+            .await
+            .unwrap();
 
         // 对端同意
         deliver(
@@ -4725,13 +5550,18 @@ mod tests {
             &mut state,
             &mut pacer,
             &mut chunk_pacer,
+            &mut direct_chunk_pacer,
+            None,
         )
-            .await
-            .unwrap()
+        .await
+        .unwrap()
         {}
 
         // 线格式：第一帧是 offer（根密钥），随后是分片（per-transfer 密钥），最后一帧是 complete
-        assert_eq!(socket.sent.len(), 1 + chunk_count(size) as usize + 1);
+        assert_eq!(
+            socket.sent.len(),
+            1 + chunk_count(size, CHUNK_SIZE) as usize + 1
+        );
 
         let Message::Binary(offer_frame) = &socket.sent[0] else {
             panic!("第一个应当是二进制帧");
@@ -4747,8 +5577,17 @@ mod tests {
         let offer: TransferOfferPayload = serde_json::from_value(envelope.payload).unwrap();
 
         assert_eq!(offer.transfer_id, 5);
-        assert_eq!(offer.chunks, chunk_count(size));
-        assert_eq!(offer.sha256, manager.history.attachment("a-1").unwrap().unwrap().sha256.unwrap());
+        assert_eq!(offer.chunks, chunk_count(size, CHUNK_SIZE));
+        assert_eq!(
+            offer.sha256,
+            manager
+                .history
+                .attachment("a-1")
+                .unwrap()
+                .unwrap()
+                .sha256
+                .unwrap()
+        );
 
         // 分片拼回来必须和源文件逐字节一致
         let cipher = PairCipher::new(&crypto::derive_transfer_key(&ROOT_KEY, 5));
@@ -4807,6 +5646,207 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// §7 / R32：钉在 DC 上的那一单用 48 KiB 分片、整单（offer / 分片 / complete）都走腿，
+    /// 中继上一条帧都没有；额度也是自己的那一套，两边都不碰对方的桶。
+    #[tokio::test]
+    async fn a_direct_transfer_takes_the_leg_and_its_own_budget() {
+        let store = TransferStore::new(temp_root("send-direct"));
+        let (manager, _sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        // 两块多一点：3 块，块边界都要走到
+        let payload: Vec<u8> = (0..(P2P_CHUNK_SIZE * 2 + 1))
+            .map(|index| (index % 89) as u8)
+            .collect();
+        let (source, size, sha256) = source_file(&root, &payload);
+
+        let mut socket = RecordingSocket::default();
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut chunk_pacer = Pacer::new(OUTBOUND_CHUNKS_PER_SECOND, OUTBOUND_CHUNK_BURST);
+        let mut direct_chunk_pacer = Pacer::new(DIRECT_CHUNKS_PER_SECOND, DIRECT_CHUNK_BURST);
+        let leg = FakeReliableLeg::new(true);
+
+        manager
+            .history
+            .insert(&NewMessage::outgoing_attachment(
+                "m-1".into(),
+                MessageKind::File,
+                "a-1".into(),
+                0,
+                1,
+            ))
+            .unwrap();
+        manager
+            .history
+            .upsert_attachment(&NewAttachment {
+                id: "a-1".into(),
+                kind: MessageKind::File,
+                original_name: Some("big.bin".into()),
+                mime: Some("application/octet-stream".into()),
+                size: Some(size),
+                sha256: Some(sha256.clone()),
+                local_path: Some(source.to_string_lossy().to_string()),
+                created_at: 0,
+            })
+            .unwrap();
+
+        start_outgoing_transfer(
+            &manager,
+            &mut state,
+            OutgoingRequest {
+                transfer_id: 11,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind: TransferKind::File,
+                name: "big.bin".into(),
+                mime: "application/octet-stream".into(),
+                size,
+                sha256,
+                path: source,
+            },
+            link::Route::Direct,
+        )
+        .unwrap();
+
+        // 分片大小跟着 route 走：offer 里写的就是 48 KiB（接收侧按它算每一块）
+        assert_eq!(
+            state.transfers.get(&11).unwrap().chunk_size,
+            P2P_CHUNK_SIZE as u32
+        );
+
+        flush(&mut socket, &mut state, &mut pacer, Some(&leg), false)
+            .await
+            .unwrap();
+
+        assert!(socket.sent.is_empty(), "offer 不该经过服务器");
+        assert_eq!(leg.frames().len(), 1);
+        assert_eq!(leg.frames()[0][0], FrameKind::TransferControl.as_byte());
+
+        deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &AppEnvelope::new(
+                message_type::TRANSFER_ACCEPT,
+                2,
+                json!(TransferIdPayload { transfer_id: 11 }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.transfers.get(&11).unwrap().phase,
+            TransferPhase::Sending
+        );
+
+        // 背压翻假：一块都不发，返回 `Ok(false)`（不是错误——这一支靠等待再试）
+        leg.block();
+
+        assert!(
+            !send_next_chunk(
+                &mut socket,
+                &manager,
+                &mut state,
+                &mut pacer,
+                &mut chunk_pacer,
+                &mut direct_chunk_pacer,
+                Some(&leg),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(socket.sent.is_empty());
+        assert_eq!(leg.frames().len(), 1, "背压时一块都不该上路");
+
+        leg.unblock();
+
+        // DC 的分片额度是这一支**真正**的门（不是中继那两个桶，也不是「有腿就放行」）：
+        // 把 DC 的分片桶抽干，一块都发不出去，而且是 `Ok(false)` 而不是错误
+        let mut drained = Pacer::new(DIRECT_CHUNKS_PER_SECOND, 0.0);
+
+        assert!(
+            !send_next_chunk(
+                &mut socket,
+                &manager,
+                &mut state,
+                &mut pacer,
+                &mut chunk_pacer,
+                &mut drained,
+                Some(&leg),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(leg.frames().len(), 1, "没有 DC 分片令牌时一块都不该上路");
+
+        while send_next_chunk(
+            &mut socket,
+            &manager,
+            &mut state,
+            &mut pacer,
+            &mut chunk_pacer,
+            &mut direct_chunk_pacer,
+            Some(&leg),
+        )
+        .await
+        .unwrap()
+        {}
+
+        // 线格式全在腿上：offer + 3 块 + complete；中继那条线一条帧都没有
+        assert!(socket.sent.is_empty(), "DC 那一单不该有任何帧经过服务器");
+        assert_eq!(
+            leg.frames().len(),
+            1 + chunk_count(size, P2P_CHUNK_SIZE) as usize + 1
+        );
+
+        // 额度（R23 / R32）：中继的两个桶一枚都没被扣——DC 上的分片不经过中继的计费点
+        assert!(
+            (pacer.tokens - OUTBOUND_BURST).abs() < 0.05,
+            "DC 那一单不该吃中继的通用额度: {}",
+            pacer.tokens
+        );
+        assert!(
+            (chunk_pacer.tokens - OUTBOUND_CHUNK_BURST).abs() < 0.05,
+            "DC 那一单不该吃中继的分片额度: {}",
+            chunk_pacer.tokens
+        );
+
+        // 分片拼回来必须和源文件逐字节一致（per-transfer 密钥）
+        let cipher = PairCipher::new(&crypto::derive_transfer_key(&ROOT_KEY, 11));
+        let frames = leg.frames();
+        let mut rebuilt = Vec::new();
+
+        for (index, frame) in frames[1..frames.len() - 1].iter().enumerate() {
+            let (header, plain) = cipher.open(frame).unwrap();
+
+            assert_eq!(header.kind, FrameKind::TransferChunk);
+            assert_eq!(header.transfer_id, 11);
+            assert_eq!(header.seq, index as u32);
+            // 48 KiB 一块：最后一块是余数，其余都是整块，绝不是中继那个 512 KiB
+            assert_eq!(
+                plain.len(),
+                if index + 1 == chunk_count(size, P2P_CHUNK_SIZE) as usize {
+                    size as usize - index * P2P_CHUNK_SIZE
+                } else {
+                    P2P_CHUNK_SIZE
+                }
+            );
+
+            rebuilt.extend_from_slice(&plain);
+        }
+
+        assert_eq!(rebuilt, payload);
+
+        let (_, complete_plain) = PairCipher::new(&ROOT_KEY)
+            .open(frames.last().unwrap())
+            .unwrap();
+        let complete = AppEnvelope::from_bytes(&complete_plain).unwrap();
+
+        assert_eq!(complete.message_type, message_type::TRANSFER_COMPLETE);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// §81：0 字节文件没有分片可发，`transfer.complete` 只能在收到 accept 时立刻补一条。
     /// 少了它两边会停在 sending / receiving，一直到断线才被判失败。
     #[tokio::test]
@@ -4819,7 +5859,7 @@ mod tests {
         let empty_sha256 = sha256.clone();
 
         assert_eq!(size, 0);
-        assert_eq!(chunk_count(size), 0);
+        assert_eq!(chunk_count(size, CHUNK_SIZE), 0);
 
         manager
             .history
@@ -4859,13 +5899,16 @@ mod tests {
                 sha256,
                 path: source,
             },
+            link::Route::Relay,
         )
         .unwrap();
 
         let mut socket = RecordingSocket::default();
         let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
 
-        flush(&mut socket, &mut state, &mut pacer).await.unwrap();
+        flush(&mut socket, &mut state, &mut pacer, None, false)
+            .await
+            .unwrap();
 
         assert!(!state.has_pending_chunks(), "空文件不该有待发分片");
 
@@ -4925,6 +5968,90 @@ mod tests {
         std::fs::remove_dir_all(&receiver_root).unwrap();
     }
 
+    /// §7 / R32：分片大小由**对端**给，所以不能只认本机常量；但必须在合法范围内、且和
+    /// `size` 对得上。不合法就回一条 reject——以前那种「只在本机 `emit_error`」会让发送方
+    /// 一直停在 `AwaitingAccept` 等一个永远不来的回执。
+    #[tokio::test]
+    async fn an_offer_with_an_impossible_chunk_size_is_rejected() {
+        let store = TransferStore::new(temp_root("bad-chunk"));
+        let (manager, _sink, root) = manager_with_store(store);
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        // 块边界两侧各有一块：中继 2 块、P2P 11 块，这样「块数和大小对不上」才真的对不上
+        let (_source, size, sha256) = source_file(&root, &vec![7u8; CHUNK_SIZE + 7]);
+
+        // 比下界还小 / 直接给 0：对端可以拿它逼你在本地写一堆小文件
+        for chunk_size in [MIN_CHUNK_SIZE - 1, 0] {
+            let reply = deliver(
+                &manager,
+                &mut state,
+                FrameKind::TransferControl,
+                &offer_with_chunk_size(31, TransferKind::File, "x.bin", size, &sha256, chunk_size),
+            )
+            .unwrap()
+            .expect("不合法的分片大小必须回一条 reject");
+
+            assert_eq!(reply.1.message_type, message_type::TRANSFER_REJECT);
+            assert!(state.transfers.is_empty(), "不合法不该建会话");
+        }
+
+        // 大小合法但 `chunks` 和 `size` 对不上（拿 512 KiB 的块数报 48 KiB 的大小）
+        let inconsistent = AppEnvelope::new(
+            message_type::TRANSFER_OFFER,
+            1,
+            json!(TransferOfferPayload {
+                transfer_id: 32,
+                message_id: "m-1".into(),
+                attachment_id: "a-1".into(),
+                kind: TransferKind::File,
+                name: "x.bin".into(),
+                size,
+                mime: "application/octet-stream".into(),
+                sha256: sha256.clone(),
+                chunk_size: P2P_CHUNK_SIZE as u32,
+                chunks: chunk_count(size, CHUNK_SIZE),
+            }),
+        );
+
+        let reply = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &inconsistent,
+        )
+        .unwrap()
+        .expect("块数对不上必须回一条 reject");
+
+        assert_eq!(reply.1.message_type, message_type::TRANSFER_REJECT);
+        assert!(state.transfers.is_empty());
+
+        // 48 KiB 是合法的一档（Phase 10 的 DC 那一单用的就是它），中继入站的 offer 钉中继
+        let accepted = deliver(
+            &manager,
+            &mut state,
+            FrameKind::TransferControl,
+            &offer_with_chunk_size(
+                33,
+                TransferKind::File,
+                "x.bin",
+                size,
+                &sha256,
+                P2P_CHUNK_SIZE,
+            ),
+        )
+        .unwrap();
+
+        assert!(accepted.is_some(), "48 KiB 的 offer 应当被接受");
+
+        let session = state.transfers.get(&33).unwrap();
+
+        assert_eq!(session.chunk_size, P2P_CHUNK_SIZE as u32);
+        assert_eq!(session.route, link::Route::Relay, "从哪条 lane 来就钉哪条");
+        assert_eq!(session.chunks, chunk_count(size, P2P_CHUNK_SIZE));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// §81：对方拒绝时，发送方要标记失败并说明原因
     #[tokio::test]
     async fn a_reject_marks_the_outgoing_attachment_failed() {
@@ -4959,6 +6086,7 @@ mod tests {
                 sha256,
                 path: source,
             },
+            link::Route::Relay,
         )
         .unwrap();
 

@@ -19,10 +19,34 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::protocol::TransferKind;
+use super::protocol::{FRAME_HEADER_SIZE, MAX_BINARY_FRAME_SIZE, NONCE_SIZE, TransferKind};
 
-/// 每个 chunk 的明文大小（§40）
+/// 中继那条路上每个 chunk 的明文大小（§40）
 pub const CHUNK_SIZE: usize = 512 * 1024;
+/// P2P（DataChannel）下每个 chunk 的明文大小（§7 / R22 / R32）。
+///
+/// 48 KiB 是保守默认：`webrtc` 0.21 的 SCTP 单条消息上限实测是 256 KiB（超限前由实现自己
+/// 分片，见 R22），48 KiB 也给「一块一帧」留出足够余量。
+pub const P2P_CHUNK_SIZE: usize = 48 * 1024;
+/// `chunk_size` 的下界（§7 / R32）：不设下界的话，对端把 `chunk_size` 报成 1 就能逼你在
+/// 本地写十亿次小文件。
+pub const MIN_CHUNK_SIZE: usize = 4 * 1024;
+/// Poly1305 认证标签的长度
+const AEAD_TAG_SIZE: usize = 16;
+
+/// `chunk_size` 的合法上界（§7 / R32）：既不能超过中继允许的一帧，也不能超过我们自己封
+/// 出来的一帧（帧头 + nonce + tag 都是封帧开销）。
+///
+/// **发送侧的夹紧与接收侧的校验必须调同一个函数**：两侧一旦用了不同的分块长度，接收侧
+/// 每一块都会报「附件分片大小不对」，比直接拒绝 offer 更难查。
+pub fn max_chunk_size() -> usize {
+    CHUNK_SIZE.min(MAX_BINARY_FRAME_SIZE - FRAME_HEADER_SIZE - NONCE_SIZE - AEAD_TAG_SIZE)
+}
+
+/// 对端 offer 里的 `chunk_size` 是否在合法范围内（§7 / R32 的接收侧校验）
+pub fn chunk_size_is_valid(chunk_size: u64) -> bool {
+    (MIN_CHUNK_SIZE as u64..=max_chunk_size() as u64).contains(&chunk_size)
+}
 /// 附件默认上限（§42）：256 MB
 pub const DEFAULT_MAX_SIZE: u64 = 256 * 1024 * 1024;
 /// 附件硬上限（§42）：设置填得再大也不会超过它
@@ -36,20 +60,24 @@ const MAX_EXTENSION_CHARS: usize = 10;
 /// 启动时清理多久以前的临时残留
 const STALE_PART_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// 一个附件需要切成几块。空文件是 0 块（offer 之后直接 complete）。
-pub fn chunk_count(size: u64) -> u32 {
-    size.div_ceil(CHUNK_SIZE as u64) as u32
+/// 一个附件按 `chunk_size` 需要切成几块。空文件是 0 块（offer 之后直接 complete）。
+///
+/// `chunk_size` 由调用方保证在 `[MIN_CHUNK_SIZE, max_chunk_size()]` 内；这里再夹一层 1
+/// 只是为了让除法不会 panic（0 会让 `div_ceil` 直接炸）。
+pub fn chunk_count(size: u64, chunk_size: usize) -> u32 {
+    size.div_ceil(chunk_size.max(1) as u64) as u32
 }
 
-/// 第 `index` 块应该是多少字节
-pub fn chunk_length(size: u64, index: u32) -> usize {
-    let start = index as u64 * CHUNK_SIZE as u64;
+/// 第 `index` 块按 `chunk_size` 应该是多少字节
+pub fn chunk_length(size: u64, index: u32, chunk_size: usize) -> usize {
+    let chunk_size = chunk_size.max(1);
+    let start = index as u64 * chunk_size as u64;
 
     if start >= size {
         return 0;
     }
 
-    (size - start).min(CHUNK_SIZE as u64) as usize
+    (size - start).min(chunk_size as u64) as usize
 }
 
 /// 把对方给的文件名洗成可以安全显示与另存的名字（§42）。
@@ -194,6 +222,9 @@ pub struct OutgoingTransfer {
     pub mime: String,
     pub size: u64,
     pub sha256: String,
+    /// 这一次传输实际使用的分片大小（§7 / R22）：中继 512 KiB、P2P 48 KiB。
+    /// 读块、seek 与「下一块该多少字节」都必须用它，不能用全局常量。
+    pub chunk_size: usize,
     pub chunks: u32,
     pub bytes_sent: u64,
     pub sent_chunks: u32,
@@ -209,13 +240,17 @@ impl OutgoingTransfer {
         mime: &str,
         size: u64,
         sha256: String,
+        chunk_size: usize,
     ) -> Self {
+        let chunk_size = chunk_size.clamp(MIN_CHUNK_SIZE, max_chunk_size());
+
         Self {
             name: sanitize_file_name(name),
             mime: sanitize_mime(mime),
             size,
             sha256,
-            chunks: chunk_count(size),
+            chunk_size,
+            chunks: chunk_count(size, chunk_size),
             bytes_sent: 0,
             sent_chunks: 0,
             source,
@@ -232,19 +267,20 @@ impl OutgoingTransfer {
 
     /// 下一块应该发多少字节（用于和接收方对齐校验）
     pub fn expected_length(&self) -> usize {
-        chunk_length(self.size, self.sent_chunks)
+        chunk_length(self.size, self.sent_chunks, self.chunk_size)
     }
 
     pub fn read_chunk(&self, index: u32) -> Result<Vec<u8>, String> {
-        let expected = chunk_length(self.size, index);
+        let expected = chunk_length(self.size, index, self.chunk_size);
 
         if expected == 0 {
             return Ok(Vec::new());
         }
 
-        let mut file = File::open(&self.source).map_err(|error| format!("读取附件失败: {error}"))?;
+        let mut file =
+            File::open(&self.source).map_err(|error| format!("读取附件失败: {error}"))?;
 
-        file.seek_relative(index as i64 * CHUNK_SIZE as i64)
+        file.seek_relative(index as i64 * self.chunk_size as i64)
             .map_err(|error| format!("读取附件失败: {error}"))?;
 
         let mut buffer = vec![0u8; expected];
@@ -267,6 +303,8 @@ impl OutgoingTransfer {
 pub struct IncomingTransfer {
     pub size: u64,
     pub sha256: String,
+    /// 这次传输实际使用的分片大小：**取 offer 里的值**，不是本机常量（§7 / R22）
+    pub chunk_size: usize,
     pub chunks: u32,
     pub received_chunks: u32,
     pub received_bytes: u64,
@@ -281,6 +319,7 @@ impl IncomingTransfer {
         size: u64,
         sha256: &str,
         chunks: u32,
+        chunk_size: usize,
     ) -> Result<Self, String> {
         fs::create_dir_all(tmp_dir).map_err(|error| format!("创建临时目录失败: {error}"))?;
 
@@ -294,6 +333,7 @@ impl IncomingTransfer {
         Ok(Self {
             size,
             sha256: sha256.to_ascii_lowercase(),
+            chunk_size,
             chunks,
             received_chunks: 0,
             received_bytes: 0,
@@ -316,7 +356,7 @@ impl IncomingTransfer {
             return Err("收到的附件分片超出 offer 声明的数量".to_string());
         }
 
-        let expected = chunk_length(self.size, index);
+        let expected = chunk_length(self.size, index, self.chunk_size);
 
         if bytes.len() != expected {
             return Err(format!(
@@ -569,20 +609,48 @@ mod tests {
 
     #[test]
     fn chunk_math_covers_the_boundaries() {
-        assert_eq!(chunk_count(0), 0);
-        assert_eq!(chunk_count(1), 1);
-        assert_eq!(chunk_count(CHUNK_SIZE as u64), 1);
-        assert_eq!(chunk_count(CHUNK_SIZE as u64 + 1), 2);
-        assert_eq!(chunk_count(10 * 1024 * 1024), 20);
+        assert_eq!(chunk_count(0, CHUNK_SIZE), 0);
+        assert_eq!(chunk_count(1, CHUNK_SIZE), 1);
+        assert_eq!(chunk_count(CHUNK_SIZE as u64, CHUNK_SIZE), 1);
+        assert_eq!(chunk_count(CHUNK_SIZE as u64 + 1, CHUNK_SIZE), 2);
+        assert_eq!(chunk_count(10 * 1024 * 1024, CHUNK_SIZE), 20);
 
-        assert_eq!(chunk_length(0, 0), 0);
-        assert_eq!(chunk_length(1, 0), 1);
-        assert_eq!(chunk_length(CHUNK_SIZE as u64, 0), CHUNK_SIZE);
-        assert_eq!(chunk_length(CHUNK_SIZE as u64 + 1, 1), 1);
-        assert_eq!(chunk_length(CHUNK_SIZE as u64 + 1, 0), CHUNK_SIZE);
+        assert_eq!(chunk_length(0, 0, CHUNK_SIZE), 0);
+        assert_eq!(chunk_length(1, 0, CHUNK_SIZE), 1);
+        assert_eq!(chunk_length(CHUNK_SIZE as u64, 0, CHUNK_SIZE), CHUNK_SIZE);
+        assert_eq!(chunk_length(CHUNK_SIZE as u64 + 1, 1, CHUNK_SIZE), 1);
+        assert_eq!(
+            chunk_length(CHUNK_SIZE as u64 + 1, 0, CHUNK_SIZE),
+            CHUNK_SIZE
+        );
+
+        // §7 / R22：同一份尺寸换个 chunk_size，块数必须跟着变
+        assert_eq!(chunk_count(10 * 1024 * 1024, P2P_CHUNK_SIZE), 214);
+        assert_eq!(
+            chunk_length(10 * 1024 * 1024, 213, P2P_CHUNK_SIZE),
+            10 * 1024 * 1024 - 213 * P2P_CHUNK_SIZE
+        );
+        assert_eq!(chunk_length(10 * 1024 * 1024, 214, P2P_CHUNK_SIZE), 0);
     }
 
-    /// §81 的尺寸表：0 字节 / 1 字节 / 512 KiB / 512 KiB + 1 / 10 MB
+    /// §7 / R32：两侧必须用**同一对常量**。这里把范围与两个实际用到的值钉住，
+    /// 免得哪天改了一侧忘了另一侧。
+    #[test]
+    fn the_chunk_size_range_covers_both_real_sizes() {
+        assert!(chunk_size_is_valid(CHUNK_SIZE as u64));
+        assert!(chunk_size_is_valid(P2P_CHUNK_SIZE as u64));
+
+        assert!(!chunk_size_is_valid(0));
+        assert!(!chunk_size_is_valid((MIN_CHUNK_SIZE - 1) as u64));
+        assert!(!chunk_size_is_valid((max_chunk_size() + 1) as u64));
+
+        // 上界要能把 512 KiB + 帧头 / nonce / tag 放进一帧里
+        assert!(max_chunk_size() >= CHUNK_SIZE);
+        assert!(max_chunk_size() < MAX_BINARY_FRAME_SIZE);
+    }
+
+    /// §81 的尺寸表：0 字节 / 1 字节 / 512 KiB / 512 KiB + 1 / 10 MB。
+    /// **两种 chunk_size 都要走一遍**（R22 / R32）：中继 512 KiB、P2P 48 KiB。
     #[test]
     fn transfers_round_trip_every_size_the_plan_asks_for() {
         let root = temp_dir("round-trip");
@@ -590,57 +658,64 @@ mod tests {
 
         store.ensure().unwrap();
 
-        for size in [0usize, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 10 * 1024 * 1024] {
-            let source = write_source(&root, &format!("src-{size}.bin"), size);
-            let (sha256, size_on_disk) = sha256_file(&source).unwrap();
-            let mut outgoing = OutgoingTransfer::with_digest(
-                source.clone(),
-                "src.bin",
-                "application/octet-stream",
-                size_on_disk,
-                sha256,
-            );
+        for chunk_size in [CHUNK_SIZE, P2P_CHUNK_SIZE] {
+            for size in [0usize, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 10 * 1024 * 1024] {
+                let source = write_source(&root, &format!("src-{size}.bin"), size);
+                let (sha256, size_on_disk) = sha256_file(&source).unwrap();
+                let mut outgoing = OutgoingTransfer::with_digest(
+                    source.clone(),
+                    "src.bin",
+                    "application/octet-stream",
+                    size_on_disk,
+                    sha256,
+                    chunk_size,
+                );
 
-            assert_eq!(outgoing.size, size as u64);
-            assert_eq!(outgoing.chunks, chunk_count(size as u64));
+                assert_eq!(outgoing.size, size as u64);
+                assert_eq!(outgoing.chunk_size, chunk_size);
+                assert_eq!(outgoing.chunks, chunk_count(size as u64, chunk_size));
 
-            let mut incoming = IncomingTransfer::create(
-                &store.tmp_dir(),
-                outgoing.size,
-                &outgoing.sha256,
-                outgoing.chunks,
-            )
-            .unwrap();
+                let mut incoming = IncomingTransfer::create(
+                    &store.tmp_dir(),
+                    outgoing.size,
+                    &outgoing.sha256,
+                    outgoing.chunks,
+                    chunk_size,
+                )
+                .unwrap();
 
-            while !outgoing.is_done() {
-                let index = outgoing.next_index();
-                let chunk = outgoing.read_chunk(index).unwrap();
+                while !outgoing.is_done() {
+                    let index = outgoing.next_index();
+                    let chunk = outgoing.read_chunk(index).unwrap();
 
-                assert_eq!(chunk.len(), outgoing.expected_length());
+                    assert_eq!(chunk.len(), outgoing.expected_length());
 
-                incoming.write_chunk(index, &chunk).unwrap();
-                outgoing.mark_sent(chunk.len());
+                    incoming.write_chunk(index, &chunk).unwrap();
+                    outgoing.mark_sent(chunk.len());
+                }
+
+                assert!(outgoing.is_done());
+
+                let target = store.attachment_path(&store.attachment_name("src.bin"));
+                let (saved, saved_size, saved_sha) = incoming.finish(target.clone()).unwrap();
+
+                assert_eq!(saved, target);
+                assert_eq!(saved_size, size as u64);
+                assert_eq!(saved_sha, outgoing.sha256);
+                assert_eq!(fs::read(&target).unwrap().len(), size);
+                assert_eq!(sha256_file(&target).unwrap().0, outgoing.sha256);
+
+                // 传完之后不应该再有 .part 残留
+                let leftovers = fs::read_dir(store.tmp_dir())
+                    .unwrap()
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|value| value.to_str()) == Some("part")
+                    })
+                    .count();
+
+                assert_eq!(leftovers, 0);
             }
-
-            assert!(outgoing.is_done());
-
-            let target = store.attachment_path(&store.attachment_name("src.bin"));
-            let (saved, saved_size, saved_sha) = incoming.finish(target.clone()).unwrap();
-
-            assert_eq!(saved, target);
-            assert_eq!(saved_size, size as u64);
-            assert_eq!(saved_sha, outgoing.sha256);
-            assert_eq!(fs::read(&target).unwrap().len(), size);
-            assert_eq!(sha256_file(&target).unwrap().0, outgoing.sha256);
-
-            // 传完之后不应该再有 .part 残留
-            let leftovers = fs::read_dir(store.tmp_dir())
-                .unwrap()
-                .flatten()
-                .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("part"))
-                .count();
-
-            assert_eq!(leftovers, 0);
         }
 
         fs::remove_dir_all(&root).unwrap();
@@ -661,6 +736,7 @@ mod tests {
             "application/octet-stream",
             size,
             sha256,
+            CHUNK_SIZE,
         );
 
         // 声明的 sha256 被篡改
@@ -669,6 +745,7 @@ mod tests {
             outgoing.size,
             &"0".repeat(64),
             outgoing.chunks,
+            CHUNK_SIZE,
         )
         .unwrap();
         let chunk = outgoing.read_chunk(0).unwrap();
@@ -698,6 +775,7 @@ mod tests {
             (CHUNK_SIZE as u64) + 1,
             &"0".repeat(64),
             2,
+            CHUNK_SIZE,
         )
         .unwrap();
 
@@ -721,13 +799,8 @@ mod tests {
 
         store.ensure().unwrap();
 
-        let incoming = IncomingTransfer::create(
-            &store.tmp_dir(),
-            10,
-            &"0".repeat(64),
-            1,
-        )
-        .unwrap();
+        let incoming =
+            IncomingTransfer::create(&store.tmp_dir(), 10, &"0".repeat(64), 1, CHUNK_SIZE).unwrap();
         let part = incoming.part.clone();
 
         assert!(part.exists());

@@ -123,6 +123,13 @@ pub mod message_type {
 /// P2P 信令的版本（R21）。不认识这个版本就不协商——将来改信令形状时靠它挡住。
 pub const SIGNAL_VERSION: u8 = 1;
 
+/// 对端声明「支持第二条 DataChannel（`reliable`）」时 `hello` 里带的能力名（R32）。
+///
+/// **不能用 bump `SIGNAL_VERSION` 代替**：那个版本是硬相等判断（不匹配就完全不协商），
+/// 一提就会把「新客户端 ↔ 旧客户端」之间**连 `pet-state` 的 P2P** 一起关掉。能力字段是
+/// 可选的，缺失就表示老客户端——它只会建 / 认领 `pet-state`。
+pub const FEATURE_RELIABLE_CHANNEL: &str = "reliable-channel";
+
 /// `pair.signal` 的载荷（R21）。
 ///
 /// 走 `FrameKind::Ping`(8)：中继会校验帧 kind，未知值直接 `close 1008`，而 kind 8
@@ -144,6 +151,9 @@ pub enum PairSignalPayload {
         version: u8,
         #[serde(rename = "deviceId")]
         device_id: String,
+        /// 可选能力（R32）：缺失 / 空 = 旧客户端。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     Offer {
         description: String,
@@ -1038,6 +1048,7 @@ mod tests {
         let hello = PairSignalPayload::Hello {
             version: SIGNAL_VERSION,
             device_id: "cat-a".to_string(),
+            features: vec![FEATURE_RELIABLE_CHANNEL.to_string()],
         };
 
         let json = serde_json::to_value(&hello).unwrap();
@@ -1045,9 +1056,34 @@ mod tests {
         assert_eq!(json["kind"], "hello");
         assert_eq!(json["version"].as_u64(), Some(SIGNAL_VERSION.into()));
         assert_eq!(json["deviceId"], "cat-a");
+        assert_eq!(json["features"][0], FEATURE_RELIABLE_CHANNEL);
         assert_eq!(
             serde_json::from_value::<PairSignalPayload>(json).unwrap(),
             hello
+        );
+
+        // R32：老客户端的 hello 没有 `features` 字段，必须照样能解出来（空能力 = 只支持
+        // `pet-state` 通道）；反过来，空能力也不该往线上写一个空数组。
+        let old =
+            serde_json::json!({ "kind": "hello", "version": SIGNAL_VERSION, "deviceId": "cat-b" });
+
+        assert_eq!(
+            serde_json::from_value::<PairSignalPayload>(old).unwrap(),
+            PairSignalPayload::Hello {
+                version: SIGNAL_VERSION,
+                device_id: "cat-b".to_string(),
+                features: Vec::new(),
+            }
+        );
+        assert!(
+            serde_json::to_value(PairSignalPayload::Hello {
+                version: SIGNAL_VERSION,
+                device_id: "cat-b".to_string(),
+                features: Vec::new(),
+            })
+            .unwrap()
+            .get("features")
+            .is_none()
         );
 
         let candidate = PairSignalPayload::Candidate {
