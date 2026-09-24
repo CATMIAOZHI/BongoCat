@@ -324,8 +324,14 @@ pub struct TransferVerifiedPayload {
     pub message: Option<String>,
 }
 
-/// 键盘活动：只有「哪只手 + 强度」，永远不含具体键名（见 docs/pair-plan.md 的 §17 / §18 与 R2 / R3）
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// 键盘活动：哪只手 + 强度 + **当前按着的键名**（R37）。
+///
+/// R2 / R3 那部分（左右手、强度）口径不变；`keys` 是用户明确要求的改动：不再只发
+/// 「哪只手」，也把键名发出去，这样对方的猫能按下一样的键。仍然有边界——只带本机模型
+/// 真的能显示的键、单个名字限长、总数限 8 个，且收发两侧都要过 [`sanitize_keys`]。
+///
+/// 旧客户端发来的载荷没有这个字段（`default`），新客户端发给旧客户端时对方会忽略它。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PetKeyboardState {
     pub active: bool,
@@ -333,6 +339,9 @@ pub struct PetKeyboardState {
     pub right_hand: bool,
     /// 0..1，发送前量化到 0.2
     pub intensity: f32,
+    /// rdev 的原始键名（`KeyA` / `ShiftLeft`），去重 + 排序 + 上限 [`KEY_LIST_MAX`]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
 }
 
 /// 鼠标活动：位置是屏幕比例（0..1），永远不含真实像素坐标
@@ -350,7 +359,7 @@ pub struct PetPointerState {
 }
 
 /// 远端宠物快照（§16）。这是唯一通过网络传输的「活动」结构。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PetSnapshot {
     pub keyboard: PetKeyboardState,
@@ -365,6 +374,7 @@ impl Default for PetSnapshot {
                 left_hand: false,
                 right_hand: false,
                 intensity: 0.0,
+                keys: Vec::new(),
             },
             pointer: PetPointerState {
                 active: false,
@@ -390,6 +400,7 @@ impl PetSnapshot {
                 left_hand: self.keyboard.left_hand,
                 right_hand: self.keyboard.right_hand,
                 intensity: quantize(self.keyboard.intensity, 0.2),
+                keys: sanitize_keys(self.keyboard.keys),
             },
             pointer: PetPointerState {
                 active: self.pointer.active,
@@ -429,6 +440,48 @@ fn quantize(value: f32, step: f32) -> f32 {
     let clamped = value.clamp(0.0, 1.0);
 
     (clamped / step).round() * step
+}
+
+/// 键名列表的上限（R37）。与 `usePairActivity.ts` 的 `KEY_LIST_MAX` 同值：
+/// 前端先筛一遍，这里再兜一遍，两边都不会让载荷无限长。
+pub const KEY_LIST_MAX: usize = 8;
+/// 单个键名的长度上限。rdev 最长的名字（`IntlBackslash`、`Unknown(255)`）都在它之内。
+pub const KEY_NAME_MAX: usize = 24;
+
+/// 这个字符是否允许出现在键名里（R37）。
+///
+/// rdev 的键名是枚举名（`KeyA`、`Num1`、`ShiftLeft`、`Unknown(255)`），所以只需要
+/// 字母 + 数字 + 括号 + 下划线；别的字符一律当成畸形载荷丢掉。
+fn is_key_name_char(value: char) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, '(' | ')' | '_')
+}
+
+/// 键名列表的兜底（R37）：丢掉不像键名的字符串、去重、排序、截断到 [`KEY_LIST_MAX`]。
+///
+/// 排序是为了让「同一组键」序列化出来完全一致：前端 R4 的「没变化就不发」用的是深比较，
+/// 顺序不稳定会让每一帧都被当成变化。前端 `sanitizeKeys` 是同口径的另一半。
+pub fn sanitize_keys(keys: Vec<String>) -> Vec<String> {
+    let mut clean: Vec<String> = Vec::new();
+
+    for key in keys {
+        if key.is_empty() || key.chars().count() > KEY_NAME_MAX {
+            continue;
+        }
+
+        if !key.chars().all(is_key_name_char) {
+            continue;
+        }
+
+        if clean.iter().any(|existing| existing == &key) {
+            continue;
+        }
+
+        clean.push(key);
+    }
+
+    clean.sort();
+    clean.truncate(KEY_LIST_MAX);
+    clean
 }
 
 /// 中继可选广告的 ICE 服务器（R21）。
@@ -904,13 +957,14 @@ mod tests {
     }
 
     #[test]
-    fn pet_snapshot_hides_key_names_and_pixels() {
+    fn pet_snapshot_sends_key_names_but_never_pixels() {
         let snapshot = PetSnapshot {
             keyboard: PetKeyboardState {
                 active: true,
                 left_hand: true,
                 right_hand: false,
                 intensity: 0.6,
+                keys: vec!["KeyA".to_string(), "ShiftLeft".to_string()],
             },
             pointer: PetPointerState {
                 active: true,
@@ -924,10 +978,13 @@ mod tests {
 
         let json = serde_json::to_string(&snapshot).unwrap();
 
-        // 只能出现布尔与 0..1 的比例，没有任何键名或像素坐标
+        // R37：键名是要发出去的（用户明确要求），但仍然没有像素坐标
         assert!(json.contains(r#""leftHand":true"#));
-        assert!(!json.contains("KeyA"));
+        assert!(json.contains(r#"["KeyA","ShiftLeft"]"#));
         assert!(!json.contains("KeyboardPress"));
+        // 真实坐标不会出现：0.34 / 0.66 是比例，1920 / 1080 这种屏幕尺寸不能出现
+        assert!(!json.contains("1920"));
+        assert!(!json.contains("1080"));
 
         for number in [
             snapshot.keyboard.intensity,
@@ -946,6 +1003,13 @@ mod tests {
                 left_hand: true,
                 right_hand: true,
                 intensity: f32::NAN,
+                keys: vec![
+                    "KeyA".to_string(),
+                    "KeyA".to_string(),
+                    "Key B".to_string(),
+                    "a".repeat(KEY_NAME_MAX + 1),
+                    "KeyZ".to_string(),
+                ],
             },
             pointer: PetPointerState {
                 active: true,
@@ -965,6 +1029,23 @@ mod tests {
         // 0.53 量化到 0.05 的整数倍
         assert_eq!(clean.pointer.speed, 0.55);
         assert!(clean.keyboard.active && clean.pointer.left_down);
+        // R37：重复的、带空格的、超长的键名都被丢掉，剩下的排序
+        assert_eq!(clean.keyboard.keys, vec!["KeyA".to_string(), "KeyZ".to_string()]);
+    }
+
+    #[test]
+    fn pet_snapshot_caps_the_key_list() {
+        let mut keys: Vec<String> = (0..20).map(|index| format!("Key{index}")).collect();
+
+        let clean = sanitize_keys(std::mem::take(&mut keys));
+
+        assert_eq!(clean.len(), KEY_LIST_MAX);
+        // 排序之后再截断：留下的是字典序最小的那 8 个（`Key10` 排在 `Key2` 前面）
+        assert_eq!(clean.first().map(String::as_str), Some("Key0"));
+        assert_eq!(clean.last().map(String::as_str), Some("Key15"));
+
+        // 畸形载荷一律丢掉，不 panic、不留下空壳
+        assert!(sanitize_keys(vec!["".to_string(), "  ".to_string(), "键A".to_string()]).is_empty());
     }
 
     #[test]
@@ -973,7 +1054,7 @@ mod tests {
         let envelope = AppEnvelope::new(
             message_type::PET_STATE,
             3,
-            serde_json::to_value(snapshot).unwrap(),
+            serde_json::to_value(&snapshot).unwrap(),
         );
 
         let parsed = AppEnvelope::from_bytes(&envelope.to_bytes().unwrap()).unwrap();

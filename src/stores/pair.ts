@@ -181,7 +181,8 @@ export const usePairStore = defineStore('pair', () => {
     privacy: {
       shareTypingActivity: true,
       sharePointer: true,
-      shareInputStats: false,
+      // R38：默认开启（用户要求）——只发「今天/累计按了多少次」这种数字，不含内容
+      shareInputStats: true,
       pauseActivitySync: false,
     },
     away: {

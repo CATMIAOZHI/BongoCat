@@ -2,11 +2,12 @@
  * 把本机输入事件映射成可以联网的宠物快照（§16 - §20）。
  *
  * 这个文件是**纯函数**：不 import Vue / Tauri / Pinia，也不读任何全局状态，
- * 时间全部由调用方传入。这样才能直接单元测试「不泄露按键内容」与 R2 / R3 的口径，
+ * 时间全部由调用方传入。这样才能直接单元测试「键名与坐标的口径」与 R2 / R3 的规则，
  * 见 docs/pair-plan.md 的 §79 与 R14。
  *
- * 网络层只会看到：哪只手在按、打字强度、鼠标的屏幕比例、按键与速度，
- * 永远看不到具体键名，也永远看不到真实像素坐标。
+ * 网络层会看到：哪只手在按、打字强度、**当前按着的键名**（R37，按用户要求加上，
+ * 只带「本机模型真的会显示」的那些键，见 `keys`），以及鼠标的屏幕比例与速度。
+ * 真实像素坐标永远不会出网；键名会出网，这是 R37 明确改掉的口径。
  */
 
 export interface PetKeyboardState {
@@ -14,6 +15,14 @@ export interface PetKeyboardState {
   leftHand: boolean
   rightHand: boolean
   intensity: number
+  /**
+   * 当前按着的键名（rdev 原始名，如 `KeyA` / `ShiftLeft`），R37。
+   *
+   * 只包含**本机模型能显示**的键（由 `MapperOptions.isSupportedKey` 过滤），去重、
+   * 排序、上限 `KEY_LIST_MAX` 个。对端用**它自己**的模型做归一化，所以同一台机器上
+   * 「我这只猫按的键」和「对方猫按的键」在各自模型里都能认。
+   */
+  keys: string[]
 }
 
 export interface PetPointerState {
@@ -46,6 +55,21 @@ export const INTENSITY_STEP = 0.2
 export const POINTER_STEP = 0.02
 /** 速度量化步长 */
 export const SPEED_STEP = 0.05
+
+/**
+ * 键名列表的上限（R37）。真按不了 8 个键，多出来的一律丢掉：
+ * 既是为了不让载荷无限长，也是为了让「同时按一堆键」这种异常情况有硬边界。
+ */
+export const KEY_LIST_MAX = 8
+/** 单个键名的长度上限：rdev 里最长的名字（`IntlBackslash`、`Unknown(255)`）都在它之内 */
+export const KEY_NAME_MAX = 24
+/**
+ * 键名白名单（R37）：只收字母、数字、括号与下划线。
+ *
+ * rdev 的名字是 `{:?}` 出来的枚举名（`KeyA`、`Num1`、`ShiftLeft`、`Unknown(255)`），
+ * 所以不需要放开别的字符；对端发来的字符串一律先过这一关，过不了就丢。
+ */
+export const KEY_NAME_PATTERN = /^[\w()]{1,24}$/
 
 /**
  * 鼠标在采样窗口内移动「四分之一个屏幕」算满速。
@@ -248,6 +272,7 @@ export function sanitizeSnapshot(snapshot: PetSnapshot): PetSnapshot {
       leftHand: snapshot.keyboard.leftHand,
       rightHand: snapshot.keyboard.rightHand,
       intensity: quantize(snapshot.keyboard.intensity, INTENSITY_STEP),
+      keys: sanitizeKeys(snapshot.keyboard.keys),
     },
     pointer: {
       active: snapshot.pointer.active,
@@ -260,6 +285,29 @@ export function sanitizeSnapshot(snapshot: PetSnapshot): PetSnapshot {
   }
 }
 
+/**
+ * 键名列表的兜底（R37）：过滤掉不合法的名字、去重、排序、截断。
+ *
+ * 收发两侧都跑这一遍。排序是为了让「同样的键集合」序列化出来完全一致——R4 的
+ * 「没变化就不发」靠的是对象深比较，顺序不稳定会让每一帧都被当成变化。
+ */
+export function sanitizeKeys(keys: unknown): string[] {
+  if (!Array.isArray(keys)) return []
+
+  const clean = new Set<string>()
+
+  for (const key of keys) {
+    if (typeof key !== 'string') continue
+    if (!KEY_NAME_PATTERN.test(key)) continue
+
+    clean.add(key)
+
+    if (clean.size >= KEY_LIST_MAX) break
+  }
+
+  return [...clean].sort()
+}
+
 export function defaultSnapshot(): PetSnapshot {
   return {
     keyboard: {
@@ -267,6 +315,7 @@ export function defaultSnapshot(): PetSnapshot {
       leftHand: false,
       rightHand: false,
       intensity: 0,
+      keys: [],
     },
     pointer: {
       active: false,
@@ -306,6 +355,13 @@ export interface MapperOptions {
    * 键本身仍然留在按下集合里，所以 OS 自动重复不会被算成新的按下。
    */
   handHoldLimitMs?: () => number
+  /**
+   * 这个键在本机模型里有没有贴图（R37）。返回 false 的键不会进 `keys`：
+   * 本机都显示不出来的键，发过去也只会让对方白算一次，还多漏一个键名。
+   *
+   * 只影响 `keys`，不影响 `active` / 左右手 / 强度——那三项的口径是 R2 / R3 定死的。
+   */
+  isSupportedKey?: (key: string) => boolean
 }
 
 export function createPairActivityMapper(options: MapperOptions = {}): PairActivityMapper {
@@ -415,7 +471,11 @@ export function createPairActivityMapper(options: MapperOptions = {}): PairActiv
     let leftHand = false
     let rightHand = false
     let held = 0
+    // R37：同时按着、且本机模型能显示的键名。按不住的一律不算「按着」，
+    // 否则收不到释放事件的键会让对方猫一直按着不动
+    const keys = new Set<string>()
     const holdLimit = options.handHoldLimitMs?.() ?? 0
+    const isSupportedKey = options.isSupportedKey
 
     for (const [key, pressedAt] of pressedKeys) {
       if (holdLimit > 0 && now - pressedAt > holdLimit) continue
@@ -424,6 +484,10 @@ export function createPairActivityMapper(options: MapperOptions = {}): PairActiv
 
       if (LEFT_HAND_KEYS.has(key)) leftHand = true
       if (RIGHT_HAND_KEYS.has(key)) rightHand = true
+
+      if (keys.size < KEY_LIST_MAX && (isSupportedKey?.(key) ?? true)) {
+        keys.add(key)
+      }
     }
 
     // §18 / R3：500ms 内去重后的按下数，5 次以上封顶
@@ -436,6 +500,7 @@ export function createPairActivityMapper(options: MapperOptions = {}): PairActiv
         leftHand,
         rightHand,
         intensity,
+        keys: [...keys].sort(),
       },
       pointer: {
         active: pointerActive,

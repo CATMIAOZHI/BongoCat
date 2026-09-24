@@ -3,12 +3,14 @@ import { isEqual } from 'es-toolkit'
 import { onMounted, onUnmounted, watch } from 'vue'
 
 import { useCatStore } from '@/stores/cat'
+import { useModelStore } from '@/stores/model'
 import { usePairStore } from '@/stores/pair'
 import { isWindows } from '@/utils/platform'
 
 import type { PresenceState } from './usePair'
 import type { PetSnapshot } from './usePairActivity'
 
+import { getSupportedKey } from './useModel'
 import { pairConnect, pairDisconnect, pairSendPetState, pairSendPresence, pairSendStats } from './usePair'
 import {
   countStats,
@@ -44,6 +46,7 @@ export interface PointerPoint {
 export function usePairState() {
   const store = usePairStore()
   const catStore = useCatStore()
+  const modelStore = useModelStore()
 
   // peer 是否在线决定了该不该发送，所以这里必须先订阅 Rust 的连接状态
   usePairStatus()
@@ -54,6 +57,10 @@ export function usePairState() {
       if (!isWindows) return 0
 
       return Math.max(catStore.model.autoReleaseDelay, 1) * 1000
+    },
+    // R37：只有本机模型真的有这张贴图的键才发出去（对端还要用它自己的模型再认一遍）
+    isSupportedKey: (key) => {
+      return Boolean(modelStore.supportKeys[getSupportedKey(modelStore.supportKeys, key)])
     },
   })
 
@@ -92,7 +99,7 @@ export function usePairState() {
     return sanitizeSnapshot({
       keyboard: shareTypingActivity
         ? snapshot.keyboard
-        : { active: false, leftHand: false, rightHand: false, intensity: 0 },
+        : { active: false, leftHand: false, rightHand: false, intensity: 0, keys: [] },
       pointer: sharePointer
         ? snapshot.pointer
         : { active: false, x: 0.5, y: 0.5, speed: 0, leftDown: false, rightDown: false },
@@ -287,7 +294,7 @@ export function usePairState() {
       // §52：暂停后不再发送活动，先让对方把猫放下
       void pairSendPetState(
         sanitizeSnapshot({
-          keyboard: { active: false, leftHand: false, rightHand: false, intensity: 0 },
+          keyboard: { active: false, leftHand: false, rightHand: false, intensity: 0, keys: [] },
           pointer: { active: false, x: 0.5, y: 0.5, speed: 0, leftDown: false, rightDown: false },
         }),
       ).catch(() => void 0)

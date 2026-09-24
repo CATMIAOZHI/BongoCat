@@ -13,7 +13,7 @@ import { getCursorMonitor } from '@/utils/monitor'
 import { isMac, isWindows } from '@/utils/platform'
 
 import { INVOKE_KEY, LISTEN_KEY, WINDOW_LABEL } from '../constants'
-import { useModel } from './useModel'
+import { getSupportedKey as resolveSupportedKey, useModel } from './useModel'
 import { usePairState } from './usePairState'
 import { useTauriListen } from './useTauriListen'
 
@@ -51,7 +51,7 @@ export function useDevice() {
   const smoothedCursorPoint = ref<CursorPoint>()
   const scaleFactor = ref(1)
   const { handlePress, handleRelease, handleMouseChange, handleMouseRatio } = useModel()
-  // 本地输入同时喂给联机同步：远程猫只关心「哪只手 + 强度 + 比例」，永远拿不到键名
+  // 本地输入同时喂给联机同步：远程猫要「哪只手 + 强度 + 比例 + 能显示的键名」（R37）
   const pairState = usePairState()
 
   const tickerCallback = (ticker: Ticker) => {
@@ -105,24 +105,7 @@ export function useDevice() {
     invoke(INVOKE_KEY.START_DEVICE_LISTENING)
   }
 
-  const getSupportedKey = (key: string) => {
-    let nextKey = key
-
-    const unsupportedKey = !modelStore.supportKeys[nextKey]
-
-    if (key.startsWith('F') && unsupportedKey) {
-      nextKey = key.replace(/F(\d+)/, 'Fn')
-    }
-
-    for (const item of ['Meta', 'Shift', 'Alt', 'Control']) {
-      if (key.startsWith(item) && unsupportedKey) {
-        const regex = new RegExp(`^(${item}).*`)
-        nextKey = key.replace(regex, '$1')
-      }
-    }
-
-    return nextKey
-  }
+  const getSupportedKey = (key: string) => resolveSupportedKey(modelStore.supportKeys, key)
 
   const onHideOnHover = (() => {
     let timer: ReturnType<typeof setTimeout> | undefined

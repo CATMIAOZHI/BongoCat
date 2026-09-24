@@ -4998,6 +4998,7 @@ mod tests {
                 left_hand: true,
                 right_hand: false,
                 intensity: 2.0,
+                keys: vec!["KeyA".to_string(), "No Such Key".to_string()],
             },
             pointer: PetPointerState {
                 active: true,
@@ -5020,6 +5021,9 @@ mod tests {
 
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0]["keyboard"]["intensity"], 1.0);
+        // R37：畸形键名到不了 UI，只有合法的那个留下
+        assert_eq!(payloads[0]["keyboard"]["keys"][0], "KeyA");
+        assert_eq!(payloads[0]["keyboard"]["keys"].as_array().unwrap().len(), 1);
         assert_eq!(payloads[0]["pointer"]["x"], 1.0);
         assert_eq!(payloads[0]["pointer"]["y"], 0.0);
 

@@ -2,7 +2,7 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { PhysicalSize } from '@tauri-apps/api/dpi'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import { exists } from '@tauri-apps/plugin-fs'
+import { exists, readDir } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
@@ -10,8 +10,9 @@ import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vu
 import type { ModelSize } from '@/composables/useModel'
 import type { ChatMessage } from '@/composables/usePair'
 import type { PetSnapshot } from '@/composables/usePairActivity'
+import type { Model } from '@/stores/model'
 
-import { useModel } from '@/composables/useModel'
+import { getSupportedKey, useModel } from '@/composables/useModel'
 import { defaultSnapshot, sanitizeSnapshot } from '@/composables/usePairActivity'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
 import { usePairStatus } from '@/composables/usePairStatus'
@@ -20,14 +21,16 @@ import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
 import { useModelStore } from '@/stores/model'
 import { usePairStore } from '@/stores/pair'
+import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
+import { clearObject } from '@/utils/shared'
 
 /**
  * 对方猫咪窗口（§21 - §23）。
  *
- * 它只做四件事：渲染远端模型、把网络快照映射到模型参数、显示对方的暂离牌与输入统计、
- * 跟随自己的窗口设置。
+ * 它做五件事：渲染远端模型、把网络快照映射到模型参数（含 R37 的按键贴图）、
+ * 显示对方的暂离牌与输入统计、跟随自己的窗口设置。
  *
  * R11 的约束在这里最要紧：**不能复用会写共享 store 的加载路径**。
  * `useModel().handleLoad()` 会写 `modelStore.currentMotions` / `currentExpressions` /
@@ -59,7 +62,7 @@ const POINTER_EPSILON = 0.001
 const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
 const modelStore = useModelStore()
-const { handleMouseRatio, handleKeyChange, handleMouseChange } = useModel()
+const { handleMouseRatio, handleKeyChange, handleMouseChange, handlePress, handleRelease } = useModel()
 
 usePairStatus()
 
@@ -85,6 +88,14 @@ let appliedX = Number.NaN
 let appliedY = Number.NaN
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 let soundFailed = false
+/**
+ * R37：已经按进本窗口模型的远端键名（归一化之后的）。
+ *
+ * 只在本窗口自己的 `modelStore.pressedKeys` / `supportKeys` 上动手——这两个字段在
+ * `stores/model.ts` 里被排除在跨窗口同步之外（`tauri.filterKeys`），所以不会把本机
+ * 猫咪窗口的按键贴图改坏（R11）。
+ */
+const appliedRemoteKeys = new Set<string>()
 
 /** 默认和本机用同一个模型（§22），也可以在偏好页里单独指定 */
 function remoteModel() {
@@ -140,6 +151,9 @@ async function loadModel() {
     modelSize.value = { width: loaded.width, height: loaded.height }
     // 新模型是默认参数：作废「跳过没变化的帧」的记录，否则参数要等下一次变化才补上
     resetApplied()
+    await loadSupportKeys(model)
+    // 换模型之后贴在旧模型上的键贴图必须立刻摘掉
+    appliedRemoteKeys.clear()
 
     const background = join(model.path, 'resources', 'background.png')
 
@@ -160,6 +174,55 @@ function resetApplied() {
   appliedKey = void 0
   appliedX = Number.NaN
   appliedY = Number.NaN
+}
+
+/**
+ * R37：把**对方模型**的按键贴图扫进本窗口的 `supportKeys`。
+ *
+ * 猫咪窗口那份扫描写在 `pages/main/index.vue` 里，而这里加载的是「对方猫咪」自己选的
+ * 模型（可能与本机不同），所以必须单独扫一次。这两个字段不跨窗口同步，各窗口一份。
+ */
+async function loadSupportKeys(model: Model) {
+  clearObject([modelStore.supportKeys, modelStore.pressedKeys])
+
+  const resourcePath = join(model.path, 'resources')
+
+  for (const groupName of ['left-keys', 'right-keys']) {
+    const groupDir = join(resourcePath, groupName)
+    const files = await readDir(groupDir).catch(() => [])
+
+    for (const file of files) {
+      if (!isImage(file.name)) continue
+
+      modelStore.supportKeys[file.name.split('.')[0]] = join(groupDir, file.name)
+    }
+  }
+}
+
+/**
+ * R37：把对方按着的键名变成贴图。只做差量，不重建。
+ *
+ * 先按**本窗口模型**归一化再比：`F5` 与 `F6` 在模型里都会折叠成 `Fn`，直接按原始
+ * 键名释放会把仍然按着的那个键一起放开。
+ */
+function applyRemoteKeys(names: string[]) {
+  const next = new Set(names.map(name => getSupportedKey(modelStore.supportKeys, name)))
+
+  for (const key of appliedRemoteKeys) {
+    if (next.has(key)) continue
+
+    handleRelease(key)
+  }
+
+  for (const key of next) {
+    if (appliedRemoteKeys.has(key)) continue
+
+    handlePress(key)
+  }
+
+  appliedRemoteKeys.clear()
+
+  for (const key of next) appliedRemoteKeys.add(key)
 }
 
 /** 自适应时间常数：1.5 倍观测间隔，夹在 [TAU_MIN_MS, TAU_MAX_MS] */
@@ -237,6 +300,8 @@ function renderRemoteSnapshot() {
     clicksFresh && snapshot.pointer.leftDown,
     clicksFresh && snapshot.pointer.rightDown,
   )
+  // R37：键名跟着 TYPING_TTL 一起过期——对方把猫放下时，贴图也要放下
+  applyRemoteKeys(handsFresh ? snapshot.keyboard.keys : [])
   applyPointer()
 }
 
@@ -386,6 +451,14 @@ function handleMouseDown() {
       >
 
       <canvas id="live2dCanvas" />
+
+      <!-- R37：对方按着的键贴图，和猫咪窗口同一套渲染方式 -->
+      <img
+        v-for="path in modelStore.pressedKeys"
+        :key="path"
+        class="absolute size-full object-cover"
+        :src="convertFileSrc(path)"
+      >
     </div>
 
     <div

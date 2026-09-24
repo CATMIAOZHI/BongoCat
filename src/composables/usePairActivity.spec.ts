@@ -5,46 +5,15 @@ import type { PetSnapshot } from './usePairActivity'
 import {
   countStats,
   createPairActivityMapper,
+  KEY_LIST_MAX,
   POINTER_IDLE_MS,
   quantize,
   rolloverStats,
+  sanitizeKeys,
   TYPING_WINDOW_MS,
 } from './usePairActivity'
 
-/** 网络层永远不该看到的字符串：键名、按键事件名都不行（§17 / R2 / R11） */
-const FORBIDDEN_IN_PAYLOAD = [
-  'KeyA',
-  'KeyZ',
-  'Digit',
-  'Num1',
-  'ShiftLeft',
-  'ControlRight',
-  'Meta',
-  'Alt',
-  'Backspace',
-  'KeyboardPress',
-  'MousePress',
-]
-
-describe('宠物快照的隐私口径', () => {
-  it('载荷里不出现任何真实键名', () => {
-    const mapper = createPairActivityMapper()
-    const now = 1_000
-
-    mapper.handleKeyboard('KeyA', true, now)
-    mapper.handleKeyboard('ShiftLeft', true, now)
-    mapper.handleKeyboard('Backspace', true, now)
-    mapper.handleKeyboard('Num1', true, now)
-    mapper.handleMouseButton('Left', true)
-    mapper.handlePointerRatio(0.337, 0.812, now)
-
-    const payload = JSON.stringify(mapper.snapshot(now))
-
-    for (const forbidden of FORBIDDEN_IN_PAYLOAD) {
-      expect(payload).not.toContain(forbidden)
-    }
-  })
-
+describe('宠物快照的口径', () => {
   it('载荷里不出现真实像素坐标，只有 0..1 的比例', () => {
     const mapper = createPairActivityMapper()
     const now = 2_000
@@ -80,6 +49,50 @@ describe('宠物快照的隐私口径', () => {
 
     expect(mapper.snapshot(0).pointer.x).toBe(0.5)
     expect(quantize(Number.POSITIVE_INFINITY, 0.2)).toBe(0)
+  })
+})
+
+describe('r37 键名同步', () => {
+  it('按着的键名会进载荷，但只带本机模型能显示的那些', () => {
+    const mapper = createPairActivityMapper({ isSupportedKey: key => key !== 'F5' })
+
+    mapper.handleKeyboard('KeyA', true, 0)
+    mapper.handleKeyboard('F5', true, 0)
+    mapper.handleKeyboard('ShiftLeft', true, 0)
+
+    expect(mapper.snapshot(0).keyboard.keys).toEqual(['KeyA', 'ShiftLeft'])
+
+    mapper.handleKeyboard('KeyA', false, 10)
+
+    expect(mapper.snapshot(10).keyboard.keys).toEqual(['ShiftLeft'])
+  })
+
+  it('键名去重、排序、封顶', () => {
+    const mapper = createPairActivityMapper()
+
+    for (const key of ['KeyD', 'KeyC', 'KeyB', 'KeyA', 'KeyJ', 'KeyI', 'KeyH', 'KeyG', 'KeyF', 'KeyE']) {
+      mapper.handleKeyboard(key, true, 0)
+    }
+
+    const { keys } = mapper.snapshot(0).keyboard
+
+    expect(keys).toHaveLength(KEY_LIST_MAX)
+    expect(keys).toEqual([...keys].sort())
+  })
+
+  it('收不到释放事件的键会被按住上限兜住', () => {
+    const mapper = createPairActivityMapper({ handHoldLimitMs: () => 1_000 })
+
+    mapper.handleKeyboard('KeyA', true, 0)
+
+    expect(mapper.snapshot(500).keyboard.keys).toEqual(['KeyA'])
+    expect(mapper.snapshot(1_500).keyboard.keys).toEqual([])
+  })
+
+  it('对端发来的畸形键名会被清洗掉', () => {
+    expect(sanitizeKeys(['KeyA', 'KeyA', 'Key B', 'a'.repeat(64), '', 42, null])).toEqual(['KeyA'])
+    expect(sanitizeKeys('KeyA')).toEqual([])
+    expect(sanitizeKeys(Array.from({ length: 20 }, (_, index) => `Key${index}`))).toHaveLength(KEY_LIST_MAX)
   })
 })
 
@@ -276,7 +289,7 @@ describe('reset', () => {
 
     const snapshot: PetSnapshot = mapper.snapshot(0)
 
-    expect(snapshot.keyboard).toMatchObject({ active: false, leftHand: false, rightHand: false })
+    expect(snapshot.keyboard).toMatchObject({ active: false, leftHand: false, rightHand: false, keys: [] })
     expect(snapshot.pointer).toMatchObject({ active: false, x: 0.5, y: 0.5, rightDown: false })
   })
 })

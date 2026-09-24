@@ -303,7 +303,7 @@
           "newEpochDeleteOld": "The current records are exported to the file you pick, then a new cycle starts and the local old records are deleted.",
           "newEpochDone": "Started cycle {epoch} ({count} messages exported)",
           "exportCanceled": "No export location chosen, canceled",
-          "shareTypingActivity": "Only the hand side and typing intensity are shared, never the actual keys.",
+          "shareTypingActivity": "Shares the hand side, typing intensity and the actual key names, so your partner's cat presses the same keys. Only keys with artwork in the model are sent.",
           "sharePointer": "Only the pointer's screen ratio and button state are shared, never real coordinates.",
           "shareInputStats": "Off by default. When enabled, your partner sees today's and total input counts — still just numbers.",
           "pauseActivitySync": "Temporarily stop sending typing and mouse activity. Chat and presence stay available.",

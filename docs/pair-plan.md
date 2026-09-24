@@ -16,7 +16,7 @@
 >
 > **R5（§15 心跳）** 心跳间隔 60 秒。任何一次发送失败或 pong 超时都立即触发重连，断线检测不依赖心跳。
 >
-> **R6（§25 / §51 统计分享）** `shareInputStats` 默认关闭，UI 示意图里的开关也画成关闭状态。
+> **R6（§25 / §51 统计分享）** `shareInputStats` 默认关闭，UI 示意图里的开关也画成关闭状态。（**已被 R38 改成默认开启**。）
 >
 > **R7（§24 统计口径）** 计数按物理键名去重：只有 NEW → PRESSED 才 +1，release 移除；这样才能过滤 OS 自动重复（长按）与 Windows 3 秒 auto-release 的影响。数据源是 device 事件流，与 §18 用的是同一份数据（不是 `modelStore.pressedKeys`）。
 >
@@ -32,7 +32,7 @@
 >
 > **R13（§70 / §82 平台范围）** `capabilities/default.json` 已是 `windows: ["*"]`，无需修改。不改 macOS / Linux 代码路径；macOS 上 remote-cat / chat 会走通用窗口分支，属「大概能用但未验证」，本次不承诺。
 >
-> **R14（§79 - §81 测试设施）** 单列一个「引入测试设施」阶段：前端 vitest（隐私回归：`PetSnapshot` 不含真实键名与真实像素坐标）、Rust `cargo test`（protocol / crypto / stats）、relay 用 vitest + `@cloudflare/vitest-pool-workers`。为此 mapper 必须是**纯函数形态**（不 import Vue / Tauri / Pinia），否则无法有意义地测试。
+> **R14（§79 - §81 测试设施）** 单列一个「引入测试设施」阶段：前端 vitest（隐私回归：`PetSnapshot` 不含真实像素坐标；键名口径已由 **R37** 改成「带键名但只带模型能显示的、有上限」，回归改成断言这个边界）、Rust `cargo test`（protocol / crypto / stats）、relay 用 vitest + `@cloudflare/vitest-pool-workers`。为此 mapper 必须是**纯函数形态**（不 import Vue / Tauri / Pinia），否则无法有意义地测试。
 >
 > **R15（§0 / 全文 i18n）** 新增文案只写 `zh-CN` 与 `en-US`；`fallbackLocale` 已是 `en-US`，另外 3 个语言文件会显示英文，这是预期行为而不是缺陷。
 >
@@ -52,6 +52,10 @@
 > **R18（§63 / §64 协议边界与限流）** 客户端 → 服务端**只接受 binary 帧**；text 帧只用于服务端 → 客户端的控制帧（`server.welcome` / `server.peer` / `server.error`），客户端发 text 一律 `close 1008`——否则已配对的一方能伪造 `server.*`、谎报对方上下线，而且这条路径不经过 AEAD。客户端入站路由规则：text = 服务端控制帧，binary = 对端业务帧；未知 text 类型忽略，不要当成对端消息。限流改为**令牌桶**（容量 = 每秒上限、按时间连续补充；固定窗口在边界会双倍突发，而 R4 要求状态变化立即发送）：每 socket 30 帧/秒、20 个 transfer chunk/秒、12 MiB/秒；12 MiB 是为了让 20 个 512 KiB chunk 的突发（合计约 10 MiB）合法。超过即 `close 1008`（限流 / 帧格式），单帧超过 1 MiB 用 `close 1009`，两者 reason 字符串分开便于排障。
 >
 > **R19（§54 文件树）** 该节文件列表按实际实现更新（补 `test/`、`scripts/`、`vitest.config.ts`、`pnpm-workspace.yaml`、`worker-configuration.d.ts`、`.gitignore`）。
+>
+> **R37（§16 - §18 键名出网）** 口径改了：`PetKeyboardState` 新增 `keys`，把**当前按着的键名**发给对方（rdev 原始名，`KeyA` / `ShiftLeft` 这种），对方的猫按下一样的键。这是用户明确要求的改动，**推翻本文件原先「永远不含具体键名」的承诺**——§17 / §78 / §79 与 R14 的隐私回归口径一并以本条为准。边界：只带**本机模型真有贴图**的键（`MapperOptions.isSupportedKey`：先用 `getSupportedKey` 归一化再查 `supportKeys`），去重、排序、封顶 8 个（`KEY_LIST_MAX`），单个名字限 24 字符且只允许字母 / 数字 / 括号 / 下划线，收发两侧各清洗一遍（`sanitizeKeys` / `sanitize_keys`）。`keys` 沿用 `handHoldLimitMs`：Windows 上收不到释放事件的键会自己掉出去，不会让对方猫一直按着。接收侧在**它自己的窗口**里用**它自己的模型**再归一化一次然后按下；`modelStore.supportKeys` / `pressedKeys` 本来就被排除在跨窗口同步之外（`stores/model.ts` 的 `tauri.filterKeys`），所以 R11 那条「不能用 `pressedKeys` 渲染按键图」说的是**不能拿本机那份**，对方猫咪窗口写自己那份正是本条的落地方式。旧客户端没有这个字段（serde `default`）也照样互通。
+>
+> **R38（§25 / §51 统计默认值）** `shareInputStats` 默认**开启**（用户要求），覆盖 R6 的「默认关闭」；§51 示意图里那个 ON 重新算数。发出去的仍然只有「今日 / 累计按下次数」这类数字，不含内容；关掉开关时照旧立刻发一帧 `share=false` 的清零载荷。**已经装过旧版的设备**设置早已落盘，仍是关闭状态——要手动打开，或清一次设置。
 >
 > **平台事实（已核实，2026-09-23）**
 >
@@ -1014,6 +1018,8 @@ interface PetSnapshot {
     leftHand: boolean
     rightHand: boolean
     intensity: number
+    /** R37：当前按着的键名（只带本机模型有贴图的键，去重 / 排序 / 上限 8 个） */
+    keys: string[]
   }
 
   pointer: {
@@ -1031,9 +1037,7 @@ interface PetSnapshot {
 
 # 17. 键盘左右手判断
 
-不要把 key 发到网络。
-
-本地可以利用现有：
+左右手判定用本地现有的：
 
 ```text
 modelStore.supportKeys
@@ -1053,15 +1057,21 @@ left hand
 right hand
 ```
 
-然后丢弃具体 key。
+**R37 改了口径**：key 现在也会发出去（`keys` 字段），所以这里不再「然后丢弃具体 key」——
+发出去的是 rdev 原始键名，只筛出本机模型真有贴图的那几个，去重、排序、封顶 8 个。
+左右手仍然只由 R2 的静态分区表判断，与该字段无关。
 
-最终网络层只能看到：
+网络层能看到的东西变成：
 
 ```text
 leftHand = true
+keys = ["KeyQ", "KeyW"]
 ```
 
-不知道是：
+但**仍然**看不到的是：真实文本、屏幕像素坐标，以及模型里没有贴图的键（例如本机模型
+不支持功能键时，`F5` 会被折叠成 `Fn`，`IntlBackslash` 这种没有贴图的键直接不发）。
+
+老文档里那段「不知道是」：
 
 ```text
 Q
@@ -1071,6 +1081,8 @@ S
 1
 2
 ```
+
+已经作废——现在对方就是知道你按了 `KeyQ`。
 
 ---
 
@@ -1293,6 +1305,8 @@ typing state TTL: 800ms
 mouse click TTL: 500ms
 pet snapshot TTL: 1500ms
 ```
+
+R37 的 `keys` 跟 typing state 同一个 TTL：超过就把对方猫按着的键贴图放掉。
 
 超过 TTL：
 
@@ -2327,7 +2341,7 @@ Secret 保存成功后不要重新把原文显示出来。
 
 # 51. Privacy Settings
 
-> ⚠️ 已被 R6 覆盖：`shareInputStats` 默认关闭，下图开关按「关闭」理解。
+> ⚠️ R6 曾把它改成默认关闭，**R38 又改回默认开启**：下图这个 ON 是对的。
 
 明确显示：
 
@@ -2340,8 +2354,8 @@ Secret 保存成功后不要重新把原文显示出来。
 解释：
 
 ```text
-键盘活动只同步左右手和输入强度，
-不会发送实际按键内容。
+键盘活动同步左右手、输入强度与真实按下的键名，
+对方猫会按下一样的键；只有模型里真有贴图的键才会发出去。
 ```
 
 这个说明必须写进 UI。
@@ -3137,6 +3151,7 @@ Auth Token
 聊天 plaintext
 解密后的文件 chunk
 完整文件路径
+键名列表（R37 的 keys —— 记进日志就等于留了一份按键记录）
 ```
 
 Connection 日志只允许：
@@ -3185,13 +3200,16 @@ different nonce → ciphertext 不同
 测试：
 
 ```text
-真实 key 不出现在 PetSnapshot
+真实 pixel 坐标不出现在 PetSnapshot
+keys 只含合法键名、去重、排序、不超过 8 个（R37）
+非法的键名（带空格 / 超长 / 非字符串）到不了 PetSnapshot
 鼠标真实 pixel 不出现在 PetSnapshot
 typing intensity 限制 0..1
 pointer ratio 限制 0..1
 ```
 
-这是非常重要的隐私回归测试。
+这是非常重要的口径回归测试：R37 之后键名会出网，所以「不出现真实键名」那条断言已经
+换成「键名有界 + 坐标不出网」。
 
 ---
 
@@ -3502,10 +3520,13 @@ B 的 remote-cat 200ms 左右内产生对应反馈
 网络数据中不能出现：
 
 ```text
-真实按键名称
 真实输入文字
 真实屏幕 pixel 坐标
 ```
+
+（原来还有一条「真实按键名称」，**R37 之后已作废**：键名会随 `keys` 字段发出去，
+只保证有界——只带模型有贴图的键、去重排序、上限 8 个。真实输入文字仍然不出网，
+聊天里的文字是用户自己敲进去发的，不是键盘监听。）
 
 ### Stats
 

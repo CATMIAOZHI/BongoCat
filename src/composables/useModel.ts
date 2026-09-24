@@ -21,6 +21,34 @@ export interface ModelSize {
   height: number
 }
 
+/**
+ * 把 rdev 的原始键名映射成「模型目录里真有贴图的名字」（§17）。
+ *
+ * 模型自己支持的键优先原样使用；不支持时退到贴图分组：功能键折叠成 `Fn`，
+ * 左右手修饰键折叠成 `Shift` / `Control` / `Alt` / `Meta`。
+ *
+ * 抽成纯函数是为了让**猫咪窗口与本机键盘**和**对方猫咪窗口回放远端键名**走同一段
+ * 映射（R37）：对方发来的是它机器的原始键名，得用**本窗口的模型**再认一遍。
+ */
+export function getSupportedKey(supportKeys: Record<string, string>, key: string): string {
+  let nextKey = key
+
+  const unsupportedKey = !supportKeys[nextKey]
+
+  if (key.startsWith('F') && unsupportedKey) {
+    nextKey = key.replace(/F(\d+)/, 'Fn')
+  }
+
+  for (const item of ['Meta', 'Shift', 'Alt', 'Control']) {
+    if (key.startsWith(item) && unsupportedKey) {
+      const regex = new RegExp(`^(${item}).*`)
+      nextKey = key.replace(regex, '$1')
+    }
+  }
+
+  return nextKey
+}
+
 export function useModel() {
   const modelStore = useModelStore()
   const catStore = useCatStore()

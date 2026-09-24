@@ -303,7 +303,7 @@
           "newEpochDeleteOld": "会先把当前记录导出到你选择的文件，然后开始新的记录周期，并删除本地旧记录。",
           "newEpochDone": "已开始第 {epoch} 个记录周期（导出 {count} 条）",
           "exportCanceled": "没有选择导出位置，已取消",
-          "shareTypingActivity": "只同步左右手和输入强度，不会发送实际按键内容。",
+          "shareTypingActivity": "同步左右手、输入强度与真实按下的键名，对方猫会按下一样的键；只有模型里真有贴图的键才会发出去。",
           "sharePointer": "只同步鼠标的屏幕比例与左右键状态，不会发送真实坐标。",
           "shareInputStats": "默认关闭。开启后对方能看到你的今日与累计输入次数，内容仍然是纯数字。",
           "pauseActivitySync": "暂时不发送打字与鼠标活动，但聊天与暂离状态仍然可用。",
