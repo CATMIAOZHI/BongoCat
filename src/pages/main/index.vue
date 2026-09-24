@@ -48,10 +48,16 @@ const { pushToTalk } = storeToRefs(shortcutStore)
 const {
   recording,
   seconds: recordingSeconds,
+  pending: recordingPending,
+  pendingSeconds: recordingPendingSeconds,
+  playing: recordingPlaying,
+  sending: recordingSending,
   error: recordingError,
   skipped: recordingSkipped,
   press: pressToTalk,
   release: releaseToTalk,
+  send: sendRecording,
+  play: playRecording,
   cancel: cancelRecording,
 } = usePairVoiceRecorder()
 const resizing = ref(false)
@@ -75,10 +81,35 @@ const modelAreaPercent = computed(() => {
 
 const overlayAreaPercent = computed(() => 100 - modelAreaPercent.value)
 
-/** 录音提示、失败原因与「太短没发出去」共用一块位置 */
+/** 录音提示、待确认的语音、失败原因与「太短没录上」共用一块位置 */
 const showVoiceOverlay = computed(() => {
-  return recording.value || Boolean(recordingError.value) || recordingSkipped.value
+  return recording.value
+    || Boolean(recordingPending.value)
+    || Boolean(recordingError.value)
+    || recordingSkipped.value
 })
+
+/**
+ * R41：待确认的语音能不能发。
+ *
+ * 对方不在线时发送一定会失败，而 Rust 侧失败路径会把临时 wav 删掉——那等于白录一段。
+ * 所以离线时按钮只显示、不生效，免得用户点一下就没了。
+ */
+const canSendRecording = computed(() => {
+  return pairStore.settings.enabled && pairStore.runtime.peerOnline && !recordingSending.value
+})
+
+/** 待确认的语音发不出去（没开联机 / 对方不在线）：胶囊上要**写出原因**，不能只把图标调暗 */
+const recordingOffline = computed(() => {
+  return !pairStore.settings.enabled || !pairStore.runtime.peerOnline
+})
+
+/** R41：离线时点「发送」直接不发起（理由同上，别把录音弄丢） */
+function handleSendRecording() {
+  if (!canSendRecording.value) return
+
+  void sendRecording()
+}
 
 /**
  * §45 的按住说话。
@@ -115,24 +146,39 @@ function targetWindowSize(scale = catStore.window.scale) {
 }
 
 const debouncedResize = useDebounceFn(async () => {
-  resizing.value = false
+  try {
+    if (!modelSize.value) return
 
-  if (!modelSize.value) return
+    /*
+     * R43：窗口尺寸变了，模型必须重新贴合一次。
+     *
+     * R39 把这块改成「自己算尺寸」时漏掉了这一步——`useModel().handleResize()` 里那句
+     * `live2d.resizeModel()` 是 pixi 的 `resizeTo: window` 之外唯一按新窗口重算缩放与
+     * 居中的地方（pixi 只改画布尺寸，不会动模型），少了它之后拖窗口猫就不再重绘：
+     * 猫停在旧缩放上、背景与按键贴图相对猫错位。
+     */
+    live2d.resizeModel(modelSize.value)
 
-  // 窗口被拉大/拉小时改的是「缩放」，比例始终由模型 (+浮层) 决定
-  const nextScale = Math.max(10, Math.min(500, round((innerWidth / modelSize.value.width) * 100)))
+    // 窗口被拉大/拉小时改的是「缩放」，比例始终由模型 (+浮层) 决定。
+    // 反推缩放要用**物理宽度**：`targetWindowSize()` 也是按物理像素设的，用 CSS 像素
+    // （`innerWidth`）在非 100% 系统缩放下会每次都算小一档，窗口会一跳一跳地越缩越小。
+    const size = await appWindow.size()
+    const nextScale = Math.max(10, Math.min(500, round((size.width / modelSize.value.width) * 100)))
 
-  if (nextScale !== catStore.window.scale) {
-    catStore.window.scale = nextScale
+    if (nextScale !== catStore.window.scale) {
+      catStore.window.scale = nextScale
 
-    return
+      return
+    }
+
+    const target = targetWindowSize()
+
+    if (target && (size.width !== target.width || size.height !== target.height)) {
+      await appWindow.setSize(new PhysicalSize(target))
+    }
+  } finally {
+    resizing.value = false
   }
-
-  const target = targetWindowSize()
-
-  if (!target || (innerWidth === target.width && innerHeight === target.height)) return
-
-  await appWindow.setSize(new PhysicalSize(target))
 }, 100)
 
 useEventListener('resize', () => {
@@ -302,6 +348,7 @@ function handleMouseMove(event: MouseEvent) {
       :style="{ height: `${overlayAreaPercent}%` }"
     >
       <ChatOverlay
+        :pending="Boolean(recordingPending)"
         :recording="recording"
         :recording-seconds="recordingSeconds"
         @voice-start="pressToTalk"
@@ -340,15 +387,57 @@ function handleMouseMove(event: MouseEvent) {
         />
       </div>
 
+      <!--
+        R41：录完先不发送，先给一次试听与确认（试听 / 发送 / 取消）。
+        重录时要等麦克风真的开（最多 5 秒）才丢掉上一份草稿，所以这段时间 `pending` 还在，
+        而 `recording` 已经亮了——两个胶囊会同时挂在窗口上。用 `!recording` 让「正在录」优先，
+        免得出现「上面写着录音中、下面还挂着待确认」这种自相矛盾的画面。
+      -->
       <div
-        v-else-if="recordingError"
+        v-if="recordingPending && !recording"
+        class="pointer-events-auto flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+        @mousedown.stop
+      >
+        <span
+          class="size-[1.2em] cursor-pointer"
+          :class="recordingPlaying ? 'i-lucide:pause' : 'i-lucide:play'"
+          :title="$t('pages.main.hints.playRecording')"
+          @click="playRecording"
+        />
+
+        <span>
+          {{ recordingOffline
+            ? $t('pages.main.hints.sendRecordingOffline')
+            : $t('pages.main.hints.recordingReady', { seconds: recordingPendingSeconds }) }}
+        </span>
+
+        <span
+          class="i-lucide:send size-[1.2em]"
+          :class="canSendRecording
+            ? 'cursor-pointer hover:text-[#4096ff]'
+            : 'color-white/35'"
+          :title="recordingOffline
+            ? $t('pages.main.hints.sendRecordingOffline')
+            : $t('pages.main.hints.sendRecording')"
+          @click="handleSendRecording"
+        />
+
+        <span
+          class="i-lucide:circle-x size-[1.2em] cursor-pointer hover:text-[#ff7875]"
+          :title="$t('pages.main.hints.cancelRecording')"
+          @click="cancelRecording"
+        />
+      </div>
+
+      <div
+        v-if="recordingError"
         class="bg-[#d4380d]/85 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
       >
         {{ recordingError }}
       </div>
 
       <div
-        v-else-if="recordingSkipped"
+        v-if="recordingSkipped"
         class="bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
       >
         {{ $t('pages.main.hints.recordingTooShort') }}

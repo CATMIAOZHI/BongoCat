@@ -143,11 +143,14 @@ pub async fn connect(
     server_token: Option<&str>,
     device_id: &str,
 ) -> Result<PairSocket, PairFailure> {
+    // R40：403 的两种情形（没填 / 填了被拒）下一步完全不同，文案要分开，所以这里先记住
+    // 这次到底带没带服务器密码
+    let sent_server_password = server_token.is_some_and(|token| !token.trim().is_empty());
     let request = build_request(relay_url, room_id, auth_token, server_token, device_id)?;
 
     let (socket, _response) = connect_async(request)
         .await
-        .map_err(describe_connect_error)?;
+        .map_err(|error| describe_connect_error(error, sent_server_password))?;
 
     Ok(socket)
 }
@@ -222,7 +225,7 @@ pub async fn next_message(socket: &mut PairSocket) -> Option<Result<Message, WsE
     socket.next().await
 }
 
-fn describe_connect_error(error: WsError) -> PairFailure {
+fn describe_connect_error(error: WsError, sent_server_password: bool) -> PairFailure {
     match error {
         WsError::Http(response) => {
             let status = response.status();
@@ -233,11 +236,17 @@ fn describe_connect_error(error: WsError) -> PairFailure {
                 // 找对方核对，403 要用户去找部署服务器的那个人要密码，两者下一步完全不同。
                 // 也必须是 fatal —— 密码不对时重连一万次都会被同一个 403 挡回来。
                 //
-                // 403 并不只从中继来：前置的 WAF 或企业代理也会拿 403 拦下 `/ws`。这时
-                // 用户手上的密码其实是对的，所以文案留了后半句，别让人一直重填密码。
+                // R40：一句「不正确或还没填」把两件事糊在一起了，用户没法判断下一步该做什么
+                // ——**没填**是去要密码，**填了还被拒**才需要怀疑服务器前面的 WAF / 代理
+                // （它也会拿 403 拦下 `/ws`，这时手上的密码其实是对的）。
+                403 if sent_server_password => PairFailure::fatal(
+                    "服务器密码不对：这台设备保存的值和服务器上的不一致。\
+                     请向部署这台服务器的人核对（若密码没错，多半是服务器前面的代理拦了连接）"
+                        .to_string(),
+                ),
                 403 => PairFailure::fatal(
-                    "服务器密码不正确或还没填：请向部署这台服务器的人索取（若密码没错，\
-                     多半是服务器前面的代理拦了连接）"
+                    "这台服务器要求填「服务器密码」，但这次没有填：\
+                     请向部署这台服务器的人索取，填进「服务器密码」并点「保存」"
                         .to_string(),
                 ),
                 426 => PairFailure::fatal("两边版本不一致：请把它们都升级到最新版".to_string()),
@@ -383,7 +392,7 @@ mod tests {
             WsError::Http(Box::new(response))
         };
 
-        let unauthorized = describe_connect_error(http(401));
+        let unauthorized = describe_connect_error(http(401), false);
 
         assert_eq!(
             unauthorized.message,
@@ -393,30 +402,43 @@ mod tests {
 
         // R36：服务器密码是**另一件事**——401 要去找对方核对，403 要去找部署服务器的人，
         // 而且它是 fatal（重连一万次都会被同一个 403 挡回来）
-        let forbidden = describe_connect_error(http(403));
+        //
+        // R40：403 再按「这次带没带服务器密码」分两种文案，用户才知道下一步是「去要密码」
+        // 还是「去核对密码 / 查代理」
+        let forbidden = describe_connect_error(http(403), true);
 
         assert_eq!(
             forbidden.message,
-            "服务器密码不正确或还没填：请向部署这台服务器的人索取（若密码没错，多半是服务器前面的代理拦了连接）"
+            "服务器密码不对：这台设备保存的值和服务器上的不一致。\
+             请向部署这台服务器的人核对（若密码没错，多半是服务器前面的代理拦了连接）"
         );
         assert!(forbidden.fatal, "服务器密码不会因为重试而变对");
 
-        let full = describe_connect_error(http(503));
+        let missing = describe_connect_error(http(403), false);
+
+        assert_eq!(
+            missing.message,
+            "这台服务器要求填「服务器密码」，但这次没有填：\
+             请向部署这台服务器的人索取，填进「服务器密码」并点「保存」"
+        );
+        assert!(missing.fatal);
+
+        let full = describe_connect_error(http(503), false);
 
         assert_eq!(full.message, "服务器双人联机会话已满，请稍后再试");
         assert!(!full.fatal, "名额会被释放，应当按退避自动重试");
 
         // 其余状态码也不能把裸 HTTP 码直接甩给用户
         assert_eq!(
-            describe_connect_error(http(426)).message,
+            describe_connect_error(http(426), true).message,
             "两边版本不一致：请把它们都升级到最新版"
         );
         assert_eq!(
-            describe_connect_error(http(404)).message,
+            describe_connect_error(http(404), true).message,
             "服务器地址路径不对：应该指向 /ws"
         );
         // §1：400 不能把 deviceId / Room 这类内部词直接甩给用户
-        let bad_request = describe_connect_error(http(400));
+        let bad_request = describe_connect_error(http(400), true);
 
         assert_eq!(
             bad_request.message,
@@ -424,12 +446,12 @@ mod tests {
         );
         assert!(bad_request.fatal);
         // 没见过的状态码才回落成 HTTP 码，并且按可重试处理
-        let unknown = describe_connect_error(http(500));
+        let unknown = describe_connect_error(http(500), true);
 
         assert_eq!(unknown.message, "服务器返回 HTTP 500，稍后自动重试");
         assert!(!unknown.fatal);
         // 连接层错误（断网、超时）是可重试的
-        assert!(!describe_connect_error(WsError::ConnectionClosed).fatal);
+        assert!(!describe_connect_error(WsError::ConnectionClosed, false).fatal);
     }
 
     /// §31：请求一定带上 `X-Bongo-Room`，而且四个头都不能少

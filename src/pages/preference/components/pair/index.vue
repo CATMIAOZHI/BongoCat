@@ -40,6 +40,37 @@ const modelStore = useModelStore()
 const { t } = useI18n()
 const secretInput = ref('')
 const serverPasswordInput = ref('')
+
+/**
+ * 服务器地址在输入框里是**草稿**（R40）。
+ *
+ * 以前直接用 `v-model` 绑在设置上：每敲一个字就写一次设置并落盘——粘贴长地址或用输入法
+ * 时会丢字符、光标乱跳。现在和两个密码一样：先编辑，点「保存」才生效。
+ */
+const relayUrlInput = ref(pairStore.settings.relay.url)
+const savingRelayUrl = ref(false)
+
+/** 只有首尾空白和结尾的 `/` 会被 Rust 当成同一个地址，比较口径跟着它走 */
+function normalizeRelayUrl(value?: string) {
+  return (value ?? '').trim().replace(/\/+$/, '')
+}
+
+/** 草稿和已保存的不一样：保存按钮才可点，并且提示「还没生效」 */
+const relayUrlDirty = computed(
+  () => normalizeRelayUrl(relayUrlInput.value) !== normalizeRelayUrl(pairStore.settings.relay.url),
+)
+
+/** 地址被清空了：这时保存按不动，也不该让它连出「框里是空的、用的却是旧地址」 */
+const relayUrlEmpty = computed(() => relayUrlInput.value.trim() === '')
+
+/**
+ * 设置里的地址变了就回填输入框（落盘值到得比组件晚——`@tauri-store/pinia` 是异步载入的），
+ * 但用户正在编辑草稿时不打断他：草稿还等于上一个值，才算「没动过」。
+ */
+watch(() => pairStore.settings.relay.url, (value, previous) => {
+  if (relayUrlInput.value === previous) relayUrlInput.value = value
+})
+
 const saving = ref(false)
 const savingServerPassword = ref(false)
 const connecting = ref(false)
@@ -50,15 +81,29 @@ const generating = ref(false)
  *
  * Rust 侧只在连接时按当次地址算 `plaintext`，改地址不会把它清掉——直接绑上去会变成
  * 「填了域名、却还挂着一条说 IP 是明文的提醒」。
+ *
+ * 比对的是**输入框里的地址**（也就是点「立即连接」真正会用的那个），草稿为空才退回已保存值：
+ * R40 把地址改成草稿之后，只跟已保存值比会让「粘上一个 http:// 地址」要等到保存才提醒。
  */
 const plaintextServerWarning = computed(() => {
   if (!pairStore.runtime.plaintext) return false
 
-  // 只有首尾空白和结尾的 `/` 会被 Rust 当成同一个地址，比较口径跟着它走
-  const normalize = (value?: string) => (value ?? '').trim().replace(/\/+$/, '')
-  const inUse = normalize(pairStore.runtime.relayUrl)
+  const inUse = normalizeRelayUrl(pairStore.runtime.relayUrl)
+  const shown = normalizeRelayUrl(relayUrlInput.value) || normalizeRelayUrl(pairStore.settings.relay.url)
 
-  return inUse !== '' && inUse === normalize(pairStore.settings.relay.url)
+  return inUse !== '' && inUse === shown
+})
+
+/**
+ * R40：错误详情里那一行地址。
+ *
+ * 优先用**这次连接真正用的**地址（`runtime.relayUrl` 由 Rust 在连接时回填），没有再退回
+ * 设置里保存的那个——两个都没有时说明这台设备还没连过，如实说「没有」比空着好。
+ */
+const lastErrorAddress = computed(() => {
+  return normalizeRelayUrl(pairStore.runtime.relayUrl)
+    || normalizeRelayUrl(pairStore.settings.relay.url)
+    || t('pages.preference.pair.hints.lastErrorNoAddress')
 })
 const exportFormat = ref<ExportFormat>('json')
 const exporting = ref(false)
@@ -298,6 +343,34 @@ async function reconnectAfterCredentialChange() {
   await pairConnect(url)
 }
 
+/**
+ * 保存服务器地址（R40）。
+ *
+ * 与两个密码一样：保存才写进设置并落盘，保存成功后按新地址重连一次——换了地址就是换了
+ * 一台服务器，旧连接必然失效。
+ */
+async function handleSaveRelayUrl() {
+  const url = normalizeRelayUrl(relayUrlInput.value)
+
+  // 连按回车会重入：按钮有 loading 挡着，键盘没有，两次「断开 → 重连」会交错
+  if (!url || savingRelayUrl.value) return
+
+  savingRelayUrl.value = true
+
+  try {
+    relayUrlInput.value = url
+    pairStore.settings.relay.url = url
+
+    message.success(t('pages.preference.pair.hints.relayUrlSaved'))
+
+    await reconnectAfterCredentialChange()
+  } catch (reason) {
+    message.error(String(reason))
+  } finally {
+    savingRelayUrl.value = false
+  }
+}
+
 async function handleSaveSecret() {
   const secret = secretInput.value.trim()
 
@@ -412,6 +485,31 @@ async function handleSaveServerPassword() {
   }
 }
 
+/** 复制服务器密码：保存后输入框会清空，所以要发出去就先点这里 */
+async function handleCopyServerPassword() {
+  try {
+    await writeText(serverPasswordInput.value.trim())
+
+    message.success(t('pages.preference.pair.hints.serverPasswordCopied'))
+  } catch (reason) {
+    message.error(String(reason))
+  }
+}
+
+/** 复制服务器地址：它本来就是要发给对方（或从对方那儿拿）的那一串，省得手抄 */
+async function handleCopyRelayUrl() {
+  try {
+    // 复制的是「框里显示的那一串」——框空着时退回已保存值，免得复制出一个空字符串
+    const value = normalizeRelayUrl(relayUrlInput.value) || normalizeRelayUrl(pairStore.settings.relay.url)
+
+    await writeText(value)
+
+    message.success(t('pages.preference.pair.hints.relayUrlCopied'))
+  } catch (reason) {
+    message.error(String(reason))
+  }
+}
+
 /**
  * 删除服务器密码：和配对密码一样只写不读，删掉就得再去找部署服务器的人要一次。
  */
@@ -462,11 +560,23 @@ async function handleConnect() {
   try {
     pairStore.runtime.lastError = void 0
 
+    const relayUrl = normalizeRelayUrl(relayUrlInput.value)
     const secret = secretInput.value.trim()
     const serverPassword = serverPasswordInput.value.trim()
     const hadSecret = pairStore.hasSecret
     let replacedSecret = false
     let remembered = false
+
+    // 地址也是「输入框里填了就先落盘」：粘贴完直接点「立即连接」也能生效，
+    // 不会出现界面上写着新地址、实际连的是旧地址这种自相矛盾的状态
+    if (relayUrl) {
+      relayUrlInput.value = relayUrl
+      pairStore.settings.relay.url = relayUrl
+    } else {
+      // 框里是空的：连的还是已保存的那个地址，那就把它显示回框里，
+      // 别让「空框 + 实际用了旧地址」同时成立（那也是这一版要消灭的错觉）
+      relayUrlInput.value = pairStore.settings.relay.url
+    }
 
     // 连接用的值**就是**记住的值：输入框里填了就先落盘（粘贴完不必先点「保存」）。
     //
@@ -508,7 +618,7 @@ async function handleConnect() {
     }
 
     // 值已经在凭据库里了，这里只交地址：Rust 会用刚存下的那两个
-    await pairConnect(pairStore.settings.relay.url)
+    await pairConnect(relayUrl || pairStore.settings.relay.url)
   } catch (reason) {
     message.error(String(reason))
   } finally {
@@ -557,10 +667,52 @@ const canPreviewSound = computed(
       :title="$t('pages.preference.pair.labels.relayUrl')"
       vertical
     >
-      <Input
-        v-model:value="pairStore.settings.relay.url"
+      <Flex
+        align="center"
         class="w-full"
-        :placeholder="$t('pages.preference.pair.placeholders.relayUrl')"
+        gap="small"
+        wrap
+      >
+        <Input
+          v-model:value="relayUrlInput"
+          class="w-56"
+          :placeholder="$t('pages.preference.pair.placeholders.relayUrl')"
+          @press-enter="handleSaveRelayUrl"
+        />
+
+        <Button
+          :disabled="!relayUrlInput.trim() || !relayUrlDirty"
+          :loading="savingRelayUrl"
+          type="primary"
+          @click="handleSaveRelayUrl"
+        >
+          {{ $t('pages.preference.pair.buttons.save') }}
+        </Button>
+
+        <Button
+          :disabled="!relayUrlInput.trim() && !pairStore.settings.relay.url"
+          @click="handleCopyRelayUrl"
+        >
+          {{ $t('pages.preference.pair.buttons.copy') }}
+        </Button>
+      </Flex>
+
+      <!-- 清空了：保存按不动，得说清楚「留空不等于清掉地址」 -->
+      <Alert
+        v-if="relayUrlEmpty"
+        class="mt-2 w-full"
+        :message="$t('pages.preference.pair.hints.relayUrlEmpty')"
+        show-icon
+        type="warning"
+      />
+
+      <!-- 草稿还没保存：地址还不是正在用的那个，得说清楚，不然用户以为已经生效 -->
+      <Alert
+        v-else-if="relayUrlDirty"
+        class="mt-2 w-full"
+        :message="$t('pages.preference.pair.hints.relayUrlUnsaved')"
+        show-icon
+        type="info"
       />
 
       <!-- §23：地址是明文时只提醒一句，绝不阻止连接 -->
@@ -584,12 +736,19 @@ const canPreviewSound = computed(
         gap="small"
         wrap
       >
-        <Input.Password
+        <Input
           v-model:value="serverPasswordInput"
           class="w-56"
           :placeholder="$t('pages.preference.pair.placeholders.serverPassword')"
           @press-enter="handleSaveServerPassword"
         />
+
+        <Button
+          :disabled="!serverPasswordInput.trim()"
+          @click="handleCopyServerPassword"
+        >
+          {{ $t('pages.preference.pair.buttons.copy') }}
+        </Button>
 
         <Button
           :disabled="!serverPasswordInput.trim()"
@@ -629,7 +788,7 @@ const canPreviewSound = computed(
         gap="small"
         wrap
       >
-        <Input.Password
+        <Input
           v-model:value="secretInput"
           class="w-56"
           :placeholder="$t('pages.preference.pair.placeholders.pairSecret')"
@@ -740,7 +899,39 @@ const canPreviewSound = computed(
       :title="$t('pages.preference.pair.labels.lastError')"
       vertical
     >
-      <span class="break-all text-3 color-red-5">{{ pairStore.runtime.lastError }}</span>
+      <span class="w-full break-all text-3 color-red-5">
+        {{ pairStore.runtime.lastError }}
+      </span>
+
+      <!--
+        R40：只给一句结论太笼统——把「这次连的是哪个地址」和「两个密码各填了没有」
+        一起摆出来，用户自己就能判断下一步是去要密码、还是去查服务器前面的代理。
+      -->
+      <Flex
+        class="mt-2 w-full"
+        gap="small"
+        vertical
+      >
+        <span class="text-3 color-text-tertiary">
+          {{ $t('pages.preference.pair.labels.lastErrorAddress') }}：{{ lastErrorAddress }}
+        </span>
+
+        <span class="text-3 color-text-tertiary">
+          {{ $t('pages.preference.pair.labels.serverPassword') }}：{{
+            pairStore.hasServerPassword
+              ? $t('pages.preference.pair.hints.secretConfigured')
+              : $t('pages.preference.pair.hints.secretMissing')
+          }}
+        </span>
+
+        <span class="text-3 color-text-tertiary">
+          {{ $t('pages.preference.pair.labels.pairSecret') }}：{{
+            pairStore.hasSecret
+              ? $t('pages.preference.pair.hints.secretConfigured')
+              : $t('pages.preference.pair.hints.secretMissing')
+          }}
+        </span>
+      </Flex>
     </ProListItem>
   </ProList>
 
@@ -1014,11 +1205,13 @@ const canPreviewSound = computed(
     <ProListItem
       :description="$t('pages.preference.pair.hints.stats')"
       :title="$t('pages.preference.pair.labels.myInput')"
+      vertical
     >
       <Flex
         align="center"
         class="w-full"
-        justify="space-between"
+        gap="large"
+        wrap
       >
         <span>
           {{ $t('pages.preference.pair.labels.todayInput', {
@@ -1027,7 +1220,7 @@ const canPreviewSound = computed(
           }) }}
         </span>
 
-        <span>
+        <span class="color-text-tertiary">
           {{ $t('pages.preference.pair.labels.totalInput', {
             keyboard: pairStore.stats.totalKeyboard,
             mouse: pairStore.stats.totalMouse,

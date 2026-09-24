@@ -64,6 +64,7 @@ pub fn run() {
             core::pair::pair_attachment_retry,
             core::pair::pair_start_recording,
             core::pair::pair_stop_recording,
+            core::pair::pair_send_recording,
             core::pair::pair_cancel_recording
         ])
         .plugin(tauri_plugin_admin_status::init())

@@ -24,6 +24,8 @@ const props = defineProps<{
   /** 是否正在录音。录音实体在父窗口那一份会话里，这里只负责显示与开合 */
   recording: boolean
   recordingSeconds: number
+  /** R41：有一段录好、还没确认发送的语音（确认按钮在猫咪窗口下方那条提示上） */
+  pending: boolean
 }>()
 
 const emit = defineEmits<{
@@ -65,11 +67,14 @@ const canSend = computed(() => {
   return online.value && !sending.value && !tooLong.value && draft.value.trim().length > 0
 })
 
-/** 输入框里的提示行：录音中 > 没连线 > 发送失败 */
+/** 输入框里的提示行：录音中 > 待发送的录音 > 没连线 > 发送失败 */
 const hint = computed(() => {
   if (props.recording) {
     return t('pages.main.hints.recording', { seconds: props.recordingSeconds, limit: RECORDING_LIMIT_SECS })
   }
+
+  // R41：录完先不发送，提示去下面那条「试听 / 发送 / 取消」上确认
+  if (props.pending) return t('pages.chat.hints.voiceReady')
 
   if (!pairStore.settings.enabled) return t('pages.chat.hints.disabled')
   if (!pairStore.runtime.peerOnline) return t('pages.chat.hints.offline')
@@ -121,7 +126,12 @@ function handleKeydown(event: KeyboardEvent) {
   void handleSend()
 }
 
-/** 麦克风：点一下开始，再点一下发送；录音期间把焦点交还出去，免得打字又被当成按键 */
+/**
+ * 麦克风：点一下开始，再点一下结束（R41 起结束只是**录好待确认**，不再直接发送）。
+ *
+ * 已经有一条待确认的录音时再点麦克风，就是重录一条：Rust 侧会把上一条的临时文件删掉。
+ * 录音期间把焦点交还出去，免得打字又被当成按键。
+ */
 function handleVoice() {
   inputRef.value?.blur()
 
@@ -171,7 +181,9 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
         :class="props.recording
           ? 'i-lucide:mic animate-pulse color-[#ff7875]'
           : 'i-lucide:mic color-white/70 hover:color-white'"
-        :title="$t('pages.main.hints.voice')"
+        :title="props.pending && !props.recording
+          ? $t('pages.main.hints.reRecord')
+          : $t('pages.main.hints.voice')"
         @click="handleVoice"
       />
 

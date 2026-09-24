@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ChatMessage } from './usePair'
+import type { ChatMessage, VoiceDraft } from './usePair'
 
 import { createVoiceSession } from './usePairVoice'
 
@@ -15,6 +15,11 @@ function message(): ChatMessage {
     attachmentId: 'attachment-1',
     conversationEpoch: 1,
   }
+}
+
+/** R41：录完待确认的那一条（Rust 侧 `VoiceDraft`） */
+function draft(): VoiceDraft {
+  return { path: 'C:/tmp/voice-1.wav', durationMs: 1_500 }
 }
 
 function delay(ms = 0) {
@@ -46,8 +51,9 @@ describe('按住说话的命令顺序', () => {
         stop: async () => {
           log.calls.push('stop')
 
-          return message()
+          return draft()
         },
+        send: async () => message(),
         cancel: async () => {
           log.calls.push('cancel')
         },
@@ -78,6 +84,7 @@ describe('按住说话的命令顺序', () => {
 
           return null
         },
+        send: async () => message(),
         cancel: async () => {
           log.calls.push('cancel')
         },
@@ -104,6 +111,7 @@ describe('轻点与失败不是同一件事', () => {
       {
         start: async () => void 0,
         stop: async () => null,
+        send: async () => message(),
         cancel: async () => void 0,
       },
       { onError: reason => log.errors.push(reason), onSkipped: log.onSkipped },
@@ -123,6 +131,7 @@ describe('轻点与失败不是同一件事', () => {
       {
         start: () => fail('找不到可用的麦克风'),
         stop: async () => null,
+        send: async () => message(),
         cancel: async () => void 0,
       },
       { onError: reason => log.errors.push(reason), onSkipped: log.onSkipped },
@@ -136,12 +145,13 @@ describe('轻点与失败不是同一件事', () => {
     expect(log.skipped()).toBe(0)
   })
 
-  it('发送失败（stop 抛错）照样报给用户', async () => {
+  it('结束录音时出错照样报给用户', async () => {
     const log = recorder()
     const session = createVoiceSession(
       {
         start: async () => void 0,
         stop: () => fail('未连接'),
+        send: async () => message(),
         cancel: async () => void 0,
       },
       { onError: reason => log.errors.push(reason), onSkipped: log.onSkipped },
@@ -153,5 +163,103 @@ describe('轻点与失败不是同一件事', () => {
 
     expect(log.errors).toEqual(['未连接'])
     expect(log.skipped()).toBe(0)
+  })
+})
+
+describe('按下要回报「麦克风开没开」（R41 / R44）', () => {
+  function sessionWith(start: () => Promise<unknown>) {
+    const log = recorder()
+
+    return {
+      log,
+      session: createVoiceSession(
+        {
+          start,
+          stop: async () => null,
+          send: async () => message(),
+          cancel: async () => void 0,
+        },
+        { onError: reason => log.errors.push(reason), onSkipped: log.onSkipped },
+      ),
+    }
+  }
+
+  it('麦克风开了返回 true：调用方据此才敢丢掉上一段待确认的录音', async () => {
+    const { log, session } = sessionWith(async () => void 0)
+
+    await expect(session.press()).resolves.toBe(true)
+    expect(log.errors).toEqual([])
+  })
+
+  it('麦克风打不开返回 false：上一段待确认的录音必须原样留着', async () => {
+    const { log, session } = sessionWith(() => fail('找不到可用的麦克风'))
+
+    await expect(session.press()).resolves.toBe(false)
+    expect(log.errors).toEqual(['找不到可用的麦克风'])
+  })
+})
+
+describe('录完先确认再发送（R41）', () => {
+  function setup(sent: () => Promise<ChatMessage>) {
+    const log = recorder()
+    const session = createVoiceSession(
+      {
+        start: async () => {
+          log.calls.push('start')
+        },
+        stop: async () => {
+          log.calls.push('stop')
+
+          return draft()
+        },
+        send: async () => {
+          log.calls.push('send')
+
+          return sent()
+        },
+        cancel: async () => {
+          log.calls.push('cancel')
+        },
+      },
+      { onError: reason => log.errors.push(reason), onSkipped: log.onSkipped },
+    )
+
+    return { log, session }
+  }
+
+  it('松开只把录音录好交回来，不发送', async () => {
+    const { log, session } = setup(async () => message())
+
+    await session.press()
+
+    const ready = await session.release()
+
+    expect(log.calls).toEqual(['start', 'stop'])
+    expect(ready).toEqual(draft())
+    expect(log.skipped()).toBe(0)
+  })
+
+  it('点「发送」才真的发出去，而且一定排在松开之后', async () => {
+    const { log, session } = setup(async () => message())
+
+    void session.press()
+    void session.release()
+
+    const sent = await session.send()
+
+    expect(log.calls).toEqual(['start', 'stop', 'send'])
+    expect(sent?.kind).toBe('voice')
+  })
+
+  it('发送失败只报错，不假装成功', async () => {
+    const { log, session } = setup(() => fail('对方离线'))
+
+    await session.press()
+    await session.release()
+
+    const sent = await session.send()
+
+    expect(sent).toBeNull()
+    expect(log.errors).toEqual(['对方离线'])
   })
 })

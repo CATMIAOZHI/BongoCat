@@ -33,6 +33,7 @@ import {
   transferLabelKey,
   usePairTransfer,
 } from '@/composables/usePairTransfer'
+import { usePairVoicePlayback } from '@/composables/usePairVoicePlayback'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
@@ -60,6 +61,14 @@ const pairStore = usePairStore()
 const { t } = useI18n()
 const { messages, loading, loadLatest, loadOlder, send, apply } = usePairChat()
 const { transferOf, apply: applyTransfer, reset: resetTransfers } = usePairTransfer()
+const {
+  isFailed: voiceFailed,
+  isPlaying: voicePlaying,
+  labelOf: voiceLabel,
+  percentOf: voicePercent,
+  stop: stopVoice,
+  toggle: toggleVoice,
+} = usePairVoicePlayback()
 const listRef = useTemplateRef<HTMLElement>('list')
 const inputRef = useTemplateRef<HTMLTextAreaElement>('input')
 
@@ -100,6 +109,11 @@ const atNewest = computed(() => offset.value === 0)
 const draftBytes = computed(() => new TextEncoder().encode(draft.value).length)
 const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
 const showingLimit = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT * 0.8)
+
+/** R42：发送键能不能按——有内容、没超长、不在发送中 */
+const sendReady = computed(() => {
+  return Boolean(draft.value.trim()) && !tooLong.value && !sending.value
+})
 
 const peerTitle = computed(() => {
   if (!pairStore.settings.enabled) return t('pages.chat.hints.disabled')
@@ -159,6 +173,8 @@ watch(() => pairStore.settings.chat.visible, (visible) => {
   }
 
   closeInput()
+  // R42：窗口都藏了就别在后台接着放语音
+  stopVoice()
   hideWindowByLabel(WINDOW_LABEL.CHAT).catch(reason => error(String(reason)))
 }, { immediate: true })
 
@@ -275,6 +291,20 @@ function assetSource(item: ChatMessage) {
   const path = localPathOf(item.attachment)
 
   return path ? convertFileSrc(path) : void 0
+}
+
+/** R42：这条语音能不能播——文件真的落到本机了才算（还在传的没有本地路径） */
+function canPlayVoice(item: ChatMessage) {
+  return item.kind === 'voice' && Boolean(assetSource(item))
+}
+
+/** R42：点播放键。地址可能刚好在这一刻还没有，所以在这里再取一次 */
+function toggleVoiceOf(item: ChatMessage) {
+  const source = assetSource(item)
+
+  if (!source) return
+
+  void toggleVoice(item.id, source)
 }
 
 function openPreview(item: ChatMessage) {
@@ -475,6 +505,8 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 
   closePreview()
   resetTransfers()
+  // R42：这一条可能已经不在列表里了，别留着一个放不完的播放器
+  stopVoice()
 
   void loadLatest().then(scrollToNewest).catch((reason) => {
     error(String(reason))
@@ -523,26 +555,37 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="relative size-screen flex flex-col overflow-hidden bg-black/45 text-white rounded-2xl">
+  <!--
+    R42：窗口本身还是 `transparent`（圆角靠它才成立），但底色改成**不透明**的实色——
+    以前是 `bg-black/45`，桌面上任何东西都会透进来，字很难读。气泡上的半透明白都是叠在
+    这一层实色上面的，所以不用逐个改。
+  -->
+  <div class="relative size-screen flex flex-col overflow-hidden bg-[#191c22] text-white ring-1 ring-white/10 rounded-2xl">
     <header
-      class="flex shrink-0 cursor-move items-center gap-1.5 px-2.5 py-1.5"
+      class="flex shrink-0 cursor-move items-center gap-2 border-b border-white/8 bg-white/5 px-2.5 py-2"
       @mousedown="handleMouseDown"
     >
-      <span class="i-lucide:message-circle shrink-0 text-[13px] color-white/50" />
+      <!-- 状态点：未启用 / 对方离线 / 在线。必须是没有点击事件的元素，否则会变成拖窗口 -->
+      <span
+        class="size-1.5 shrink-0 rounded-full"
+        :class="!pairStore.settings.enabled
+          ? 'bg-[#faad14]'
+          : (pairStore.runtime.peerOnline ? 'bg-[#52c41a]' : 'bg-white/30')"
+      />
 
-      <span class="min-w-0 flex-1 truncate text-[11px] color-white/55">
+      <span class="min-w-0 flex-1 truncate text-[11px] color-white/80 font-medium">
         {{ peerTitle }}
       </span>
 
       <button
         v-if="!atNewest"
-        class="i-lucide:chevron-down shrink-0 cursor-pointer text-[14px] color-white/60 hover:color-white"
+        class="i-lucide:chevron-down shrink-0 cursor-pointer text-[14px] color-white/55 hover:color-white"
         :title="$t('pages.chat.hints.backToNewest')"
         @click="backToNewest"
       />
 
       <button
-        class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-white/60 hover:color-white"
+        class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-white/55 hover:color-white"
         :title="$t('pages.chat.hints.hide')"
         @click="handleHide"
       />
@@ -550,41 +593,43 @@ onMounted(async () => {
 
     <p
       v-if="notice"
-      class="shrink-0 break-all px-2.5 pb-1 text-[9px] color-white/70"
+      class="pointer-events-none absolute inset-x-3 top-9 z-50 break-all bg-black/75 px-2 py-1 text-center text-[9px] color-white/85 rounded-lg"
     >
       {{ notice }}
     </p>
 
     <div
       ref="list"
-      class="min-h-0 flex-1 overflow-y-auto px-2 pb-1.5"
+      class="min-h-0 flex flex-1 flex-col gap-1 overflow-y-auto px-2 py-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-white/15 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:hover:bg-white/25"
       @wheel="handleWheel"
     >
       <div
         v-if="loading && !messages.length"
-        class="py-4 text-center text-[10px] color-white/40"
+        class="flex flex-1 flex-col items-center justify-center gap-2 color-white/40"
       >
-        {{ $t('pages.chat.hints.loading') }}
+        <span class="i-lucide:message-circle animate-pulse text-[22px]" />
+        <span class="text-[10px]">{{ $t('pages.chat.hints.loading') }}</span>
       </div>
 
       <div
         v-else-if="!messages.length"
-        class="py-4 text-center text-[10px] color-white/40"
+        class="flex flex-1 flex-col items-center justify-center gap-2 color-white/35"
       >
-        {{ $t('pages.chat.hints.empty') }}
+        <span class="i-lucide:message-circle text-[22px]" />
+        <span class="text-[10px]">{{ $t('pages.chat.hints.empty') }}</span>
       </div>
 
       <div
         v-for="item in visibleMessages"
         :key="item.id"
-        class="group mb-1.5 flex"
+        class="group flex"
         :class="item.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
       >
         <div
-          class="max-w-[86%] px-2 py-1 text-[12px] leading-[1.35] rounded-xl"
+          class="max-w-[86%] break-words px-2.5 py-1.5 text-[12px] leading-[1.4] rounded-2xl shadow-sm"
           :class="item.direction === 'outgoing'
-            ? 'bg-[#1677ff] rounded-br-sm'
-            : 'bg-white/15 rounded-bl-sm'"
+            ? 'bg-[#1677ff] rounded-br-md'
+            : 'bg-white/10 ring-1 ring-white/10 rounded-bl-md'"
         >
           <template v-if="item.attachment">
             <button
@@ -600,26 +645,57 @@ onMounted(async () => {
               >
             </button>
 
+            <template v-else-if="item.kind === 'voice'">
+              <!--
+                R42：不再用系统原生 `<audio controls>`（那条「播放 / 0:00 / 下载 / ⋮」），
+                换成自绘的一行：播放键 + 进度条 + 时长。播放走 `new Audio()` + asset 协议，
+                与猫咪窗口里试听录音同一套（`usePairVoicePlayback`）。
+              -->
+              <div class="min-w-32 flex items-center gap-2">
+                <button
+                  class="size-7 flex shrink-0 items-center justify-center transition rounded-full"
+                  :class="canPlayVoice(item) ? 'bg-white/15 hover:bg-white/25' : 'bg-white/10 opacity-40'"
+                  :disabled="!canPlayVoice(item)"
+                  :title="canPlayVoice(item)
+                    ? (voicePlaying(item.id) ? $t('pages.chat.player.pause') : $t('pages.chat.player.play'))
+                    : $t('pages.chat.player.waiting')"
+                  @click="toggleVoiceOf(item)"
+                >
+                  <span
+                    class="text-[13px] color-white"
+                    :class="voicePlaying(item.id) ? 'i-lucide:pause' : 'i-lucide:play'"
+                  />
+                </button>
+
+                <div class="min-w-0 flex-1">
+                  <div class="h-1 w-full overflow-hidden bg-white/20 rounded-full">
+                    <div
+                      class="h-full bg-white/90 transition-[width] duration-150"
+                      :style="{ width: `${voicePercent(item.id)}%` }"
+                    />
+                  </div>
+
+                  <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-white/60">
+                    <span class="truncate">
+                      {{ voiceFailed(item.id)
+                        ? $t('pages.chat.player.failed')
+                        : (canPlayVoice(item) ? $t('pages.chat.hints.voice') : $t('pages.chat.player.waiting')) }}
+                    </span>
+
+                    <span class="shrink-0">{{ voiceLabel(item.id) }}</span>
+                  </div>
+                </div>
+              </div>
+            </template>
+
             <template v-else>
               <div class="flex items-center gap-1.5">
-                <span
-                  class="shrink-0 text-[14px]"
-                  :class="item.kind === 'voice' ? 'i-lucide:mic' : 'i-lucide:file'"
-                />
+                <span class="i-lucide:file shrink-0 text-[14px]" />
 
                 <span class="min-w-0 truncate">
-                  {{ item.kind === 'voice'
-                    ? $t('pages.chat.hints.voice')
-                    : (attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment')) }}
+                  {{ attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment') }}
                 </span>
               </div>
-
-              <audio
-                v-if="item.kind === 'voice' && assetSource(item)"
-                class="mt-1 max-w-full w-44"
-                controls
-                :src="assetSource(item)"
-              />
             </template>
 
             <div class="mt-1 flex items-center gap-1 text-[9px] color-white/60">
@@ -667,14 +743,14 @@ onMounted(async () => {
               class="mt-1 flex items-center gap-2"
             >
               <button
-                class="cursor-pointer text-[10px] underline hover:color-white"
+                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
                 @click="handleAccept(item)"
               >
                 {{ $t('pages.chat.buttons.accept') }}
               </button>
 
               <button
-                class="cursor-pointer text-[10px] underline hover:color-white"
+                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
                 @click="handleReject(item)"
               >
                 {{ $t('pages.chat.buttons.reject') }}
@@ -683,11 +759,11 @@ onMounted(async () => {
 
             <div
               v-if="localPathOf(item.attachment) || canCancel(transferOf(item.id)) || (item.status === 'failed' && item.direction === 'outgoing')"
-              class="mt-1 flex items-center gap-2"
+              class="mt-1.5 flex flex-wrap items-center gap-1"
             >
               <button
                 v-if="item.kind !== 'image' && localPathOf(item.attachment)"
-                class="cursor-pointer text-[10px] underline hover:color-white"
+                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
                 @click="handleOpen(item)"
               >
                 {{ $t('pages.chat.buttons.open') }}
@@ -695,7 +771,7 @@ onMounted(async () => {
 
               <button
                 v-if="localPathOf(item.attachment)"
-                class="cursor-pointer text-[10px] underline hover:color-white"
+                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
                 @click="handleSaveAs(item)"
               >
                 {{ $t('pages.chat.buttons.saveAs') }}
@@ -703,7 +779,7 @@ onMounted(async () => {
 
               <button
                 v-if="canCancel(transferOf(item.id))"
-                class="cursor-pointer text-[10px] underline hover:color-white"
+                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
                 @click="handleCancel(item)"
               >
                 {{ $t('pages.chat.buttons.cancel') }}
@@ -711,7 +787,7 @@ onMounted(async () => {
 
               <button
                 v-if="item.status === 'failed' && item.direction === 'outgoing'"
-                class="cursor-pointer text-[10px] underline hover:color-white"
+                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
                 @click="handleRetry(item)"
               >
                 {{ $t('pages.chat.buttons.retry') }}
@@ -726,7 +802,7 @@ onMounted(async () => {
             {{ item.text }}
           </p>
 
-          <div class="mt-0.5 flex items-center justify-end gap-1 text-[9px] color-white/55">
+          <div class="mt-1 flex items-center justify-end gap-1 text-[9px] color-white/45">
             <button
               v-if="item.text"
               class="shrink-0 cursor-pointer text-[10px] opacity-0 transition group-hover:opacity-100 hover:color-white"
@@ -750,28 +826,39 @@ onMounted(async () => {
 
     <div
       v-if="inputMode"
-      class="shrink-0 border-t border-white/10 p-1.5"
+      class="shrink-0 border-t border-white/8 p-1.5"
     >
-      <textarea
-        ref="input"
-        v-model="draft"
-        class="h-10 w-full resize-none bg-white/10 px-2 py-1 text-[12px] outline-none rounded-lg placeholder:color-white/35"
-        :placeholder="$t('pages.chat.placeholders.input')"
-        @keydown.enter.exact="handleSendKey"
-        @keydown.esc.prevent="closeInput"
-        @paste="handlePaste"
-      />
+      <!-- R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款 -->
+      <div class="flex items-end gap-1.5 bg-white/8 px-2 py-1.5 rounded-xl">
+        <button
+          class="i-lucide:paperclip mb-1 shrink-0 cursor-pointer text-[13px] color-white/55 hover:color-white"
+          :title="$t('pages.chat.hints.pickAttachment')"
+          @click="pickAttachment"
+        />
 
-      <div class="mt-1 flex items-center justify-between gap-2 text-[9px] color-white/45">
-        <div class="min-w-0 flex items-center gap-1.5">
-          <button
-            class="i-lucide:paperclip shrink-0 cursor-pointer text-[11px] hover:color-white"
-            :title="$t('pages.chat.hints.pickAttachment')"
-            @click="pickAttachment"
-          />
+        <textarea
+          ref="input"
+          v-model="draft"
+          class="max-h-24 min-h-9 w-full resize-none py-1 text-[12px] leading-[1.4] outline-none bg-transparent placeholder:color-white/35"
+          :placeholder="$t('pages.chat.placeholders.input')"
+          @keydown.enter.exact="handleSendKey"
+          @keydown.esc.prevent="closeInput"
+          @paste="handlePaste"
+        />
 
-          <span class="truncate">{{ $t('pages.chat.hints.inputKeys') }}</span>
-        </div>
+        <button
+          class="mb-0.5 size-7 flex shrink-0 items-center justify-center transition rounded-full"
+          :class="sendReady ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-white/15'"
+          :disabled="!sendReady"
+          :title="$t('pages.chat.buttons.send')"
+          @click="handleSend"
+        >
+          <span class="i-lucide:arrow-up text-[13px] color-white" />
+        </button>
+      </div>
+
+      <div class="mt-1 flex items-center justify-between gap-2 px-0.5 text-[9px] color-white/35">
+        <span class="truncate">{{ $t('pages.chat.hints.inputKeys') }}</span>
 
         <span
           v-if="showingLimit"
@@ -805,7 +892,7 @@ onMounted(async () => {
 
     <div
       v-else
-      class="shrink-0 px-2.5 pb-1.5"
+      class="shrink-0 px-2.5 pb-2"
     >
       <button
         class="cursor-pointer text-[9px] color-white/35 hover:color-white/70"
@@ -818,7 +905,7 @@ onMounted(async () => {
     <!-- 图片预览（§37）：复制图片 / 另存为 -->
     <div
       v-if="previewMessage"
-      class="absolute inset-0 z-50 flex flex-col bg-black/85 rounded-2xl"
+      class="absolute inset-0 z-50 flex flex-col bg-black/95 rounded-2xl"
     >
       <header
         class="flex shrink-0 cursor-move items-center gap-1.5 px-2.5 py-1.5"

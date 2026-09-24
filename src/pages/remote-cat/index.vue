@@ -5,6 +5,7 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { exists, readDir } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
+import { round } from 'es-toolkit'
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 
 import type { ModelSize } from '@/composables/useModel'
@@ -118,25 +119,77 @@ const remoteStats = computed(() => {
   return stats?.share ? stats : void 0
 })
 
+/**
+ * 目标窗口尺寸（物理像素）：模型尺寸 × 缩放。
+ *
+ * 对方猫窗口上没有聊天浮层（R39 那条只在自己猫上），所以不用留额外高度。
+ */
+function targetRemoteSize(scale = pairStore.settings.remoteCat.scale) {
+  if (!modelSize.value) return
+
+  const factor = scale / 100
+
+  return {
+    width: Math.round(modelSize.value.width * factor),
+    height: Math.round(modelSize.value.height * factor),
+  }
+}
+
 async function applySize() {
   if (!modelSize.value) return
 
-  const scale = pairStore.settings.remoteCat.scale / 100
+  const target = targetRemoteSize()
 
-  await appWindow.setSize(new PhysicalSize({
-    width: Math.round(modelSize.value.width * scale),
-    height: Math.round(modelSize.value.height * scale),
-  }))
+  if (!target) return
+
+  await appWindow.setSize(new PhysicalSize(target))
 
   live2d.resizeModel(modelSize.value)
 }
 
-/** `setSize` 之后浏览器才会派发 resize，这里再按真实尺寸适配一次 */
-const debouncedResize = useDebounceFn(() => {
-  if (modelSize.value) live2d.resizeModel(modelSize.value)
+/** 拖动 / 摆正时盖一层黑罩，避免露出贴图与猫错位的那一帧（与自己猫一致） */
+const resizing = ref(false)
+
+/**
+ * R43：和猫咪窗口同一套——拖窗口边缘改的是「缩放百分比」，比例永远由模型决定。
+ *
+ * 以前这里只调 `live2d.resizeModel()`：窗口被自由拉伸、比例不写回，下一次重算尺寸
+ * （改设置里的尺寸、换模型、重启）都会跳回去；而且背景与键贴图是 `object-cover` 铺满
+ * 窗口的，猫却是等比居中的，拖完必然错位。三段式照抄 `pages/main/index.vue`：
+ * 先按新窗口贴合模型，再用窗口宽度反推缩放并写回设置，由上面的 watcher 把窗口摆正。
+ */
+const debouncedResize = useDebounceFn(async () => {
+  try {
+    if (!modelSize.value) return
+
+    live2d.resizeModel(modelSize.value)
+
+    // 反推缩放用**物理宽度**，与自己猫（`pages/main/index.vue`）和 `targetRemoteSize()`
+    // 的口径一致：用 CSS 像素在非 100% 系统缩放下会每次都算小一档、窗口越缩越小。
+    const size = await appWindow.size()
+    const nextScale = Math.max(10, Math.min(500, round((size.width / modelSize.value.width) * 100)))
+
+    if (nextScale !== pairStore.settings.remoteCat.scale) {
+      pairStore.settings.remoteCat.scale = nextScale
+
+      return
+    }
+
+    const target = targetRemoteSize()
+
+    if (target && (size.width !== target.width || size.height !== target.height)) {
+      await appWindow.setSize(new PhysicalSize(target))
+    }
+  } finally {
+    resizing.value = false
+  }
 }, 100)
 
-useEventListener('resize', debouncedResize)
+useEventListener('resize', () => {
+  resizing.value = true
+
+  debouncedResize()
+})
 
 async function loadModel() {
   const model = remoteModel()
@@ -509,11 +562,11 @@ function handleMouseDown() {
     </div>
 
     <div
-      v-show="!modelReady"
+      v-show="resizing || !modelReady"
       class="absolute size-full flex items-center justify-center bg-black"
     >
       <span class="text-center text-[10vw] text-white">
-        {{ $t('pages.main.hints.switching') }}
+        {{ resizing ? $t('pages.main.hints.redrawing') : $t('pages.main.hints.switching') }}
       </span>
     </div>
 

@@ -294,21 +294,43 @@ export function pairAttachmentRetry(messageId: string) {
 /** §45：单条语音的上限（秒），与 Rust 侧 `MAX_RECORDING_SECS` 一致 */
 export const RECORDING_LIMIT_SECS = 60
 
+/**
+ * 录完但还没发出去的一条语音（Rust 侧 `VoiceDraft`，R41）。
+ *
+ * `path` 是临时目录里的 wav，前端用 asset protocol 先试听；`durationMs` 是 Rust 按样本
+ * 数算出来的真实时长，不是界面上那个滴答。
+ */
+export interface VoiceDraft {
+  path: string
+  durationMs: number
+}
+
 /** §45 的按住说话：按下开始录，返回麦克风的原生采样率 */
 export function pairStartRecording() {
   return invoke<number>(INVOKE_KEY.PAIR_START_RECORDING)
 }
 
 /**
- * §45 的按住说话：松开发送。
+ * §45 的按住说话：松开结束录音（R41 起**先不发送**）。
  *
- * 返回 `null` 表示这次没发出去：没在录，或者只轻点了一下（< 300 ms）。
+ * 返回 `null` 表示这次没留下东西：没在录，或者只轻点了一下（< 300 ms）。
+ * 否则返回待确认的录音，等前端调 `pairSendRecording` 或 `pairCancelRecording`。
  */
 export function pairStopRecording() {
-  return invoke<ChatMessage | null>(INVOKE_KEY.PAIR_STOP_RECORDING)
+  return invoke<VoiceDraft | null>(INVOKE_KEY.PAIR_STOP_RECORDING)
 }
 
-/** §45 的「可取消」：这次录音直接丢掉，不发送 */
+/** R41：发送上一条待确认的语音（返回本地已经落库的那条消息） */
+export function pairSendRecording() {
+  return invoke<ChatMessage>(INVOKE_KEY.PAIR_SEND_RECORDING)
+}
+
+/**
+ * §45 的「可取消」，R41 起管两种状态：
+ *
+ * - 正在录：丢掉麦克风里那一段，不落盘；
+ * - 录完待确认：删掉临时 wav，不发送。
+ */
 export function pairCancelRecording() {
   return invoke<void>(INVOKE_KEY.PAIR_CANCEL_RECORDING)
 }

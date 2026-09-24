@@ -502,6 +502,28 @@ impl TransferStore {
         Ok(target)
     }
 
+    /// 上一次运行留下的「录完待确认」wav（R41）：`voice-*.wav`。
+    ///
+    /// 它们只在 `PairRecording` 的内存状态里被认领，进程一退就没人管了
+    /// （`cleanup_stale_parts` 只认 `.part`），所以**只在启动时**清一次。
+    /// 运行中绝不能调它：那会把用户手上那条待确认的录音删掉。
+    pub fn cleanup_orphan_recordings(&self) {
+        let Ok(entries) = fs::read_dir(self.tmp_dir()) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if name.starts_with("voice-")
+                && path.extension().and_then(|value| value.to_str()) == Some("wav")
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
     /// 崩溃 / 强杀留下的 `.part`：只清理明显过期的，避免误删正在传输的文件
     fn cleanup_stale_parts(&self) {
         let Ok(entries) = fs::read_dir(self.tmp_dir()) else {
@@ -867,6 +889,32 @@ mod tests {
 
         assert!(fresh.exists());
         assert!(!stale.exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// R41 / R44：上一次运行留下的「录完待确认」wav 只在启动时清一次，
+    /// 而且只认 `voice-*.wav` —— 别把别的临时文件（`.part`、别的 wav）顺手删掉。
+    #[test]
+    fn orphan_recordings_are_cleaned_up_without_touching_other_files() {
+        let root = temp_dir("orphan-voice");
+        let store = TransferStore::new(&root);
+
+        store.ensure().unwrap();
+
+        let orphan = store.tmp_dir().join("voice-20260925-120000.wav");
+        let other_wav = store.tmp_dir().join("note.wav");
+        let part = store.tmp_dir().join(format!("{}.part", Uuid::new_v4()));
+
+        fs::write(&orphan, b"orphan").unwrap();
+        fs::write(&other_wav, b"keep").unwrap();
+        fs::write(&part, b"keep").unwrap();
+
+        store.cleanup_orphan_recordings();
+
+        assert!(!orphan.exists());
+        assert!(other_wav.exists());
+        assert!(part.exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

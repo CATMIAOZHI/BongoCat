@@ -70,6 +70,7 @@ export const INVOKE_KEY = {
   PAIR_ATTACHMENT_RETRY: 'pair_attachment_retry',
   PAIR_START_RECORDING: 'pair_start_recording',
   PAIR_STOP_RECORDING: 'pair_stop_recording',
+  PAIR_SEND_RECORDING: 'pair_send_recording',
   PAIR_CANCEL_RECORDING: 'pair_cancel_recording',
 }
 

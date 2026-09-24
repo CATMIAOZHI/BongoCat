@@ -22,9 +22,10 @@ pub mod transfer;
 #[cfg(test)]
 mod e2e;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rand::Rng as _;
+use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Manager as _, Runtime, State, command};
 
@@ -58,6 +59,10 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) {
     if let Err(error) = store.ensure() {
         tauri_plugin_log::log::error!("附件目录不可用（附件功能会失败）: {error}");
     }
+
+    // R41：上一次运行里「录完还没确认」的 wav 进程一退就没人认领了，启动时顺手清一次
+    // （必须在运行前：运行中调它会把用户手上待确认的那条录音删掉）
+    store.cleanup_orphan_recordings();
 
     app.manage(Arc::new(PairManager::new(device_id, sink, history, store)));
     app.manage(PairRecording::default());
@@ -572,10 +577,48 @@ pub async fn pair_attachment_retry(
     Arc::clone(&manager).retry_attachment(&message_id)
 }
 
-/// 语音录音状态（§44 / §45）。录音本身跑在专用线程里，这里只是一个句柄盒子。
+/// 录完但还没发出去的一条语音（R41 的二次确认）。
+///
+/// 它在临时目录里是一份 wav，前端用 asset protocol 先试听；用户点「发送」才真正走
+/// 附件管线，点「取消」就直接删掉。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceDraft {
+    /// 临时目录里的 wav 绝对路径
+    pub path: String,
+    /// 实际录到的时长（毫秒）：由样本数算出来，不是前端那个滴答
+    pub duration_ms: u64,
+}
+
+/// 语音录音状态（§44 / §45）。录音本身跑在专用线程里，这里只是一个句柄盒子；
+/// R41 之后还多存一条「录完待确认」的草稿。
 #[derive(Default)]
 pub struct PairRecording {
     recorder: Arc<audio::Recorder>,
+    draft: Mutex<Option<VoiceDraft>>,
+}
+
+impl PairRecording {
+    /// 记下待发送的草稿：替换掉上一份（连同它的临时文件一起删掉，别攒孤儿 wav）
+    fn hold_draft(&self, draft: VoiceDraft) {
+        self.discard_draft();
+
+        if let Ok(mut held) = self.draft.lock() {
+            *held = Some(draft);
+        }
+    }
+
+    /// 取走待发送的草稿（发送与取消都要先把它从状态里摘出来）
+    fn take_draft(&self) -> Option<VoiceDraft> {
+        self.draft.lock().ok().and_then(|mut held| held.take())
+    }
+
+    /// 丢掉草稿并删掉它的临时文件
+    fn discard_draft(&self) {
+        if let Some(draft) = self.take_draft() {
+            let _ = std::fs::remove_file(&draft.path);
+        }
+    }
 }
 
 /// 开始录音（§45 的 Pressed），返回麦克风的原生采样率
@@ -584,25 +627,33 @@ pub async fn pair_start_recording(recording: State<'_, PairRecording>) -> Result
     let recorder = Arc::clone(&recording.recorder);
 
     // 打开麦克风要等设备真的开始录（最多 5 秒），别把异步运行时的工作线程占住
-    tokio::task::spawn_blocking(move || recorder.start())
+    let sample_rate = tokio::task::spawn_blocking(move || recorder.start())
         .await
-        .map_err(|error| format!("开始录音失败: {error}"))?
+        .map_err(|error| format!("开始录音失败: {error}"))??;
+
+    // R41：重新开始录音时，上一次没发出去的草稿作废——但必须放在**麦克风真的开了之后**：
+    // 放在前面的话，「重录时麦克风打不开」会把用户上一段还没确认的录音连文件一起弄丢。
+    recording.discard_draft();
+
+    Ok(sample_rate)
 }
 
-/// 结束录音并发送（§45 的 Released）。
+/// 结束录音，但**先不发送**（R41 的二次确认）。
 ///
 /// 返回 `None` 表示这次不该发出去：没在录，或者只轻点了一下（< 300 ms）。
+/// 录好的 wav 留在临时目录里等用户确认：点「发送」走 `pair_send_recording`，
+/// 点「取消」走 `pair_cancel_recording`——两者都会把这份临时文件收干净。
 #[command]
 pub async fn pair_stop_recording(
     manager: State<'_, Arc<PairManager>>,
     recording: State<'_, PairRecording>,
-) -> Result<Option<ChatMessage>, String> {
-    let Some(recording) = recording.recorder.take() else {
+) -> Result<Option<VoiceDraft>, String> {
+    let Some(current) = recording.recorder.take() else {
         return Ok(None);
     };
 
     // 收尾最多等一个轮询周期，但 join 是阻塞调用，别占着异步运行时
-    let audio = tokio::task::spawn_blocking(move || recording.finish())
+    let audio = tokio::task::spawn_blocking(move || current.finish())
         .await
         .map_err(|error| format!("结束录音失败: {error}"))??;
 
@@ -633,43 +684,66 @@ pub async fn pair_stop_recording(
         history::file_stamp(protocol::now_millis())
     ));
     let target = path.clone();
+    let duration_ms = audio.duration_ms();
 
     let written = tokio::task::spawn_blocking(move || audio::write_wav(&target, &audio))
         .await
         .map_err(|error| format!("保存录音失败: {error}"))?;
 
-    // 落盘之后任何一条出错路径（写失败、发送失败、上限被临时改小）都要把临时文件删掉
-    let message = match written {
-        Ok(()) => {
-            send_attachment(
-                Arc::clone(&manager),
-                path.clone(),
-                TransferKind::Voice,
-                Some("audio/wav".to_string()),
-                true,
-            )
-            .await
-        }
-        Err(error) => Err(error),
-    };
-
-    if message.is_err() {
-        // `stage_copy` 成功时已经删过源文件了，这里删不到就是正常的
+    if let Err(error) = written {
+        // 写坏的文件不留：下一次录音会覆盖同一个名字（同一毫秒内不会重名）
         let _ = std::fs::remove_file(&path);
+
+        return Err(error);
     }
 
-    Ok(Some(message?))
+    let draft = VoiceDraft {
+        path: path.to_string_lossy().to_string(),
+        duration_ms,
+    };
+
+    recording.hold_draft(draft.clone());
+
+    Ok(Some(draft))
 }
 
-/// 放弃这次录音（§45 的「可取消」）：不落盘、不发送
+/// 发送「录完待确认」的那条语音（R41）。
+///
+/// 与 `pair_stop_recording` 分开，是为了让用户先试听再决定。`stage` 为真：wav 是临时文件，
+/// 发送前先收进附件缓存（成功路径里它会被移走，失败路径由 `send_attachment` 删掉）。
+#[command]
+pub async fn pair_send_recording(
+    manager: State<'_, Arc<PairManager>>,
+    recording: State<'_, PairRecording>,
+) -> Result<ChatMessage, String> {
+    let Some(draft) = recording.take_draft() else {
+        return Err("没有等待发送的录音".to_string());
+    };
+
+    send_attachment(
+        Arc::clone(&manager),
+        std::path::PathBuf::from(draft.path),
+        TransferKind::Voice,
+        Some("audio/wav".to_string()),
+        true,
+    )
+    .await
+}
+
+/// 放弃这次录音（§45 的「可取消」）：不落盘、不发送。
+///
+/// R41 之后它管两种「取消」：正在录的那一段（丢掉麦克风数据），以及录完待确认的那一份
+/// （删掉临时 wav）。前端两个取消按钮都调它，用户不用分辨自己在哪个阶段。
 #[command]
 pub async fn pair_cancel_recording(recording: State<'_, PairRecording>) -> Result<(), String> {
-    let Some(recording) = recording.recorder.take() else {
+    recording.discard_draft();
+
+    let Some(current) = recording.recorder.take() else {
         return Ok(());
     };
 
     // 取消不该因为麦克风出错而失败：结果直接丢掉
-    let _ = tokio::task::spawn_blocking(move || recording.finish()).await;
+    let _ = tokio::task::spawn_blocking(move || current.finish()).await;
 
     Ok(())
 }
