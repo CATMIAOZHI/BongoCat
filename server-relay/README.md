@@ -115,7 +115,7 @@ docker compose -f docker-compose.direct.yml up -d
 | --- | --- | --- |
 | `PAIR_SERVER_PASSWORD` | **无（必填）** | 服务器密码：决定「谁能用这台服务器」。≥ 16 个字符，客户端要填同一个值；缺了它中继会拒绝启动 |
 | `PAIR_MAX_SESSIONS` | `20` | 同时承载的双人会话数。**只挡新会话**：已有会话的第二个人加入、同 deviceId 重连都不受影响；会话空了立刻释放名额。必须 ≥ 1 |
-| `PAIR_LISTEN` | `0.0.0.0:8080` | 监听地址（容器健康检查按它的主机去探 `/health`，所以绑具体网卡也能正确判定）。**域名模式别把它改成 `127.0.0.1:8080`**：Caddy 是从另一个容器连 `relay:8080` 的，改完 Caddy 连不上上游（502），而健康检查照样 healthy |
+| `PAIR_LISTEN` | `0.0.0.0:8080` | 监听地址（容器健康检查按它的主机去探 `/health`，所以绑具体网卡也能正确判定）。**一般别改**：改成 `127.0.0.1:8080` 会让 Caddy 连不上上游（502，它是从另一个容器连 `relay:8080` 的）；改端口还要同时改 Caddy 的上游（域名模式）或 `docker-compose.direct.yml` 里写死的 `ports: "8080:8080"`（direct 模式）。这两种改坏的共同症状都是「健康检查 healthy、客户端连不上」 |
 | `PAIR_MAX_FRAMES_PER_SECOND` | `30` | 每连接的帧额度，会通过 `server.welcome` 广告给客户端（缺省 30 是为了与 CF 一致；compose 里默认给到 90 → 客户端 60Hz） |
 | `PAIR_MAX_CHUNKS_PER_SECOND` | `20` | 附件分片额度 |
 | `PAIR_MAX_BYTES_PER_SECOND` | `12582912` | 字节额度（12 MiB，要容得下 20 个 512 KiB 分片的突发） |
@@ -161,9 +161,9 @@ docker compose -f docker-compose.direct.yml up -d
 docker compose -f docker-compose.yml -f docker-compose.coturn.yml up -d
 ```
 
-`turnserver.conf` 里有一份最小配置示例（选项集是按 coturn **4.18** 核过的，`coturn/coturn:latest` 现在就是这一版；将来镜像大版本升级时值得再核一遍），上线前记得改这几处：`user=` 的密码、`external-ip`（**只能写公网 IP 字面量**，coturn 不接受域名；云主机在 NAT 后面时写 `<公网IP>/<内网IP>`）、`realm` / `server-name`（不改也能用，但日志里会一直出现示例域名）；要 TLS 再配证书。**它是被 git 跟踪的文件，改完别提交**（真实密码会进仓库）。改完要让它生效：`docker compose -f docker-compose.yml -f docker-compose.coturn.yml restart coturn`（改的是挂载进去的文件，`up -d` 不会重启它）。
+`turnserver.conf` 里有一份最小配置示例（选项集是按 coturn **4.18** 核过的，`coturn/coturn:latest` 现在就是这一版；将来镜像大版本升级时值得再核一遍），上线前记得改这几处：`user=` 的密码、`external-ip`（**写公网 IP 字面量**；官方只支持 IP，写域名会被解析一次，解析到 CDN 边缘 IP 或解析失败（那样 `external-ip` 会被清空、报出去的是内网地址）都会坏。云主机在 NAT 后面时写 `<公网IP>/<内网IP>`）、`realm` / `server-name`（不改也能用，但日志里会一直出现示例域名）；要 TLS 再配证书。**它是被 git 跟踪的文件，改完别提交**（真实密码会进仓库）。改完要让它生效：`docker compose -f docker-compose.yml -f docker-compose.coturn.yml restart coturn`（改的是挂载进去的文件，`up -d` 不会重启它）。
 
-**这些上限也是正常用量的天花板**：`user-quota` / `total-quota` 是按**整台服务器**算的（coturn 只有一张静态凭据，`iceServers` 是统一广告的，没法按组发不同凭据），每一组双人会话约占 2 个分配，所以默认给的 64 / 128 是配 `PAIR_MAX_SESSIONS=20` 的；把组数调大时这几个数要跟着调，不然「双方都在大内网、只能靠 TURN」的那几组会拿不到分配（同样表现为日志正常、打洞失败）。`max-bps=1048576` 是每个分配、上下行各 ≈8 Mbps，只影响「两边都只能走 TURN」时的文件传输速度。`denied-peer-ip` 挡的是往内网、回环与云元数据地址（169.254.169.254 那类）的转发。
+**这些上限也是正常用量的天花板**：`user-quota` / `total-quota` 是按**整台服务器**算的（coturn 只有一张静态凭据，`iceServers` 是统一广告的，没法按组发不同凭据），每一组双人会话约占 2 个分配，所以默认给的 64 / 128 是配 `PAIR_MAX_SESSIONS=20` 的；把组数调大时这几个数与 `min-port`~`max-port`（还有安全组里对应的放行）都要跟着放大，不然「双方都在大内网、只能靠 TURN」的那几组会拿不到分配（同样表现为日志正常、打洞失败）。默认那 101 个端口也是按 20 组给的，端口先耗尽还是这个症状。`max-bps=1048576` 是每个分配、上下行各 ≈8 Mbps，只影响「两边都只能走 TURN」时的文件传输速度。`denied-peer-ip` 挡的是往内网、回环与云元数据地址（169.254.169.254 那类）的转发。
 
 起好之后把地址广告给客户端：
 
@@ -213,7 +213,7 @@ X-Bongo-Protocol: 1
 
 - 日志里只出现**会话指纹**（`SHA256(ROOM_ID)` 的前 8 字节）与 `deviceId`；完整 `ROOM_ID`、`AUTH_TOKEN`、配对密码、服务器密码、聊天内容一律不写。
 - **凭据与会话相关的**拒绝各留一行（对端地址 + 阶段 + HTTP 状态码，例如「被拒绝：服务器密码不正确（HTTP 403）」）。按**阶段**记的是这六段：协议版本、服务器密码、`ROOM_ID`、`Authorization`、容量、`deviceId`。没有这几行时，「两台设备连不上」和「客户端根本没连到这」在日志里长得一样。
-- **不记**的是「连接还没进到协议这一层」的那几步：路径不对（404）、缺 `Upgrade` / `Sec-WebSocket-Version` / `Sec-WebSocket-Key`（426 / 400）。它们跟凭据无关，客户端自己会说「服务器地址路径不对」，记下来只会被公网扫描器刷满。
+- **不记**的是「连接还没进到协议这一层」的那几步：路径不对（404）、缺 `Upgrade` / `Sec-WebSocket-Version` / `Sec-WebSocket-Key`（426 / 400）。它们跟凭据无关，客户端自己会说「服务器地址路径不对」，记下来只会被公网扫描器刷满。（握手中断，例如请求头超过 8 KiB，走的是另一条日志：「连接 … 结束：请求头过大」。）
 - 服务器只在内存里保存 `SHA256(AUTH_TOKEN)` 与 `SHA256(服务器凭据)` 两个摘要，不保存它们的明文。
 - README 承诺的「不收集任何用户数据」在这里同样成立：中继不做任何统计上报，只做转发。
 

@@ -153,6 +153,8 @@
 > - 界面：「连接即落盘」在**替换**掉旧配对密码时改说「原来的已被替换」（凭据库里的旧值读不回来，这件事不能不说）；「已记住」的提示挪到连接**之前**（连接失败时用户看到两个空框 + 一条红字，容易读成白填了）；`handleConnect` 补 `connecting` 守卫（连点两次会取消并重启同一条会话、连出两条提示）；zh 的地址与服务器密码说明里两句指代不清的话改直白；en-US 的 `pairSecret` 说明里 `secret` 混用改成 `pairing key`（与标签一致）。
 > - 部署：`PAIR_LISTEN` 也改成 `${PAIR_LISTEN:-0.0.0.0:8080}` 透传（它是最后一个「写进 `.env` 却不生效」的键，健康检查已经能跟着它走了，这一改才是完整闭环），并补上「域名模式别改成 `127.0.0.1:8080`，否则 Caddy 连不上上游而健康检查照样 healthy」；`PAIR_ICE_SERVERS` 的写法在四处说明里统一成「写进 `.env`、不要加引号」，并注明 compose 里必须加引号；补「改完 `turnserver.conf` 要 `... restart coturn`」（只改挂载的文件时 `up -d` 不会重启容器——这是第二个会静默不生效的步骤）；coturn 的 external-ip 冲突注释改成「保留先读到的那份（配置文件里的）」；日志口径按**阶段**写清（六段记、还没进协议层的那几步不记）；README 两处「旧版」统一成「改造前的老版本」；healthcheck 的失败消息带上探测地址；coturn 的配额算式改成算得出 64 的写法，并注明按 4.18 核过。
 >
+> **第三轮（同一批代理，针对上面这批修复）又提了 3 + 4 + 6 条措辞级 P2，都已修**：替换旧配对密码时先比对指纹（同一串再粘一遍不再说「被替换」）；`valuesReplaced` 的文案改直白；`turnserver.conf` 的配额算式与 §7.3 的公式统一成能算出 64 的写法；`--log-file=stdout` 的作用改成准确的说法（coturn 默认本来就往 stdout 打）；`external-ip` 的理由改成「官方只支持 IP，写域名会被解析一次、解析到 CDN 边缘 IP 或解析失败都会坏」（结论不变）；`.env.example` 补齐 `PAIR_STALE_AFTER_MS`；`PAIR_LISTEN` 的提醒补上「改端口还要同时改 Caddy 上游或 direct 模式的 `ports`」；生成密码的字符集注释补上 `0` `1`；调大 `PAIR_MAX_SESSIONS` 时提醒端口段与安全组放行要同步放大；README 的日志那一节补「握手中断走另一条日志」。三个代理的最终结论都是 `CLEAN`。
+>
 > **提交前最后一次全跑的证据**：`server-relay` 单测 **41**（含 `main.rs` 的健康检查目标）+ 集成 **22**、`cargo clippy --all-targets` 无警告、`cargo fmt --check` 干净；`src-tauri --lib` **135 passed / 9 ignored**；真实中继端到端 **8/8**（含多 Room 与其中的 P2P），另外单独验过「不设 `BONGO_PAIR_E2E_SERVER_PASSWORD` 时两端都拿到 403 与那句中文指引」；`eslint` / `tsc --noEmit` / `vitest` 51 条全绿；zh-CN 与 en-US 的 pair 键集完全对称（各 129 条，占位符一致）。
 >
 > **未验证（不要当成已验证）**：Docker 构建与 `docker compose up -d` 实跑、Caddy 的 ACME、coturn 的真实启动与配额计数与打洞、1GB 机器上的 OOM 现象、真机双端 P2P 打洞。审计环境里没有 Docker 与 coturn，这几项只有静态核对与常量算术。
@@ -288,7 +290,7 @@ X-Bongo-Protocol: 1
 - 生成入口：`cargo run --release --bin generate-pair -- --server`（`--all` 一次给服务器密码 + 配对密码）。
 - 日志：**凭据与会话相关的**拒绝路径各留一行（对端地址 + 阶段 + 状态码；按阶段是协议版本 / 服务器密码 / `ROOM_ID` / `Authorization` / 容量 / `deviceId` 六段），不含密码 / token / 完整 `ROOM_ID`；「还没进到协议层」的那几步（404、缺 `Upgrade` / `Sec-WebSocket-Version` / `Sec-WebSocket-Key`）不记，避免被公网扫描器刷满（R37）。
 - **`.env` 里的每一项都要在 compose 里逐项透传**（`X: ${X:-}`）：`.env` 是给 compose 做变量替换用的，容器不读这个文件本身——少一行就是「改了 `.env` 却完全没生效」（R37 的 P1-1）。留空值 = 用二进制里的默认值。
-- coturn 的配额按**整台服务器**给（只有一张静态凭据、`iceServers` 是统一广告的）：`user-quota ≈ 2 × (PAIR_MAX_SESSIONS + 2)`（R37 的 P1-2）。
+- coturn 的配额按**整台服务器**给（只有一张静态凭据、`iceServers` 是统一广告的）：每一组约占 2 个分配，所以 `user-quota ≈ 2 × PAIR_MAX_SESSIONS` 再留余量——默认 20 组给到 `user-quota=64` / `total-quota=128`（R37 的 P1-2）。`PAIR_MAX_SESSIONS` 调大时这两个数要跟着调，否则「双方都在大内网」的那几组会拿不到分配（日志正常、打洞失败）。
 - 容器健康检查 `--health-check` 探的地址跟着 `PAIR_LISTEN` 的主机走（通配地址才回落回环），两个超时各 1 秒（compose 的 `timeout: 3s` 之内）。
 
 ## 7.4 验收

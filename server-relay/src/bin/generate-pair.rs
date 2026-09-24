@@ -22,8 +22,8 @@ use bongocat_pair_relay::auth;
 use bongocat_pair_relay::protocol::MIN_SERVER_PASSWORD_LENGTH;
 use rand::Rng as _;
 
-/// 服务器密码的长度：取 24 字节随机数，逐个映射到 57 个**去掉易混字符（I / O / l）**
-/// 的字母数字字符集，得到 24 个字符（约 139 bit 熵，远超 16 字符的最小长度要求）。
+/// 服务器密码的长度：取 24 字节随机数，逐个映射到 57 个**去掉易混字符（`I` `O` `l`
+/// `0` `1`）**的字母数字字符集，得到 24 个字符（约 139 bit 熵，远超 16 字符的最小长度要求）。
 const SERVER_PASSWORD_BYTES: usize = 24;
 
 /// 同时打印「这个密钥属于哪个会话」的指纹（§29：日志与终端都不输出完整 ROOM_ID）
