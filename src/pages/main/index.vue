@@ -13,6 +13,7 @@ import { nth } from 'es-toolkit/compat'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import ChatOverlay from '@/components/chat-overlay/index.vue'
 import { useAppMenu } from '@/composables/useAppMenu'
 import { useDevice } from '@/composables/useDevice'
 import { useGamepad } from '@/composables/useGamepad'
@@ -21,11 +22,12 @@ import { useModel } from '@/composables/useModel'
 import { RECORDING_LIMIT_SECS } from '@/composables/usePair'
 import { usePairVoiceRecorder } from '@/composables/usePairVoice'
 import { useTauriListen } from '@/composables/useTauriListen'
-import { LISTEN_KEY } from '@/constants'
+import { CHAT_OVERLAY_RATIO, LISTEN_KEY } from '@/constants'
 import { hideWindow, setAlwaysOnTop, setTaskbarVisibility, showWindow } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
 import { useGeneralStore } from '@/stores/general.ts'
 import { useModelStore } from '@/stores/model'
+import { usePairStore } from '@/stores/pair'
 import { useShortcutStore } from '@/stores/shortcut'
 import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
@@ -35,11 +37,12 @@ import { clearObject } from '@/utils/shared'
 
 const { startListening } = useDevice()
 const appWindow = getCurrentWebviewWindow()
-const { modelSize, handleLoad, handleDestroy, handleResize, handleKeyChange } = useModel()
+const { modelSize, handleLoad, handleDestroy, handleKeyChange } = useModel()
 const catStore = useCatStore()
 const { getBaseMenu, getExitMenu } = useAppMenu()
 const modelStore = useModelStore()
 const generalStore = useGeneralStore()
+const pairStore = usePairStore()
 const shortcutStore = useShortcutStore()
 const { pushToTalk } = storeToRefs(shortcutStore)
 const {
@@ -54,6 +57,23 @@ const {
 const resizing = ref(false)
 const backgroundImagePath = ref<string>()
 const { stickActive } = useGamepad()
+
+/**
+ * R39：猫咪窗口上那条聊天浮层只在**开启双人联机**时出现。
+ *
+ * 它占窗口顶上一块（高度按 `CHAT_OVERLAY_RATIO` 相对模型高度算），猫咪本体贴底不动，
+ * 所以窗口总高 = 模型高 × (1 + 比例)。没开联机时窗口尺寸与过去完全一样。
+ */
+const overlayVisible = computed(() => pairStore.settings.enabled)
+
+/** 猫咪本体占窗口的百分比：浮层出现时把上面那块让出来 */
+const modelAreaPercent = computed(() => {
+  const ratio = overlayVisible.value ? CHAT_OVERLAY_RATIO : 0
+
+  return 100 / (1 + ratio)
+})
+
+const overlayAreaPercent = computed(() => 100 - modelAreaPercent.value)
 
 /** 录音提示、失败原因与「太短没发出去」共用一块位置 */
 const showVoiceOverlay = computed(() => {
@@ -74,10 +94,45 @@ onMounted(startListening)
 
 onUnmounted(handleDestroy)
 
-const debouncedResize = useDebounceFn(async () => {
-  await handleResize()
+/**
+ * 目标窗口尺寸（物理像素）：模型尺寸 × 缩放，开着联机时再给聊天浮层留一条（R39）。
+ *
+ * 窗口的比例从此由**模型 + 浮层**决定，不再是「模型比例」：`useModel().handleResize()`
+ * 那条「比例不对就把窗口按模型比例摆正」的纠正在这里用不了，会把浮层那一条挤掉，
+ * 所以猫咪窗口自己算尺寸。
+ */
+function targetWindowSize(scale = catStore.window.scale) {
+  if (!modelSize.value) return
 
+  const { width, height } = modelSize.value
+  const overlayHeight = overlayVisible.value ? height * CHAT_OVERLAY_RATIO : 0
+  const factor = scale / 100
+
+  return {
+    width: Math.round(width * factor),
+    height: Math.round((height + overlayHeight) * factor),
+  }
+}
+
+const debouncedResize = useDebounceFn(async () => {
   resizing.value = false
+
+  if (!modelSize.value) return
+
+  // 窗口被拉大/拉小时改的是「缩放」，比例始终由模型 (+浮层) 决定
+  const nextScale = Math.max(10, Math.min(500, round((innerWidth / modelSize.value.width) * 100)))
+
+  if (nextScale !== catStore.window.scale) {
+    catStore.window.scale = nextScale
+
+    return
+  }
+
+  const target = targetWindowSize()
+
+  if (!target || (innerWidth === target.width && innerHeight === target.height)) return
+
+  await appWindow.setSize(new PhysicalSize(target))
 }, 100)
 
 useEventListener('resize', () => {
@@ -89,7 +144,8 @@ useEventListener('resize', () => {
 watch(() => modelStore.currentModel, async (model) => {
   if (!model) return
 
-  await handleLoad()
+  // R39：换模型时把聊天浮层那一条也算进窗口高度
+  await handleLoad(overlayVisible.value ? CHAT_OVERLAY_RATIO : 0)
 
   const path = join(model.path, 'resources', 'background.png')
 
@@ -117,18 +173,23 @@ watch(() => modelStore.currentModel, async (model) => {
   modelStore.modelReady = true
 }, { deep: true, immediate: true })
 
-watch([() => catStore.window.scale, modelSize], async ([scale, modelSize]) => {
-  if (!modelSize) return
+watch([() => catStore.window.scale, modelSize, overlayVisible], async () => {
+  const target = targetWindowSize()
 
-  const { width, height } = modelSize
+  if (!target) return
 
-  appWindow.setSize(
-    new PhysicalSize({
-      width: Math.round(width * (scale / 100)),
-      height: Math.round(height * (scale / 100)),
-    }),
-  )
+  await appWindow.setSize(new PhysicalSize(target))
 }, { immediate: true })
+
+/**
+ * R39：进输入框 = 这一段输入不算猫的活动。
+ *
+ * 交给 `usePairState` 与 `useDevice` 读同一个标志：前者停发宠物快照并先让对方把猫放下，
+ * 后者不把键盘事件喂给本机贴图。离开输入框时两边各自恢复。
+ */
+function handleChatFocus(focused: boolean) {
+  pairStore.runtime.localInputPaused = focused
+}
 
 watch([modelStore.pressedKeys, stickActive], ([keys, stickActive]) => {
   const dirs = Object.values(keys).map((path) => {
@@ -210,8 +271,7 @@ function handleMouseMove(event: MouseEvent) {
 
 <template>
   <div
-    class="relative size-screen overflow-hidden children:(absolute size-full)"
-    :class="{ '-scale-x-100': catStore.model.mirror }"
+    class="relative size-screen overflow-hidden"
     :style="{
       opacity: catStore.window.opacity / 100,
       borderRadius: `${catStore.window.radius}%`,
@@ -220,24 +280,49 @@ function handleMouseMove(event: MouseEvent) {
     @mousedown="handleMouseDown"
     @mousemove="handleMouseMove"
   >
-    <img
-      v-if="backgroundImagePath"
-      class="object-cover"
-      :src="backgroundImagePath"
+    <!--
+      猫咪本体：贴底、按模型比例占一块。镜像只作用在这一层——
+      放在根节点上会把 R39 的聊天浮层连文字一起镜像过去。
+    -->
+    <div
+      class="absolute inset-x-0 bottom-0 overflow-hidden children:(absolute size-full)"
+      :class="{ '-scale-x-100': catStore.model.mirror }"
+      :style="{ height: `${modelAreaPercent}%` }"
     >
+      <img
+        v-if="backgroundImagePath"
+        class="object-cover"
+        :src="backgroundImagePath"
+      >
 
-    <canvas id="live2dCanvas" />
+      <canvas id="live2dCanvas" />
 
-    <img
-      v-for="path in modelStore.pressedKeys"
-      :key="path"
-      class="object-cover"
-      :src="convertFileSrc(path)"
+      <img
+        v-for="path in modelStore.pressedKeys"
+        :key="path"
+        class="object-cover"
+        :src="convertFileSrc(path)"
+      >
+    </div>
+
+    <!-- R39：聊天浮层。只在开启双人联机时占位置，猫咪本体不会被它遮住 -->
+    <div
+      v-if="overlayVisible"
+      class="absolute inset-x-0 top-0"
+      :style="{ height: `${overlayAreaPercent}%` }"
     >
+      <ChatOverlay
+        :recording="recording"
+        :recording-seconds="recordingSeconds"
+        @focus-change="handleChatFocus"
+        @voice-start="pressToTalk"
+        @voice-stop="releaseToTalk"
+      />
+    </div>
 
     <div
       v-show="resizing || !modelStore.modelReady"
-      class="flex items-center justify-center bg-black"
+      class="absolute inset-0 flex items-center justify-center bg-black"
     >
       <span class="text-center text-[10vw] text-[#fff]">
         {{ resizing ? $t('pages.main.hints.redrawing') : $t('pages.main.hints.switching') }}
@@ -246,10 +331,10 @@ function handleMouseMove(event: MouseEvent) {
 
     <div
       v-show="showVoiceOverlay"
-      class="flex flex-col items-center justify-end gap-1 pb-[4%]"
+      class="absolute inset-x-0 bottom-0 flex flex-col items-center gap-1 pb-[4%]"
     >
       <div
-        v-if="recording"
+        v-if="recording && !overlayVisible"
         class="pointer-events-auto flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
         @mousedown.stop
       >
@@ -274,7 +359,7 @@ function handleMouseMove(event: MouseEvent) {
       </div>
 
       <div
-        v-else
+        v-else-if="recordingSkipped"
         class="bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
       >
         {{ $t('pages.main.hints.recordingTooShort') }}

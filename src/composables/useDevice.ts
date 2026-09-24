@@ -8,11 +8,12 @@ import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useAppStore } from '@/stores/app'
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
+import { usePairStore } from '@/stores/pair'
 import { inBetween } from '@/utils/is'
 import { getCursorMonitor } from '@/utils/monitor'
 import { isMac, isWindows } from '@/utils/platform'
 
-import { INVOKE_KEY, LISTEN_KEY, WINDOW_LABEL } from '../constants'
+import { CHAT_OVERLAY_RATIO, INVOKE_KEY, LISTEN_KEY, WINDOW_LABEL } from '../constants'
 import { getSupportedKey as resolveSupportedKey, useModel } from './useModel'
 import { usePairState } from './usePairState'
 import { useTauriListen } from './useTauriListen'
@@ -47,6 +48,7 @@ export function useDevice() {
   const releaseTimers = new Map<string, NodeJS.Timeout>()
   const appStore = useAppStore()
   const catStore = useCatStore()
+  const pairStore = usePairStore()
   const latestCursorPoint = ref<CursorPoint>()
   const smoothedCursorPoint = ref<CursorPoint>()
   const scaleFactor = ref(1)
@@ -119,7 +121,15 @@ export function useDevice() {
       const isInWindow = inBetween(x, winX, winX + width)
         && inBetween(y, winY, winY + height)
 
-      if (isInWindow === wasInWindow) return
+      // R39：开着双人联机时，窗口顶上那一条是聊天浮层。鼠标停在它上面不该让窗口淡出，
+      // 否则「悬停就变透明」会把输入框也一起藏掉，根本点不到
+      const overlayBand = pairStore.settings.enabled
+        ? height * (CHAT_OVERLAY_RATIO / (1 + CHAT_OVERLAY_RATIO))
+        : 0
+      const isOverOverlay = overlayBand > 0 && y <= winY + overlayBand
+      const shouldHide = isInWindow && !isOverOverlay
+
+      if (shouldHide === wasInWindow) return
 
       if (timer) {
         clearTimeout(timer)
@@ -127,7 +137,7 @@ export function useDevice() {
         timer = void 0
       }
 
-      if (isInWindow) {
+      if (shouldHide) {
         timer = setTimeout(() => {
           document.body.style.setProperty('opacity', '0')
 
@@ -139,7 +149,7 @@ export function useDevice() {
         appWindow.setIgnoreCursorEvents(catStore.window.passThrough)
       }
 
-      wasInWindow = isInWindow
+      wasInWindow = shouldHide
     }
   })()
 
@@ -183,6 +193,10 @@ export function useDevice() {
 
   useTauriListen<DeviceEvent>(LISTEN_KEY.DEVICE_CHANGED, ({ payload }) => {
     const { kind, value } = payload
+
+    // R39：正在猫咪窗口的聊天浮层里打字。这段输入属于「在写消息」，不是「在敲猫」：
+    // 本机不按贴图、也不发给对方（鼠标位置除外，让对方的猫继续跟着指针看）
+    if (pairStore.runtime.localInputPaused && kind !== 'MouseMove') return
 
     if (kind === 'KeyboardPress' || kind === 'KeyboardRelease') {
       // R2：左右手判定必须用 rdev 的原始键名，不能先过 getSupportedKey 的归一化

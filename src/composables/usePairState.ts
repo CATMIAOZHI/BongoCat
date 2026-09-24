@@ -77,6 +77,8 @@ export function usePairState() {
     return store.settings.enabled
       && store.runtime.peerOnline
       && !store.settings.privacy.pauseActivitySync
+      // R39：正在猫咪窗口的聊天浮层里打字，这段时间不算「猫的活动」
+      && !store.runtime.localInputPaused
   }
 
   const canSendStats = () => {
@@ -247,6 +249,14 @@ export function usePairState() {
     }
   }
 
+  /** 让对方立刻把猫放下：暂停同步、以及 R39 进输入框时都用这一份空快照 */
+  const clearedSnapshot = () => {
+    return sanitizeSnapshot({
+      keyboard: { active: false, leftHand: false, rightHand: false, intensity: 0, keys: [] },
+      pointer: { active: false, x: 0.5, y: 0.5, speed: 0, leftDown: false, rightDown: false },
+    })
+  }
+
   onMounted(() => {
     // 启动时先按本地日期校正一次，避免上次运行的「今日」数据被当成今天
     if (rolloverStats(store.stats, today())) sendStats()
@@ -292,16 +302,24 @@ export function usePairState() {
   watch(() => store.settings.privacy.pauseActivitySync, (paused) => {
     if (paused) {
       // §52：暂停后不再发送活动，先让对方把猫放下
-      void pairSendPetState(
-        sanitizeSnapshot({
-          keyboard: { active: false, leftHand: false, rightHand: false, intensity: 0, keys: [] },
-          pointer: { active: false, x: 0.5, y: 0.5, speed: 0, leftDown: false, rightDown: false },
-        }),
-      ).catch(() => void 0)
+      void pairSendPetState(clearedSnapshot()).catch(() => void 0)
     } else {
       resetActivity()
       sendSnapshot(true)
     }
+  })
+
+  // R39：在猫咪窗口的聊天浮层里打字时同样停发，并先让对方把猫放下；
+  // 离开输入框再把这一段时间累积的状态补发一次
+  watch(() => store.runtime.localInputPaused, (paused) => {
+    if (paused) {
+      void pairSendPetState(clearedSnapshot()).catch(() => void 0)
+
+      return
+    }
+
+    resetActivity()
+    sendSnapshot(true)
   })
 
   watch(() => store.settings.enabled, (enabled) => {

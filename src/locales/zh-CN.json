@@ -6,7 +6,12 @@
         "switching": "切换中...",
         "recording": "录音中 {seconds}s / {limit}s",
         "cancelRecording": "取消这次录音",
-        "recordingTooShort": "按得太短，没有发送"
+        "recordingTooShort": "按得太短，没有发送",
+        "send": "发送",
+        "voice": "语音",
+        "bubbleImage": "[图片]",
+        "bubbleVoice": "[语音]",
+        "bubbleFile": "[文件]"
       }
     },
     "remoteCat": {

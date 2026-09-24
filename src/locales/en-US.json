@@ -6,7 +6,12 @@
         "switching": "Switching...",
         "recording": "Recording {seconds}s / {limit}s",
         "cancelRecording": "Discard this recording",
-        "recordingTooShort": "Too short, nothing was sent"
+        "recordingTooShort": "Too short, nothing was sent",
+        "send": "Send",
+        "voice": "Voice",
+        "bubbleImage": "[Image]",
+        "bubbleVoice": "[Voice]",
+        "bubbleFile": "[File]"
       }
     },
     "remoteCat": {
