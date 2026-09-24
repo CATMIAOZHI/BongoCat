@@ -52,22 +52,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-
+          # 只构建 Windows：双人联机只在 Windows 上实现和验证过，macOS / Linux
+          # 的包在这里没人用，白等几分钟 runner。要恢复上游的全平台，把
+          # macos-latest（aarch64 / x86_64-apple-darwin）与 ubuntu-22.04 /
+          # ubuntu-22.04-arm（x86_64 / aarch64-unknown-linux-gnu）加回来，并把
+          # 下面那段「Install dependencies (ubuntu only)」一起恢复即可。
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
           - platform: windows-latest
             target: i686-pc-windows-msvc
           - platform: windows-latest
             target: aarch64-pc-windows-msvc
-
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -83,13 +78,6 @@ jobs:
 
       - name: Install rust target
         run: rustup target add ${{ matrix.target }}
-
-      - name: Install dependencies (ubuntu only)
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          # libasound2-dev / pkg-config：语音录音用的 cpal 在 Linux 上经 alsa-sys 链接 ALSA
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libudev-dev patchelf xdg-utils pkg-config libasound2-dev
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
