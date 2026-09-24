@@ -17,8 +17,8 @@ import { usePairStore } from '@/stores/pair'
  * （麦克风 + 输入框 + 发送）。消息仍然以 Rust 侧 SQLite 为准，这里只保存本窗口读出来的
  * 那一部分，和聊天窗口是同一套读取方式。
  *
- * 输入框聚焦期间要把本机输入从「猫的活动」里摘出去，否则打字会被全局键鼠监听当成按键：
- * 自己的猫按住贴图，对方还会看到你在按什么。这一步由父窗口落地（`focusChange`）。
+ * 在这里打字**也算猫的活动**（用户要求）：浮层不做任何「暂停同步」的动作，全局键鼠监听
+ * 照旧把这段输入喂给本机贴图与对方，所以自己的猫和对方的猫都会跟着按。
  */
 const props = defineProps<{
   /** 是否正在录音。录音实体在父窗口那一份会话里，这里只负责显示与开合 */
@@ -27,7 +27,6 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  focusChange: [focused: boolean]
   voiceStart: []
   voiceStop: []
 }>()
@@ -85,14 +84,6 @@ function bubbleText(message: ChatMessage) {
   if (message.kind === 'voice') return t('pages.main.hints.bubbleVoice')
 
   return t('pages.main.hints.bubbleFile')
-}
-
-function handleFocus() {
-  emit('focusChange', true)
-}
-
-function handleBlur() {
-  emit('focusChange', false)
 }
 
 async function handleSend() {
@@ -190,8 +181,6 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
         class="min-w-0 flex-1 resize-none text-[3.4vw] leading-[1.4] outline-none bg-transparent placeholder:color-white/40"
         :placeholder="hint || $t('pages.chat.placeholders.input')"
         rows="1"
-        @blur="handleBlur"
-        @focus="handleFocus"
         @keydown="handleKeydown"
       />
 

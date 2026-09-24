@@ -181,16 +181,6 @@ watch([() => catStore.window.scale, modelSize, overlayVisible], async () => {
   await appWindow.setSize(new PhysicalSize(target))
 }, { immediate: true })
 
-/**
- * R39：进输入框 = 这一段输入不算猫的活动。
- *
- * 交给 `usePairState` 与 `useDevice` 读同一个标志：前者停发宠物快照并先让对方把猫放下，
- * 后者不把键盘事件喂给本机贴图。离开输入框时两边各自恢复。
- */
-function handleChatFocus(focused: boolean) {
-  pairStore.runtime.localInputPaused = focused
-}
-
 watch([modelStore.pressedKeys, stickActive], ([keys, stickActive]) => {
   const dirs = Object.values(keys).map((path) => {
     return nth(path.split(sep()), -2)!
@@ -314,7 +304,6 @@ function handleMouseMove(event: MouseEvent) {
       <ChatOverlay
         :recording="recording"
         :recording-seconds="recordingSeconds"
-        @focus-change="handleChatFocus"
         @voice-start="pressToTalk"
         @voice-stop="releaseToTalk"
       />

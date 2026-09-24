@@ -77,8 +77,6 @@ export function usePairState() {
     return store.settings.enabled
       && store.runtime.peerOnline
       && !store.settings.privacy.pauseActivitySync
-      // R39：正在猫咪窗口的聊天浮层里打字，这段时间不算「猫的活动」
-      && !store.runtime.localInputPaused
   }
 
   const canSendStats = () => {
@@ -307,19 +305,6 @@ export function usePairState() {
       resetActivity()
       sendSnapshot(true)
     }
-  })
-
-  // R39：在猫咪窗口的聊天浮层里打字时同样停发，并先让对方把猫放下；
-  // 离开输入框再把这一段时间累积的状态补发一次
-  watch(() => store.runtime.localInputPaused, (paused) => {
-    if (paused) {
-      void pairSendPetState(clearedSnapshot()).catch(() => void 0)
-
-      return
-    }
-
-    resetActivity()
-    sendSnapshot(true)
   })
 
   watch(() => store.settings.enabled, (enabled) => {

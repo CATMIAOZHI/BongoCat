@@ -194,10 +194,6 @@ export function useDevice() {
   useTauriListen<DeviceEvent>(LISTEN_KEY.DEVICE_CHANGED, ({ payload }) => {
     const { kind, value } = payload
 
-    // R39：正在猫咪窗口的聊天浮层里打字。这段输入属于「在写消息」，不是「在敲猫」：
-    // 本机不按贴图、也不发给对方（鼠标位置除外，让对方的猫继续跟着指针看）
-    if (pairStore.runtime.localInputPaused && kind !== 'MouseMove') return
-
     if (kind === 'KeyboardPress' || kind === 'KeyboardRelease') {
       // R2：左右手判定必须用 rdev 的原始键名，不能先过 getSupportedKey 的归一化
       pairState.handleKeyboard(value, kind === 'KeyboardPress')

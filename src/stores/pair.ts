@@ -145,13 +145,6 @@ export interface PairRuntime {
   remoteStats?: PairStatsPayload
   deviceId?: string
   lastError?: string
-  /**
-   * R39：正在猫咪窗口的聊天浮层里打字。
-   *
-   * 这个窗口的输入不该算成「猫的活动」：聚焦时既不发宠物快照，本机也不按贴图。
-   * 只是本窗口的瞬时状态，不进设置、不落盘（`runtime` 本来就不持久化）。
-   */
-  localInputPaused: boolean
 }
 
 export const usePairStore = defineStore('pair', () => {
@@ -220,7 +213,6 @@ export const usePairStore = defineStore('pair', () => {
     remoteStats: void 0,
     deviceId: void 0,
     lastError: void 0,
-    localInputPaused: false,
   })
 
   /** 是否已经保存过 Pair Secret（明文永远不会进入这个 store） */
