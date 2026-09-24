@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 pub const AUTH_INFO: &[u8] = b"bongocat-pair-auth-v1";
 pub const E2EE_INFO: &[u8] = b"bongocat-pair-e2ee-v1";
 pub const ROOM_INFO: &[u8] = b"bongocat-pair-room-v1";
+pub const SERVER_INFO: &[u8] = b"bongocat-pair-server-v1";
 pub const PAIR_SECRET_BYTES: usize = 32;
 
 /// HKDF-SHA256，salt 为空（RFC 5869 的「无 salt」与「32 字节零 salt」等价，
@@ -51,6 +52,23 @@ pub fn derive_root_key(secret: &[u8; PAIR_SECRET_BYTES]) -> [u8; 32] {
 /// 并用**独立实现的固定向量**守住两端派生不漂移。
 pub fn derive_room_id(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
     URL_SAFE_NO_PAD.encode(hkdf_sha256(secret, ROOM_INFO))
+}
+
+/// 从「服务器密码」派生客户端升级头里要带的凭据（R36，base64url 无填充，43 字符）。
+///
+/// 服务器密码是**部署者**在服务器上自己定的文本（不是 32 字节的 Pair Secret），所以
+/// 这里对任意长度的文本做同一套 HKDF：客户端填什么，中继就用同样的方式算一遍。
+/// 走 HKDF 而不是直接拿密码当 token，是为了让「密码」与「线上凭据」不是同一个值
+/// ——中继只保存凭据的摘要，日志里也不会出现密码本身。
+pub fn derive_server_token(password: &str) -> String {
+    URL_SAFE_NO_PAD.encode(hkdf_sha256(password.trim().as_bytes(), SERVER_INFO))
+}
+
+/// 服务器密码的不可逆 verifier：`SHA256(derive_server_token(password))`（与 Room 同一套纪律）。
+///
+/// 中继启动时算一次，之后**不再保留密码原文**；每个连接按同样方式算一份，做恒定时间比较。
+pub fn server_verifier(password: &str) -> [u8; 32] {
+    auth_verifier(&derive_server_token(password))
 }
 
 /// Room 的不可逆 verifier：`SHA256(AUTH_TOKEN)`（§7）。
@@ -216,6 +234,47 @@ mod tests {
         assert_eq!(
             room_fingerprint("r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97M"),
             fingerprint
+        );
+    }
+
+    /// R36：服务器密码的派生必须与 `src-tauri/src/core/pair/crypto.rs` 逐字节一致
+    /// ——两个 crate 各写一遍同一个向量，任何一侧漂移都会在 `cargo test` 里露出来。
+    /// 中文密码那一条同时守住「按 UTF-8 字节派生」，不是按 ASCII。
+    #[test]
+    fn derives_the_server_token_vector() {
+        assert_eq!(
+            derive_server_token("bongo-server-password"),
+            "qi0Bz36jIJ_OpjN86BJihPxefEIuxps8XLYTOBlmEmc"
+        );
+        assert_eq!(
+            derive_server_token("长密码测试-服务器密码"),
+            "Q_HFVsHDdAD1cs13Z806GPaJU9lye7ENW3eKwTEThyU"
+        );
+        // 前后空白是复制粘贴的常态，不参与派生
+        assert_eq!(
+            derive_server_token("  bongo-server-password\n"),
+            derive_server_token("bongo-server-password")
+        );
+    }
+
+    /// 中继唯一保存下来的那份摘要：它必须是个**稳定**的固定向量（不是「不含密码」这种
+    /// 没有意义的性质——SHA256 的输出本来就没有这种约束）。
+    #[test]
+    fn the_server_verifier_is_a_stable_digest() {
+        let verifier = server_verifier("bongo-server-password");
+
+        assert_eq!(verifier, server_verifier("bongo-server-password"));
+        assert_ne!(verifier, server_verifier("bongo-server-password2"));
+
+        // 摘要本身也钉一个固定向量：它是中继唯一保存下来的东西，
+        // 这里漂移一次，所有已经部署好的服务器都会在升级后一夜之间连不上
+        assert_eq!(
+            verifier,
+            [
+                0x18, 0x5a, 0xe7, 0x70, 0x55, 0x9c, 0x80, 0xd2, 0x5f, 0x3b, 0x27, 0x59, 0x91, 0xc7,
+                0x36, 0xfa, 0x6d, 0x0c, 0x43, 0x4f, 0x68, 0x85, 0x1b, 0xf6, 0x06, 0xc3, 0x98, 0xd6,
+                0xf0, 0x97, 0x75, 0x9a
+            ]
         );
     }
 

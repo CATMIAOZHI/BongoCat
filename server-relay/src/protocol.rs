@@ -27,6 +27,20 @@ pub const HEADER_PROTOCOL: &str = "x-bongo-protocol";
 /// 带这个头的新客户端仍然能连**旧** Cloudflare 中继（那边直接忽略它，§5 / §17）。
 pub const HEADER_ROOM: &str = "x-bongo-room";
 
+/// 服务器密码派生出来的凭据（R36）。它是**服务器级**的门槛，与 Room 无关：
+/// 一个能连上你的人也必须知道部署者在服务器上设的密码，否则连一次握手都拿不到。
+///
+/// 它同样只是一个 HTTP 升级头：旧客户端不发它（会被这一版中继拒），带它的新客户端
+/// 连旧自建中继与 Cloudflare 版都照旧可用（那边忽略未知头）。
+pub const HEADER_SERVER: &str = "x-bongo-server";
+
+/// 服务器密码的最小长度（部署者在 `.env` 里设置）。
+///
+/// 太短的密码会让「门槛」变成摆设：它保护的是「别人能不能白用你的服务器与 TURN」，
+/// 而服务器没有任何其它限速手段。16 个字符已经远超在线爆破的可行范围（每次尝试都
+/// 要先建一条 TCP + 发一次握手）。
+pub const MIN_SERVER_PASSWORD_LENGTH: usize = 16;
+
 /// 每个应用帧固定 14 字节明文帧头：kind(1) | flags(1) | transferId(8) | seq(4)
 pub const FRAME_HEADER_SIZE: usize = 14;
 
@@ -36,7 +50,7 @@ pub const MAX_FRAME_KIND: u8 = 8;
 /// 单帧上限（整帧，含帧头与 nonce/tag）
 pub const MAX_BINARY_FRAME_SIZE: usize = 1024 * 1024;
 
-/// 一个 Room（一个联机密钥）永远只有两台设备
+/// 一个 Room（一个配对密码）永远只有两台设备
 pub const PAIR_SIZE: usize = 2;
 
 /// 一套服务器同时承载的双人会话数上限（§2）。超出的**新会话**会被拒（HTTP 503），

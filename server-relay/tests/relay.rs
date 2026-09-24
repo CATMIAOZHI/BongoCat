@@ -18,9 +18,12 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use bongocat_pair_relay::protocol::{self, close_code, Limits};
 use bongocat_pair_relay::relay::Relay;
 use bongocat_pair_relay::server::{self, Config};
+use bongocat_pair_relay::{
+    auth,
+    protocol::{self, close_code, Limits},
+};
 
 /// 两个互不相干的会话：多会话的隔离性全靠它们来验
 const ROOM_A: &str = "room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -29,6 +32,22 @@ const ROOM_C: &str = "room-cccccccccccccccccccccccccccccccccccccc";
 const TOKEN_A: &str = "token-a";
 const TOKEN_B: &str = "token-b";
 const TOKEN_C: &str = "token-c";
+
+/// R36：这一版中继**必须**配服务器密码，测试用一个固定值（长度满足最小值要求）
+const SERVER_PASSWORD: &str = "relay-tests-server-password";
+
+fn server_token() -> String {
+    auth::derive_server_token(SERVER_PASSWORD)
+}
+
+/// 造一个合法的（43 个 base64url 字符）、和别人都不一样的会话标识。
+///
+/// 「服务器密码被拒的尝试一个名额都不占」这条用例必须**每次换一个 Room**才有意义：
+/// 都用同一个 Room 的话，被拒的请求即使错误地占下了名额，同一个 Room 的后续连接
+/// 也会因为摘要一致而照样成功，用例照样绿。
+fn room(seed: char) -> String {
+    format!("room-{}", seed.to_string().repeat(38))
+}
 
 const PATIENCE: Duration = Duration::from_secs(5);
 /// 负向断言等的时长：足够让一条真的会串房的帧走到对面
@@ -53,12 +72,14 @@ async fn start_relay_with(
         max_sessions,
         stale_after,
         ice_servers: ice_servers.clone(),
+        server_verifier: auth::server_verifier(SERVER_PASSWORD),
     };
     let relay = Relay::new(
         config.limits,
         config.max_sessions,
         config.stale_after,
         ice_servers,
+        config.server_verifier,
     );
 
     tokio::spawn(server::serve(listener, relay));
@@ -73,6 +94,27 @@ async fn connect(
     protocol_version: &str,
     device_id: &str,
 ) -> Result<Client, WsError> {
+    connect_with_server(
+        address,
+        room_id,
+        token,
+        protocol_version,
+        device_id,
+        &server_token(),
+    )
+    .await
+}
+
+/// 与 [`connect`] 相同，但可以指定（或省掉）`X-Bongo-Server`：只有 R36 的几条负向
+/// 用例需要它，其它用例一律走 [`connect`]——这样「默认情况下服务器密码一定是对的」。
+async fn connect_with_server(
+    address: SocketAddr,
+    room_id: &str,
+    token: &str,
+    protocol_version: &str,
+    device_id: &str,
+    server: &str,
+) -> Result<Client, WsError> {
     let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
 
     {
@@ -82,6 +124,10 @@ async fn connect(
         headers.insert("x-bongo-client", device_id.parse().unwrap());
         headers.insert("x-bongo-protocol", protocol_version.parse().unwrap());
         headers.insert("x-bongo-room", room_id.parse().unwrap());
+
+        if !server.is_empty() {
+            headers.insert("x-bongo-server", server.parse().unwrap());
+        }
     }
 
     let (socket, _) = connect_async(request).await?;
@@ -108,7 +154,26 @@ async fn handshake_status_with(
     protocol_version: &str,
     device_id: &str,
 ) -> u16 {
-    match connect(address, room_id, token, protocol_version, device_id).await {
+    handshake_status_with_server(
+        address,
+        room_id,
+        token,
+        protocol_version,
+        device_id,
+        &server_token(),
+    )
+    .await
+}
+
+async fn handshake_status_with_server(
+    address: SocketAddr,
+    room_id: &str,
+    token: &str,
+    protocol_version: &str,
+    device_id: &str,
+    server: &str,
+) -> u16 {
+    match connect_with_server(address, room_id, token, protocol_version, device_id, server).await {
         Ok(_) => 101,
         Err(WsError::Http(response)) => response.status().as_u16(),
         Err(other) => panic!("期望 HTTP 错误，实际 {other:?}"),
@@ -185,11 +250,90 @@ async fn health_is_public_and_unknown_paths_are_not_found() {
     assert!(response.contains("\"protocol\":1"));
     // §28：只说自己是多会话模式，不暴露任何会话列表
     assert!(response.contains("\"mode\":\"multi-pair\""));
+    // R36：部署者一条 curl 就能确认自己装对了（密码是必填项）
+    assert!(response.contains("\"passwordRequired\":true"));
     assert!(!response.contains(ROOM_A));
 
     let response = raw_request(address, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
 
     assert!(response.starts_with("HTTP/1.1 404 "), "实际：{response}");
+}
+
+/// R36：服务器密码是**最外层**的门槛。
+///
+/// 没有它的人不该能建会话、不该能探测 Room 是否存在、更不该走到 `server.welcome`
+/// （那里带着按流量计费的 TURN 凭据）。两种拒绝（没带 / 带错）用同一个状态码 403，
+/// 但响应体不同，便于部署者自查。
+#[tokio::test]
+async fn the_server_password_gates_the_upgrade() {
+    let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
+
+    // 完全没带
+    assert_eq!(
+        handshake_status_with_server(address, ROOM_A, TOKEN_A, "1", "aaaa", "").await,
+        403
+    );
+    // 带错的
+    assert_eq!(
+        handshake_status_with_server(address, ROOM_A, TOKEN_A, "1", "aaaa", "wrong-password").await,
+        403
+    );
+    // 带对的：照常进
+    assert_eq!(
+        handshake_status_with_server(address, ROOM_A, TOKEN_A, "1", "aaaa", &server_token()).await,
+        101
+    );
+
+    // 响应体要把两种拒绝分开（客户端与部署者都靠它定位）
+    let missing = raw_request(
+        address,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         X-Bongo-Protocol: 1\r\nX-Bongo-Room: room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+         Authorization: Bearer token-a\r\n\r\n",
+    )
+    .await;
+
+    assert!(missing.starts_with("HTTP/1.1 403 "), "实际：{missing}");
+    assert!(
+        missing.contains("server password required"),
+        "实际：{missing}"
+    );
+
+    let wrong = raw_request(
+        address,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         X-Bongo-Protocol: 1\r\nX-Bongo-Room: room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+         X-Bongo-Server: wrong-password\r\nAuthorization: Bearer token-a\r\n\r\n",
+    )
+    .await;
+
+    assert!(wrong.starts_with("HTTP/1.1 403 "), "实际：{wrong}");
+    assert!(wrong.contains("server password incorrect"), "实际：{wrong}");
+}
+
+/// R36：被 403 挡掉的尝试**一个名额都不该占**——否则陌生人用错的密码刷几下
+/// 就能让别人进不来（那正好是这道门槛要防的事）。
+#[tokio::test]
+async fn a_rejected_server_password_never_consumes_a_session_slot() {
+    let address = start_relay_with(Limits::default(), 1, Duration::from_secs(120), None).await;
+
+    // 三次错密码各用一个**全新**的 Room：如果闸门被挪到占名额之后，它们会各建一个
+    // Room 并把唯一的名额用光，下面那次真用户的连接就会拿到 503 而不是 101
+    for seed in ['1', '2', '3'] {
+        assert_eq!(
+            handshake_status_with_server(address, &room(seed), TOKEN_C, "1", "aaaa", "wrong").await,
+            403
+        );
+    }
+
+    // 唯一的名额仍然留给真正的用户
+    assert_eq!(
+        handshake_status_with_server(address, &room('9'), TOKEN_C, "1", "aaaa", &server_token())
+            .await,
+        101
+    );
 }
 
 #[tokio::test]
@@ -236,7 +380,14 @@ async fn rejects_bad_auth_protocol_and_device_ids() {
 #[tokio::test]
 async fn the_room_header_is_required_and_validated() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let head = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nX-Bongo-Protocol: 1\r\nAuthorization: Bearer token-a\r\nX-Bongo-Client: aaaa\r\n";
+    // R36：服务器密码在最前面，所以这条用例必须带上它，才能走到 Room 的校验
+    let head = format!(
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         X-Bongo-Protocol: 1\r\nX-Bongo-Server: {}\r\nAuthorization: Bearer token-a\r\n\
+         X-Bongo-Client: aaaa\r\n",
+        server_token()
+    );
 
     // 完全没带 X-Bongo-Room
     let response = raw_request(address, &format!("{head}\r\n")).await;
@@ -448,7 +599,7 @@ async fn rooms_are_isolated_end_to_end() {
     assert_eq!(offline["deviceId"], "b2");
 }
 
-/// §9：同一个会话上拿错联机密钥 = 401，而且不会因此多出一个会话
+/// §9：同一个会话上拿错配对密码 = 401，而且不会因此多出一个会话
 #[tokio::test]
 async fn a_wrong_token_on_an_existing_room_is_refused() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;

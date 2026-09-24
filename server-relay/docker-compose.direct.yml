@@ -9,15 +9,29 @@
 #    客户端在填了明文地址时也会显示一条同样的提醒。
 #
 # 客户端填法：服务器地址填 <公网 IP>:8080（不带 scheme，客户端会按 ws:// 处理）。
+# 别忘了在云控制台的安全组里放行 **TCP 8080**，否则容器起来了客户端也连不上。
 
 services:
   relay:
     build: .
     restart: unless-stopped
     environment:
-      PAIR_LISTEN: 0.0.0.0:8080
+      PAIR_LISTEN: ${PAIR_LISTEN:-0.0.0.0:8080}
+      # 必填（R36）：同 docker-compose.yml，客户端要填同一个值
+      PAIR_SERVER_PASSWORD: ${PAIR_SERVER_PASSWORD:?请先在 .env 里设置 PAIR_SERVER_PASSWORD}
       PAIR_MAX_SESSIONS: ${PAIR_MAX_SESSIONS:-20}
+      # 客户端按广告值的 2/3 推导**帧**速率：广告 90 → 客户端 60
       PAIR_MAX_FRAMES_PER_SECOND: ${PAIR_MAX_FRAMES_PER_SECOND:-90}
-      # PAIR_ICE_SERVERS: '[{"urls":["stun:cat.example.com:3478"]}]'
+      # 这几项必须在这里透传（写进 .env 是给 compose 做替换用的，容器不读 .env 文件本身）
+      PAIR_MAX_CHUNKS_PER_SECOND: ${PAIR_MAX_CHUNKS_PER_SECOND:-}
+      PAIR_MAX_BYTES_PER_SECOND: ${PAIR_MAX_BYTES_PER_SECOND:-}
+      PAIR_STALE_AFTER_MS: ${PAIR_STALE_AFTER_MS:-}
+      PAIR_ICE_SERVERS: ${PAIR_ICE_SERVERS:-}
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "bongocat-pair-relay", "--health-check"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s

@@ -5,7 +5,12 @@
 #   docker compose -f docker-compose.yml -f docker-compose.coturn.yml up -d
 #   docker compose -f docker-compose.yml -f docker-compose.coturn.yml down
 #
-# 起来之后把地址写进主 compose 的 PAIR_ICE_SERVERS（见 README 的「可选：STUN/TURN」）。
+# 起来之后把地址写进 .env 的 PAIR_ICE_SERVERS（见 README 的「可选：STUN/TURN」）。
+#
+# 上线前记得改 turnserver.conf 里的 external-ip（公网 IP 字面量，不能写域名）、
+# realm / server-name 与 user= 的密码；改完不要把真实密码提交进仓库。
+# 改完要让它生效：`docker compose -f docker-compose.yml -f docker-compose.coturn.yml
+# restart coturn` —— 只改了挂载进去的文件时，`up -d` 认为容器配置没变，不会重启它。
 
 services:
   coturn:
@@ -14,3 +19,9 @@ services:
     network_mode: host
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    # 镜像自带的命令里有 `--external-ip=$(detect-external-ip)`，而配置文件里也写着
+    # external-ip——coturn 只允许定义一次，同时给会打一条 ERROR 并**保留先读到的那份**
+    # （配置文件先被读，所以是 conf 里的值生效，命令行那条被忽略）。
+    # 这里显式指定配置文件，并且**必须保留** `--log-file=stdout`，否则
+    # `docker compose logs coturn` 里什么都没有。
+    command: ["-c", "/etc/coturn/turnserver.conf", "--log-file=stdout"]

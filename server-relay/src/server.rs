@@ -14,7 +14,8 @@ use crate::protocol::{
     is_valid_device_id, is_valid_room_id, Limits, DEFAULT_MAX_BYTES_PER_SECOND,
     DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND, DEFAULT_MAX_SESSIONS,
     DEFAULT_STALE_AFTER_MS, HEADER_AUTHORIZATION, HEADER_CLIENT, HEADER_PROTOCOL, HEADER_ROOM,
-    HEALTH_PATH, PROTOCOL_VERSION, WEBSOCKET_VERSION, WS_PATH,
+    HEADER_SERVER, HEALTH_PATH, MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, WEBSOCKET_VERSION,
+    WS_PATH,
 };
 use crate::relay::{Relay, RoomRejection};
 
@@ -31,7 +32,7 @@ fn is_valid_websocket_key(value: &str) -> bool {
 /// 运行期配置。全部可以用环境变量覆盖（见 `load_config`）。
 ///
 /// 多会话（§6）下这里**没有 Pair Secret、也没有 PAIR_AUTH_TOKEN**：一套服务器服务
-/// 的是所有自带联机密钥的用户，鉴权退化成「同一个 Room 的人拿的 token 摘要一致」。
+/// 的是所有自带配对密码的用户，鉴权退化成「同一个 Room 的人拿的 token 摘要一致」。
 pub struct Config {
     /// 监督下发给客户端的限流额度，同时就是中继自己的桶容量
     pub limits: Limits,
@@ -41,6 +42,9 @@ pub struct Config {
     pub stale_after: Duration,
     /// `/ws` 的 `server.welcome` 里附带的 ICE 服务器（可选，原样透传）
     pub ice_servers: Option<serde_json::Value>,
+    /// R36：服务器密码的 verifier（`SHA256(derive_server_token(密码))`）。
+    /// 配置里**没有**密码原文，也没有它的任何可逆形态。
+    pub server_verifier: [u8; 32],
 }
 
 fn env_non_empty(name: &str) -> Option<String> {
@@ -101,11 +105,30 @@ pub fn load_config() -> Result<Config, String> {
         ),
     };
 
+    // R36：服务器密码是**必填**的。它是「谁能用这台服务器」的唯一门槛：没有它，
+    // 任何人只要知道地址就能开一个自己的会话（还会顺走 welcome 里的 TURN 凭据）。
+    // 与其允许一个默认开放、随时可能被白嫖的部署，不如启动就报错说清楚怎么设。
+    let server_password = env_non_empty("PAIR_SERVER_PASSWORD").ok_or_else(|| {
+        format!(
+            "缺少 PAIR_SERVER_PASSWORD：请在 .env 里设置一个至少 {MIN_SERVER_PASSWORD_LENGTH} \
+             字符的服务器密码（可以用 `cargo run --bin generate-pair -- --server` 生成），\
+             填完再重启；客户端要用同一个值填「服务器密码」"
+        )
+    })?;
+
+    if server_password.chars().count() < MIN_SERVER_PASSWORD_LENGTH {
+        return Err(format!(
+            "PAIR_SERVER_PASSWORD 太短：至少要 {MIN_SERVER_PASSWORD_LENGTH} 个字符（太短的\
+             门槛挡不住爆破，也挡不住猜）"
+        ));
+    }
+
     Ok(Config {
         limits,
         max_sessions: env_positive_usize("PAIR_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?,
         stale_after: Duration::from_millis(env_u64("PAIR_STALE_AFTER_MS", DEFAULT_STALE_AFTER_MS)?),
         ice_servers,
+        server_verifier: auth::server_verifier(&server_password),
     })
 }
 
@@ -152,9 +175,12 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     };
 
     if head.path() == HEALTH_PATH {
-        // §28：只说「我活着、协议是 1」。**不暴露**任何 Room、deviceId 或密钥信息
-        let body =
-            format!("{{\"ok\":true,\"protocol\":{PROTOCOL_VERSION},\"mode\":\"multi-pair\"}}");
+        // §28：只说「我活着、协议是 1、需要服务器密码」。**不暴露**任何 Room、deviceId
+        // 或密钥信息；`passwordRequired` 是常量，用来让部署者一条 curl 就确认自己装对了
+        let body = format!(
+            "{{\"ok\":true,\"protocol\":{PROTOCOL_VERSION},\"mode\":\"multi-pair\",\
+             \"passwordRequired\":true}}"
+        );
 
         return write_response(&mut stream, 200, "OK", "application/json", &body)
             .await
@@ -162,6 +188,8 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     }
 
     if head.path() != WS_PATH {
+        // 这一路**不记日志**：公网扫描器会把它刷满，而它跟凭据无关——客户端自己
+        // 会看到 404 与「服务器地址路径不对」，不需要服务器这边也留痕
         return write_response(
             &mut stream,
             404,
@@ -220,12 +248,54 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     let expected_protocol = PROTOCOL_VERSION.to_string();
 
     if head.header(HEADER_PROTOCOL) != Some(expected_protocol.as_str()) {
+        reject(peer, "协议版本不支持", 426);
+
         return write_response(
             &mut stream,
             426,
             "Upgrade Required",
             "text/plain; charset=utf-8",
             "unsupported protocol",
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
+
+    // R36：**服务器密码排在最前面**。它是「谁能用这台服务器」的门槛，与「哪一对用户」
+    // 完全无关：没有它的人不该能建会话、不该能探测 Room 是否存在、更不该拿到
+    // `server.welcome` 里的 TURN 凭据（那是按流量计费的东西）。
+    //
+    // 用 403 而不是 401：401 在这套协议里已经表示「配对密码不对」（Room verifier 不匹配），
+    // 客户端要把两者显示成不同的话。Cloudflare 版不会返回 403，所以这个取值不会撞车。
+    let server_token = head
+        .header(HEADER_SERVER)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if server_token.is_empty() {
+        reject(peer, "缺少服务器密码", 403);
+
+        return write_response(
+            &mut stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            "server password required",
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
+
+    if !relay.accepts_server_token(&server_token) {
+        reject(peer, "服务器密码不正确", 403);
+
+        return write_response(
+            &mut stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            "server password incorrect",
         )
         .await
         .map_err(|error| error.to_string());
@@ -240,6 +310,8 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         .to_string();
 
     if !is_valid_room_id(&room_id) {
+        reject(peer, "会话标识不合法", 400);
+
         return write_response(
             &mut stream,
             400,
@@ -255,6 +327,8 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     let token = auth::bearer_token(head.header(HEADER_AUTHORIZATION));
 
     if token.is_empty() {
+        reject(peer, "缺少配对密码", 401);
+
         return write_response(
             &mut stream,
             401,
@@ -267,10 +341,12 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     }
 
     // §8 / §9 / §27：容量与密钥判定都在升级之前完成，客户端才能按状态码区分
-    // 「联机密钥不正确」（401）与「服务器会话已满」（503）。
+    // 「配对密码不正确」（401）与「服务器会话已满」（503）。
     let reservation = match relay.reserve(&room_id, auth::auth_verifier(&token)).await {
         Ok(reservation) => reservation,
         Err(RoomRejection::AuthMismatch) => {
+            reject(peer, "配对密码与这个会话不一致", 401);
+
             return write_response(
                 &mut stream,
                 401,
@@ -282,6 +358,8 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             .map_err(|error| error.to_string());
         }
         Err(RoomRejection::Capacity) => {
+            reject(peer, "服务器会话已满", 503);
+
             return write_response(
                 &mut stream,
                 503,
@@ -306,6 +384,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     if !is_valid_device_id(&device_id) {
         // 名额已经占上了，这里必须还回去，否则一个拼错 deviceId 的客户端会永久占住一个会话位
         relay.release(reservation).await;
+        reject(peer, "设备标识不合法", 400);
 
         return write_response(
             &mut stream,
@@ -325,4 +404,13 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     );
 
     relay.serve(stream, head, device_id, reservation).await
+}
+
+/// 被拒绝的连接要留下**一行**不含秘密的痕迹（P2-2）。
+///
+/// 此前只有「通过鉴权」会打日志，于是「两台设备连不上、`docker compose logs` 一片空白」
+/// 时分不清是「客户端根本没连到这台服务器」还是「被 401/503 挡在门外」。这里只写
+/// 对端地址、阶段与状态码——不写 token、不写 ROOM_ID、不写密码。
+fn reject(peer: SocketAddr, reason: &str, status: u16) {
+    eprintln!("连接 {peer} 被拒绝：{reason}（HTTP {status}）");
 }

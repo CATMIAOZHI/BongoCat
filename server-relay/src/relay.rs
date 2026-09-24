@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::auth::{constant_time_eq, room_fingerprint};
+use crate::auth::{auth_verifier, constant_time_eq, room_fingerprint};
 use crate::http::{write_upgrade, RequestHead};
 use crate::protocol::{
     self, close_code, is_known_frame_kind, Limits, ServerFrame, FRAME_HEADER_SIZE,
@@ -140,13 +140,13 @@ enum Admit {
         peer_online: bool,
         ejected: oneshot::Receiver<()>,
     },
-    /// 这个 Room 里已经有两台不同设备在线（同一个联机密钥的第三台）
+    /// 这个 Room 里已经有两台不同设备在线（同一个配对密码的第三台）
     Full,
 }
 
 /// `reserve` 的拒绝原因。
 ///
-/// 两种都必须在 **WebSocket 升级之前**判定：客户端要按 HTTP 状态码区分「联机密钥不对」
+/// 两种都必须在 **WebSocket 升级之前**判定：客户端要按 HTTP 状态码区分「配对密码不对」
 /// 与「服务器满员」，而升级成功之后只剩关闭码可以表达（§9 / §27）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomRejection {
@@ -172,6 +172,10 @@ pub struct Relay {
     max_sessions: usize,
     stale_after: Duration,
     ice_servers: Option<serde_json::Value>,
+    /// R36：`SHA256(derive_server_token(服务器密码))`。这一版中继**必须**有它：
+    /// 它是「谁能连上这台服务器」的唯一门槛，缺了它任何人都能白用转发与 TURN。
+    /// 与 Room 的 verifier 一样只存摘要——启动之后进程里没有密码原文。
+    server_verifier: [u8; 32],
     next_id: AtomicU64,
     state: Mutex<State>,
 }
@@ -182,15 +186,23 @@ impl Relay {
         max_sessions: usize,
         stale_after: Duration,
         ice_servers: Option<serde_json::Value>,
+        server_verifier: [u8; 32],
     ) -> Arc<Self> {
         Arc::new(Self {
             limits,
             max_sessions,
             stale_after,
             ice_servers,
+            server_verifier,
             next_id: AtomicU64::new(1),
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// 这次连接带来的服务器凭据对不对（R36）。恒定时间比较，与长度无关的旁路不成立
+    /// （两边都是 32 字节摘要）。
+    pub fn accepts_server_token(&self, token: &str) -> bool {
+        constant_time_eq(&auth_verifier(token), &self.server_verifier)
     }
 
     /// 升级之前的容量与密钥判定（§8 / §9 / §27）。放行时**当场创建 Room**，让这份名额
@@ -531,7 +543,7 @@ impl Relay {
             .count();
 
         if remaining >= PAIR_SIZE {
-            // 同一个联机密钥的第三方无法进入：这是体验约束，不是安全边界（R9 / §10）
+            // 同一个配对密码的第三方无法进入：这是体验约束，不是安全边界（R9 / §10）
             return Admit::Full;
         }
 
@@ -848,7 +860,7 @@ mod tests {
     use crate::auth;
     use tokio::sync::oneshot::error::TryRecvError;
 
-    /// 固定向量用的联机密钥（与 `crypto.rs` / `auth.rs` 里那份是同一个）
+    /// 固定向量用的配对密码（与 `crypto.rs` / `auth.rs` 里那份是同一个）
     const SECRET: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
     /// 三个互不相干的会话。中继本身不校验 `ROOM_ID` 的格式（那是 `server.rs` 的事），
@@ -858,7 +870,28 @@ mod tests {
     const ROOM_C: &str = "room-c";
 
     fn relay(max_sessions: usize, stale_after: Duration) -> Arc<Relay> {
-        Relay::new(Limits::default(), max_sessions, stale_after, None)
+        Relay::new(
+            Limits::default(),
+            max_sessions,
+            stale_after,
+            None,
+            // 会话层用不到服务器密码（那是 `server.rs` 在升级之前判的），给一个固定摘要
+            auth::server_verifier("relay-unit-tests-server-password"),
+        )
+    }
+
+    /// R36：会话层不该认错的服务器凭据
+    #[test]
+    fn the_relay_only_accepts_its_own_server_password() {
+        let relay = relay(20, Duration::from_secs(120));
+        let token = auth::derive_server_token("relay-unit-tests-server-password");
+
+        assert!(relay.accepts_server_token(&token));
+        assert!(!relay.accepts_server_token(""));
+        assert!(!relay.accepts_server_token("relay-unit-tests-server-password"));
+        assert!(!relay.accepts_server_token(&auth::derive_server_token(
+            "relay-unit-tests-server-password2"
+        )));
     }
 
     /// 走完 `reserve` + `admit` 的正常路径（不 panic，拒绝的情况也返回给用例断言）

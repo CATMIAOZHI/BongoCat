@@ -1,34 +1,58 @@
 # 推荐模式：域名 + Caddy 自动 HTTPS。
 #
-# 一套服务器同时承载 PAIR_MAX_SESSIONS 个双人会话，服务器本身**没有**联机密钥。
+# 一套服务器同时承载 PAIR_MAX_SESSIONS 个双人会话，服务器本身**没有**配对密码。
 #
 # 用法：
-#   1. cp .env.example .env，填 PAIR_DOMAIN=<你的域名>
-#   2. docker compose up -d
-#   3. 客户端双方都填 https://<你的域名> 与同一个「联机密钥」
+#   1. cp .env.example .env，填 PAIR_DOMAIN=<你的域名> 与
+#      PAIR_SERVER_PASSWORD=<服务器密码>（缺任一个都会明确报错，不会半启动）
+#      ——服务器密码先生成好再 cp 更省事：`cargo run --release --bin generate-pair -- --server`
+#   2. 云控制台的安全组放行 80 与 443（Caddy 要用 80 申请证书），
+#      域名 A 记录指向这台机器
+#   3. docker compose up -d
+#   4. 自查：curl https://<你的域名>/health 应当打印
+#      {"ok":true,"protocol":1,"mode":"multi-pair","passwordRequired":true}
+#   5. 把「服务器地址（https://<你的域名>）+ 服务器密码 + 配对密码」三个值一起发给对方，
+#      两边客户端都填这三项
+#
+# 改过 .env 之后要重新 `docker compose up -d` 才会生效：`docker compose restart`
+# **不会**重读 .env（换服务器密码时最容易踩这一下）。
 
 services:
   relay:
     build: .
     restart: unless-stopped
     environment:
-      PAIR_LISTEN: 0.0.0.0:8080
+      PAIR_LISTEN: ${PAIR_LISTEN:-0.0.0.0:8080}
+      # 必填（R36）：决定「谁能用这台服务器」。客户端要填同一个值才连得上
+      PAIR_SERVER_PASSWORD: ${PAIR_SERVER_PASSWORD:?请先在 .env 里设置 PAIR_SERVER_PASSWORD}
       PAIR_MAX_SESSIONS: ${PAIR_MAX_SESSIONS:-20}
-      # 想放开额度（例如为了 60Hz）时改这三行；不给就是 CF 的 30 / 20 / 12MiB。
-      # 客户端按 2/3 推导自己的速率：广告 90 → 客户端 60。
+      # 想放开额度（例如为了 60Hz）时改这几行；不给就是 CF 的 30 / 20 / 12MiB。
+      # 客户端按广告值的 2/3 推导**帧**速率：广告 90 → 客户端 60；分片那一路是 3/4。
       PAIR_MAX_FRAMES_PER_SECOND: ${PAIR_MAX_FRAMES_PER_SECOND:-90}
-      # PAIR_MAX_CHUNKS_PER_SECOND: "20"
-      # PAIR_MAX_BYTES_PER_SECOND: "12582912"
-      # 自建 coturn 后把地址广告给客户端（见 docker-compose.coturn.yml）
-      # PAIR_ICE_SERVERS: '[{"urls":["stun:cat.example.com:3478"]}]'
+      # 这几项**必须在这里透传**：写进 `.env` 是给 compose 做替换用的，容器不会自己去读
+      # `.env`——少一行就是「改了 .env 却完全没生效」。留空时用二进制里的默认值。
+      PAIR_MAX_CHUNKS_PER_SECOND: ${PAIR_MAX_CHUNKS_PER_SECOND:-}
+      PAIR_MAX_BYTES_PER_SECOND: ${PAIR_MAX_BYTES_PER_SECOND:-}
+      PAIR_STALE_AFTER_MS: ${PAIR_STALE_AFTER_MS:-}
+      # 自建 coturn 后把地址填在 .env 的 PAIR_ICE_SERVERS 里（coturn 本体见
+      # docker-compose.coturn.yml）；空值等于不广告
+      PAIR_ICE_SERVERS: ${PAIR_ICE_SERVERS:-}
     expose:
       - "8080"
+    # 让 `docker compose ps` 能看出中继到底在不在服务，也让 Caddy 等到它就绪
+    healthcheck:
+      test: ["CMD", "bongocat-pair-relay", "--health-check"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
 
   caddy:
     image: caddy:2
     restart: unless-stopped
     depends_on:
-      - relay
+      relay:
+        condition: service_healthy
     environment:
       PAIR_DOMAIN: ${PAIR_DOMAIN:?请先在 .env 里设置 PAIR_DOMAIN}
     ports:
