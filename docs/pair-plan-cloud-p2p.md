@@ -212,6 +212,20 @@
 >    - 前端：`tsc --noEmit`、`pnpm test`（51 条）、`pnpm lint` 全过。`p2p` 那行的文案跟着改准：从「猫咪状态和聊天」改成「猫咪状态与输入统计」。
 > 10. **仍未做**：`reliable` 通道与附件分片走 P2P（Phase 10）；Phase 9a 的 60Hz 与额度参数化；**真机双端（两台机器、真实 NAT）的打洞验收仍是人工项**——本轮 e2e 是同机两个进程，只能证明「信令 → ICE → DataChannel → 探针往返 → 可覆盖流切过去」这条链路成立，证明不了跨 NAT 的可达率，也证明不了「服务器转发量明显下降」。
 
+> **R31（Phase 9a + 9b 落地：额度按传输层拆开、60Hz 上限、远端插值）—— 提交 `5f36bd8` / `8b49a50`**
+>
+> 1. **DC 那条腿有了自己的额度**：`DIRECT_FRAMES_PER_SECOND = 60` / `DIRECT_BURST = 60`，一个 `direct_pacer` 只服务 DC。中继腿的 `pacer` / `chunk_pacer` 与 `retune` **一行未改**——DC 上的帧不经过中继的计费点，拿中继额度去压它正好会把可覆盖流压回 20 帧/秒。9a 里 DC 上只有可覆盖流，所以 `direct_pacer` 目前只被 `flush_replaceable` 使用；附件分片与可靠帧上 DC 是 Phase 10。
+> 2. **上限契约 `PairStatus.pet_state_hz`**：前端不再自己判断该用哪个上限（原来硬编码 `SNAPSHOT_INTERVAL_MS = 333`）。取值 = **当前生效传输的额度**：可覆盖通道可用（`dc_open && dc_verified`，与 `p2p == connected` 同一对标志）→ 60；否则中继推导帧额度 ≥ 60 → 60；否则 3。**这是一个台阶**：推导 59 → 3Hz、60 → 60Hz，看着突兀，但它是 §10 两条验收的直译——`min(60, max(3, 推导))` 会把 CF 从 3Hz 抬到 20Hz，违反「CF 版行为一字不变」。发布统一走 `publish_route`，`p2p` 与 `pet_state_hz` **一次写完**，不会出现「已直连但还按 3Hz 发」的中间态；`start` / `disconnect` / `fail_hard` / `Reconnecting` 都复位成 `Off` + 3Hz，welcome 重广告只重算 `pet_state_hz`。
+> 3. **§6 的括号订正**：原文写「只把上限从 3Hz 提到 60Hz（**且只在 P2P 生效**）」，与 §10 的「自建中继广告 90 → 客户端能跑到 60Hz」互相矛盾。以 §10 为准：**上限跟着当前生效传输的额度走**。
+> 4. **远端插值**：`remote-cat` 从 `setInterval(200)` 的慢更新换成常驻 `requestAnimationFrame`，指针位置按 `alpha = 1 - exp(-dt / tau)` 指数趋近最新快照。**tau 不是固定的 100ms**：固定的 100ms 会在 60Hz 下稳定引入 100ms 迟滞，而 §10 要的正是「明显更跟手」，所以取 `clamp(1.5 × 观测到的相邻快照间隔, 25ms, 150ms)`（观测值夹 `[16, 1000]`）：60Hz 下约 25ms，3Hz 下封顶 150ms。窗口被节流后的自愈靠第一帧的大 `dt`（`1 - exp(-dt / tau) ≈ 1` 直接吸附）——**这是设计，不是 bug**。
+> 5. **只有真变了才写模型参数**：`appliedKey`（4 个布尔）与 `appliedX` / `appliedY`（阈值 0.001，远小于 0.02 的量化步长）。换模型后新模型是默认参数，所以 `live2d.load()` 成功后必须 `resetApplied()`，否则参数要等下一次变化才补上。
+> 6. **验证**：
+>    - 单测 **111 passed / 7 ignored / 0 failed**（新增 `the_direct_pacer_carries_the_sixty_hertz_budget`、`the_pet_state_ceiling_follows_the_effective_transport`）。`coverable_frames_take_the_data_channel_and_chat_never_does` 补两条断言：走 DC 的那一帧**不吃中继的 pacer**（中继额度只被那一条聊天消耗）、DC 那条腿的额度被扣掉一枚。
+>    - 前端：`tsc --noEmit`、`eslint src`（0 problem）、`pnpm test`（51 条）全过。
+>    - 独立只读审计：**无 P0 / 无 P1**；1 个 P2 是本轮多出的一处 rustfmt 差异，已改回基线（既有的 19 处差异不变，CI 也不跑 `cargo fmt --check`）。
+>    - **没跑到**：真机双端目视「更跟手」（§10 的人工项）、`pnpm tauri build`。60Hz 是**上限**而不是目标（量化本身就是限流），所以「包量对比」也只在真机上有人工意义。
+> 7. **仍未做**：Phase 10（`reliable` 通道 + 附件分片走 P2P，见 §8 的落地形状）、真机双端验收。
+
 ---
 
 # 1. 目标与非目标
@@ -364,10 +378,10 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 
 # 6. 60Hz 与远端插值
 
-- 发送侧：保持「变化立即发 + 尾随定时器」结构，只把上限从 3Hz 提到 60Hz（且只在 P2P 生效）。量化（0.02 / 0.2 / 布尔）继续当天然限流。
-- Rust 侧：Pacer 额度随传输层参数化（R23），测试同步更新。
-- **DC 那条腿在 8c 里没有任何 pacing**：3Hz 下无所谓；9a 把上限提到 60Hz 时要把额度按传输层拆开（R23），别让 DC 复用中继的 pacer。
-- 接收侧：remote-cat 把 `DECAY_INTERVAL_MS = 200` 的慢更新改成随快照驱动的插值渲染（在 60 FPS 下按时间插值到最新快照），TTL 释放逻辑（`TYPING_TTL_MS` / `CLICK_TTL_MS` / `SNAPSHOT_TTL_MS`）保留。
+- 发送侧：保持「变化立即发 + 尾随定时器」结构，上限按**当前生效传输的额度**取（R23 / R31）：可覆盖通道可用时 60Hz；中继广告额度够（推导 ≥ 60）时也是 60Hz；都不满足就留在 v1 的 3Hz。量化（0.02 / 0.2 / 布尔）继续当天然限流。
+- Rust 侧：Pacer 额度随传输层参数化（R23），测试同步更新；上限本身通过 `PairStatus.pet_state_hz` 交给前端（R31），前端**不再自己判断**该用哪个上限。
+- **DC 那条腿的额度就是 60Hz 上限本身**（`DIRECT_FRAMES_PER_SECOND`）：它既不吃中继的 `pacer` 也不吃 `chunk_pacer`，也不参与 `retune`（R23 / R31）。
+- 接收侧：remote-cat 用常驻 `requestAnimationFrame` 按时间插值到最新快照（R31），tau 随观测到的快照间隔自适应，不再是固定的 `DECAY_INTERVAL_MS = 200` 轮询；TTL 释放逻辑（`TYPING_TTL_MS` / `CLICK_TTL_MS` / `SNAPSHOT_TTL_MS`）保留。
 - 验收看的是「视觉上更跟手」，不是「包更密」。
 
 ---
@@ -377,9 +391,9 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 见 R22 的清单。要点：
 
 - `TransferOfferPayload.chunk_size` 早已存在，协议不动；
-- 接收侧从「必须等于本机常量」改成「用 offer 的值 + 夹紧（≥4 KiB，≤512 KiB 且 ≤ 帧上限推导值）」；
-- 中继 512 KiB / P2P 48 KiB；
-- 分片 Pace 改成按字节或随传输层参数化，避免 48 KiB × 15 的低速。
+- 接收侧从「必须等于本机常量」改成**用 offer 的值 + 范围校验**（`[4 KiB, min(512 KiB, 帧上限推导值)]`），越界就**拒绝这条 offer**（R31 的订正：夹紧会让两端的分块长度算法不一致，每一块都会报「附件分片大小不对」，比早失败更难查）；「夹紧」落在**发送侧**选 `chunk_size` 时。两侧的范围必须是**同一对常量**（单一来源：`transfer::MIN_CHUNK_SIZE` 与 `transfer::max_chunk_size()`）。
+- 中继 512 KiB / P2P 48 KiB（`P2P_CHUNK_SIZE`）；
+- 分片 Pace 随传输层参数化（R23）：中继那条路仍是「通用额度 + 分片额度」两套；**DC 那条路有自己的分片额度**（`DIRECT_CHUNKS_PER_SECOND` / `DIRECT_CHUNK_BURST`），按「与中继那条路同样的字节速率」推导——15 × 512 KiB ÷ 48 KiB = 160，即 160 × 48 KiB/s ≈ 7.5 MiB/s，与今天中继那条路的天花板持平，不是新引入的激进值。它**不与 60Hz 快照共用桶**，否则 48 KiB 的块会把 60 枚/秒吃光、对端猫在整段传输里冻住。两条都落地在 Phase 10。
 
 ---
 
@@ -415,13 +429,15 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 
 ## Phase 9a：额度参数化 + 60Hz 上限
 
-- 交付：Pacer 随传输层参数化、60Hz 上限；
-- 验证：单测覆盖额度计算；真机对比 3Hz 与 60Hz 的包量。
+- 交付：Pacer 随传输层参数化（DC 那条腿有自己的预算）、**`PairStatus.pet_state_hz` 这个新契约 + 前端消费**（上限只由 Rust 给出，前端不再硬编码 3Hz）；
+- 验证：单测覆盖额度计算与上限推导（含「CF 缺省仍是 3Hz」「自建广告 90 → 60Hz」两个方向）；真机对比 3Hz 与 60Hz 的包量与视觉。
+- **落地（R31）**：`DIRECT_FRAMES_PER_SECOND` / `DIRECT_BURST` = 60/60，`publish_route` 一次写完 `p2p` + `pet_state_hz`。上限的取值规则见 §6。
 
 ## Phase 9b：远端插值
 
-- 交付：remote-cat 插值渲染；
+- 交付：remote-cat 插值渲染（常驻 `requestAnimationFrame` + 自适应 tau）；
 - 验证：真机目视「更跟手」，无抖动、无残影。
+- **落地（R31）**：`tau = clamp(1.5 × 观测到的快照间隔, 25ms, 150ms)`；只有参数真的变了才写模型。
 
 ## Phase 10：reliable 通道 + 附件分片走 P2P
 
@@ -429,6 +445,16 @@ Phase 8 只启用 `pet-state` 通道（只跑可覆盖流）；聊天等留在�
 - 交付：`reliable` 通道（有序、有重传）、上面那几类消息切过去、R22 的分片大小随传输层走、**传输在途时延后切换**（等这一单结束再切，不在中途换传输——接收侧要求分片序号严格递增、V1 无断点续传）；
 - 验证：真机双端传一个附件，中途断掉 P2P 通路要能回落且不破坏这一单；对端是旧客户端时行为与 v1 一致。
 - 说明：这一条在 R30 之前**在 §8 里没有归属阶段**（7a / 7b / 8a / 8b / 8c / 9a / 9b 都不管它），而 §10 的验收却依赖它。
+- **落地形状（R32，规划评审 `AGREED`）**：
+  1. **能力门控靠 `hello` 里的可选能力字段，`SIGNAL_VERSION` 保持 1**：那个版本是硬相等判断（不匹配就完全不协商），bump 会把 10↔8c 之间**连 `pet-state` 的 P2P** 一起关掉。两端都要门控——offerer 只在**对端声明过**时才建 `reliable`，answerer 只在**对端声明过**时才认领它；未知 label 一律不认领（8c 的 `on_data_channel` 是无条件认领任何通道，两条通道进来就是 last-wins、两个泵喂同一个 `Inbound`）。
+  2. **两条腿各自的探针证据**：`pet-state` 用现有的应用级 `pair.ping`；`reliable` 在自己的 `ChannelOpen` 时也发一枚 `pair.ping`，它的入站置 `reliable_verified`。DC 入站的回复**按入站的那条通道原路返回**（R30 的约束）。`route == Direct` 可用 ⟺ `reliable_open && reliable_verified`。**不给 reliable 加 R30 那条「任何 DC 入站」的旁证**：那是无序通道上的廉价替代；有序通道上的真往返是更强的证据，而另一条 lane 的入站对这条 lane 没有证明力。
+  3. **分片是唯一「不能有缺口」的流，所以按传输会话钉住 route**：`start_outgoing_transfer` 时选 route、把 `chunk_size` 写进 offer（Direct = 48 KiB，Relay = 512 KiB），`TransferSession` 存它，这一单的 `send_next_chunk` 全程走它。**这就是「传输在途时延后切换」**（不换腿，所以不会造成分片缺口）。聊天 / presence / 控制帧**不钉**，每帧按当前可用性选腿——两条腿两端都读，只有分片有「严格递增」约束。接收侧在收到 offer 时记下它的 lane（`handle_binary` 多收一个 lane 参数）。
+  4. **失败收敛挂在「reliable 腿不可用」上**（探针**超时**与 `ChannelClosed(Lane::Reliable)` **两处**都调同一个 `direct_lost()`）：按 §43 失败所有 `route == Direct` 的会话（两个方向都算），并且**在中继上显式发一条 `transfer.cancel`**——不能假定两端在同一时刻拿到同一个事件，半死的腿正是「一端以为还在传、另一端什么都没收到」的形状；对端收到未知 `transferId` 的 cancel 是 no-op，重复无害。
+  5. **「聊天不丢」靠 DB 兜底而不是在途缓冲**：`reliable` 腿掉时调 `resend_pending_chat()`（库里 `pending` / `sent` 的聊天经中继重发，对端按 message id 去重并补 ack）。不变量：**线上 at-least-once、UI / DB 按 message id exactly-once**——正是它让「丢掉在途帧」变安全。
+  6. **DC 上的分片有自己的额度与背压**：额度见 §7（与 60Hz 快照**不共用桶**）；另外配 `with_data_channel_send_buffer_limit`（**`0` 等于无界，别传 0**）并用 `OnBufferedAmountHigh` / `OnBufferedAmountLow`（配 `set_buffered_amount_high_threshold` / `set_buffered_amount_low_threshold`）维护一个 writable 标志。阈值按「几个分片」定（约 limit 192 KiB / high = limit / low ≈ 48 KiB），**不照抄 crate 文档的 16 MiB**——那段建议是给只跑批量数据的通道写的，而我们的 `reliable` 是三用的（聊天 / 控制 / 分片），排队量直接等于聊天的队头延迟。`writable()` 是 **async 的「等到有空间」**，不能在 `live` 的 `select!` 分支里 `await`（会把中继腿的入站一起挡住，正是 R18 注释防的那件事）；非阻塞那一半用 `try_send` 的语义。
+  7. **`chunk_wait` 的不变量**：算 wait 与真正发帧必须用**同一个** `state.next_sending_transfer()`；并且只要这一轮因为取令牌 / 背压 / 会话状态而**没发出去**，wait 就**不能**是 `ZERO`，要给一个 5ms 量级的轮询间隔——否则 `Ok(false)` + `ZERO` 就是忙循环。
+  8. **背压拒绝绝不能造成跳号**：有序可靠通道上唯一的「丢」只能来自我们自己的拒绝，而接收侧要求 seq 严格递增。源头（writable 标志）负责挡住注入；万一 `try_send` 仍然满载，按「这一单失败 + cancel」处理，**不跳过、也不重发同一 seq**。
+  9. **两条已知取舍**：`Input::Failed` 来自**任一** lane 的泵退出，所以一条通道关闭也会触发整条腿重协商（可接受：关掉的通道本来就要重开一轮）；未知 label 的通道在 webrtc 下仍会缓冲对端发来的数据（风险表已记）。Phase 10 之后 `p2p == connected` 仍然只表示**可覆盖流**在 DC 上，第二条腿不暴露成 UI 状态。
 
 ---
 
@@ -445,6 +471,8 @@ perf(pair): raise the pet state ceiling and interpolate remotely
 ```
 
 实际落地时，8b 把上面第 4、5 两条合成了一个提交（`f3427cc`，`feat(pair): add webrtc signaling and the p2p link`）：信令与 P2P 传输同属一次交付。第 5 条标题里的「relay fallback」指的是切换与回落，那半属于 8c，届时单独落。
+
+Phase 9a 与 9b 也拆成了两个提交（R31）：`5f36bd8`（`feat(pair): give the data channel its own pacing budget and a 60hz ceiling`）与 `8b49a50`（`feat(pair): interpolate the remote cat between snapshots`）。上限契约与渲染插值是两件独立的事，放在一起反而看不清各自的验证面。
 
 ---
 
@@ -519,6 +547,9 @@ perf(pair): raise the pet state ceiling and interpolate remotely
 | `webrtc` 拉长编译与体积                               | 发布耗时、安装包变大                                                                                   | 依赖落地那一刻量一次（R24-6），必要时按 feature 门控                                                                                                                                                                                             |
 | 两条腿的心跳探针共用一个标志                          | 中继静默半死被 DC 流量掩盖：DC 上 pet-state 照常流动，聊天 / 信令 / 离线检测全哑却看起来正常，也不重连 | 两条独立标志——中继腿只由中继入站清除；DC 腿超时只回落（R21「心跳归属」第二条、R28 第 3 条）                                                                                                                                                      |
 | DC 已 open 但打不通（ICE connected 之后半死）         | 可覆盖流灌进黑洞：对端猫冻住，而两边 UI 都显示「已直连」                                               | 切换门要 `dc_open && dc_verified`（DC 入站才算验过），`ChannelOpen` 立刻补一枚 ping，`p2p = connected` 与选路用同一对标志；**验过之后又静默半死**的那一半靠 R28 的 DC 探针超时兜底（窗口最长约 2 个心跳，默认 120 秒），这期间选路仍在 DC（R30） |
+| DC 的发送缓冲不设上限就不阻塞（R31 记）               | 慢链路下注入量只受令牌桶约束，缓冲无界增长                                                             | 配 `with_data_channel_send_buffer_limit` + writable 背压，源头挡住注入（Phase 10，见 §8）                                                                                                                                                        |
+| 未知 label 的 DataChannel 仍会被 webrtc 缓冲          | 恶意对端可以多开通道占内存                                                                             | 只认领声明过的两条；不认领的通道不 poll（对端发来的数据仍会被缓冲，所以记在这里）                                                                                                                                                                |
+| 任一条 DC 通道的泵退出会重开整条腿                    | 一次重协商（十几秒），期间可靠流全部回中继                                                             | 可接受：两条通道在同一条 SCTP 关联上，关掉的那条本来就要重开一轮                                                                                                                                                                                 |
 
 未决：自建中继是否默认广告 60 帧/秒（还是留给环境变量）。 另一个未决：探针超时之后那条腿要不要自愈回 DC（今天不自愈，要等通道真的关闭重开；保守方向的取舍，9a 再定，见 R30）。
 
