@@ -40,8 +40,21 @@ import { join } from '@/utils/path'
 const TYPING_TTL_MS = 800
 const CLICK_TTL_MS = 500
 const SNAPSHOT_TTL_MS = 1500
-/** 检查 TTL 的频率 */
-const DECAY_INTERVAL_MS = 200
+/**
+ * 指针插值的时间常数（§6 / R23 的「远端本地插值」）。
+ *
+ * 快照是**绝对值 + 量化**的（步长 0.02），60Hz 下目标值仍在跳，所以插值仍然必要：
+ * 它把「一跳一跳」变成「跟手」。固定的 100ms 会在 60Hz 下稳定引入 100ms 迟滞，而 §10
+ * 要的正是「明显更跟手」，所以 tau 取观测到的快照间隔的 1.5 倍，夹在这个区间里：
+ * 60Hz 下约 25ms，3Hz 下封顶 150ms。
+ */
+const TAU_MIN_MS = 25
+const TAU_MAX_MS = 150
+/** 观测间隔的夹取范围，防止第一次收到包时算出离谱的值 */
+const GAP_MIN_MS = 16
+const GAP_MAX_MS = 1000
+/** 指针变化小于它就跳过重绘（量化步长是 0.02，这个阈值远小于它） */
+const POINTER_EPSILON = 0.001
 
 const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
@@ -59,7 +72,17 @@ const notice = ref('')
 const modelRef = useTemplateRef<HTMLElement>('model')
 const flashRef = useTemplateRef<HTMLElement>('flash')
 let receivedAt = 0
-let decayTimer: ReturnType<typeof setInterval> | undefined
+/** 最近一次相邻快照的间隔，用来自适应插值的时间常数 */
+let snapshotGapMs = 0
+/** 插值中的指针位置（`remote` 是最新目标，这里是渲染中的值） */
+let renderedX = 0.5
+let renderedY = 0.5
+let lastFrameAt = 0
+let frameHandle: number | undefined
+/** 上一次真正写进模型的参数，用来跳过没有任何变化的帧 */
+let appliedKey: string | undefined
+let appliedX = Number.NaN
+let appliedY = Number.NaN
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 let soundFailed = false
 
@@ -115,6 +138,8 @@ async function loadModel() {
     const loaded = await live2d.load(model.path)
 
     modelSize.value = { width: loaded.width, height: loaded.height }
+    // 新模型是默认参数：作废「跳过没变化的帧」的记录，否则参数要等下一次变化才补上
+    resetApplied()
 
     const background = join(model.path, 'resources', 'background.png')
 
@@ -130,15 +155,63 @@ async function loadModel() {
   }
 }
 
+/** 换模型之后新模型是默认参数，之前「跳过没变化的帧」的记录必须作废 */
+function resetApplied() {
+  appliedKey = void 0
+  appliedX = Number.NaN
+  appliedY = Number.NaN
+}
+
+/** 自适应时间常数：1.5 倍观测间隔，夹在 [TAU_MIN_MS, TAU_MAX_MS] */
+function interpolateTau() {
+  return Math.min(TAU_MAX_MS, Math.max(TAU_MIN_MS, snapshotGapMs * 1.5))
+}
+
+function applyHands(left: boolean, right: boolean, leftDown: boolean, rightDown: boolean) {
+  const key = `${left}|${right}|${leftDown}|${rightDown}`
+
+  if (key === appliedKey) return
+
+  appliedKey = key
+
+  handleKeyChange(true, left)
+  handleKeyChange(false, right)
+  handleMouseChange('Left', leftDown)
+  handleMouseChange('Right', rightDown)
+}
+
+function applyPointer() {
+  if (
+    Math.abs(renderedX - appliedX) < POINTER_EPSILON
+    && Math.abs(renderedY - appliedY) < POINTER_EPSILON
+  ) {
+    return
+  }
+
+  appliedX = renderedX
+  appliedY = renderedY
+
+  handleMouseRatio(renderedX, renderedY)
+}
+
 /**
- * 把远端快照写进模型参数。
+ * 把远端快照写进模型参数（§6 / R23 的远端插值）。
  *
  * 只认「对方的左右手 + 鼠标比例」，永远不会读本机的 `modelStore.pressedKeys`
  * （那是本机按键，见 R11）。
+ *
+ * 每帧都跑，但只有真的变了才写模型参数：指针位置按时间指数趋近最新快照，TTL 判定与
+ * 离线回中位照旧。窗口隐藏时浏览器会节流 rAF，恢复可见后的第一帧 `dt` 很大 →
+ * `1 - exp(-dt / tau) ≈ 1` 直接吸附到目标，这就是它自愈的方式（不是 bug）。
  */
-function applyRemoteSnapshot() {
+function renderRemoteSnapshot() {
+  const now = Date.now()
+  const dt = lastFrameAt === 0 ? Number.POSITIVE_INFINITY : Math.max(0, now - lastFrameAt)
+
+  lastFrameAt = now
+
   const online = isOnline()
-  const elapsed = Date.now() - receivedAt
+  const elapsed = now - receivedAt
   const snapshot = online ? remote.value : defaultSnapshot()
   // §23：三个 TTL 各自负责一项，超过就回到「没在动」的样子
   const handsFresh = online && elapsed <= TYPING_TTL_MS
@@ -147,25 +220,50 @@ function applyRemoteSnapshot() {
   const settled = online && elapsed <= SNAPSHOT_TTL_MS
   const pointer = settled ? snapshot.pointer : defaultSnapshot().pointer
 
-  handleKeyChange(true, handsFresh && snapshot.keyboard.leftHand)
-  handleKeyChange(false, handsFresh && snapshot.keyboard.rightHand)
-  handleMouseChange('Left', clicksFresh && snapshot.pointer.leftDown)
-  handleMouseChange('Right', clicksFresh && snapshot.pointer.rightDown)
-  handleMouseRatio(pointer.x, pointer.y)
+  if (settled) {
+    const alpha = 1 - Math.exp(-dt / interpolateTau())
+
+    renderedX += (pointer.x - renderedX) * alpha
+    renderedY += (pointer.y - renderedY) * alpha
+  } else {
+    // 离线、过期或本窗口的第一帧：直接吸附，不做插值
+    renderedX = pointer.x
+    renderedY = pointer.y
+  }
+
+  applyHands(
+    handsFresh && snapshot.keyboard.leftHand,
+    handsFresh && snapshot.keyboard.rightHand,
+    clicksFresh && snapshot.pointer.leftDown,
+    clicksFresh && snapshot.pointer.rightDown,
+  )
+  applyPointer()
+}
+
+function frameLoop() {
+  frameHandle = requestAnimationFrame(frameLoop)
+
+  renderRemoteSnapshot()
 }
 
 useTauriListen<PetSnapshot>(LISTEN_KEY.PAIR_PET_STATE, ({ payload }) => {
   // 收到就对端是「刚从网络解密出来」的值；这里再跑一遍量化只是防御，不是信任
+  const now = Date.now()
+
+  if (receivedAt > 0) {
+    snapshotGapMs = Math.min(GAP_MAX_MS, Math.max(GAP_MIN_MS, now - receivedAt))
+  }
+
   remote.value = sanitizeSnapshot(payload)
-  receivedAt = Date.now()
+  receivedAt = now
 })
 
 onMounted(async () => {
   await loadModel()
 
-  applyRemoteSnapshot()
+  renderRemoteSnapshot()
 
-  decayTimer = setInterval(applyRemoteSnapshot, DECAY_INTERVAL_MS)
+  frameLoop()
 
   if (pairStore.settings.remoteCat.visible) {
     await showWindowByLabel(WINDOW_LABEL.REMOTE_CAT)
@@ -173,7 +271,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  if (decayTimer) clearInterval(decayTimer)
+  if (frameHandle !== undefined) cancelAnimationFrame(frameHandle)
   if (noticeTimer) clearTimeout(noticeTimer)
 
   live2d.destroy()
