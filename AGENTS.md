@@ -44,7 +44,9 @@
 ## 提交与发布
 
 - 提交信息遵循 Conventional Commits（`commitlint` 经 `simple-git-hooks` 的 `commit-msg`、`pre-commit` 钩子校验，pre-commit 会跑 `eslint --fix`）。
-- 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 多平台构建 Draft Release。
+- 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 多平台构建 Draft Release。**本 fork 自用版不需要配任何 Secret**：推 `v*` 标签（或手动 Run workflow）就出安装包，用的是 GitHub 自带的 `GITHUB_TOKEN`（workflow 里已声明 `permissions: contents: write`），构建时 `--no-sign`、不生成 `latest.json`。想恢复「签名 + 自动更新分发」，按 `release.yml` 末尾的四步做（含要换掉 `tauri.conf.json` 里的 `pubkey`，上游公钥和自己的私钥配不上）。
+- `.github/workflows/upgradelink.yml` 与 `sync-to-gitee.yml` 依赖只属于上游作者的第三方账号 Secret（UpgradeLink、Gitee），在 fork 里只能失败，所以已改成**只能手动触发**；要恢复上游行为见两个文件顶部的注释。
+- 注意 `src-tauri/tauri.conf.json` 的 updater 端点仍指向上游（见「仓库边界」），自己装的版本会提示更新到上游版本；自用发布不带签名，属于预期。
 - 未经用户明确要求，不提交、不推送、不打标签、不发布 Release。
 
 ## 通用安全

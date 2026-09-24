@@ -1,8 +1,13 @@
 name: Sync Github Repos To Gitee
+
+# 本 fork 自用：这个 job 是把**上游作者**的仓库镜像到**上游作者**的 Gitee 账号
+# （src: github/ayangweb，dst: gitee/ayangweb），需要 2 个只属于他的 Secret。
+# fork 里一旦往 `master` 推东西，它只会失败，所以改成**只能手动触发**。
 on:
-  push:
-    branches:
-      - master
+  # push:
+  #   branches:
+  #     - master
+  workflow_dispatch:
 
 jobs:
   repo-sync:

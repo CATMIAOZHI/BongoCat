@@ -1,8 +1,12 @@
 name: Upload Release to UpgradeLink
 
+# 本 fork 自用：UpgradeLink 是上游作者的第三方更新分发服务，需要 3 个只属于上游
+# 账号的 Secret（`UPGRADE_LINK_*`），且 config 里的 app_key 也是上游的。fork 里
+# 发 Release 时这个 job 只会失败，所以改成**只能手动触发**。
+# 想恢复上游行为：把下面 `workflow_dispatch:` 上面的 `# ` 去掉，并配好那 3 个 Secret。
 on:
-  release:
-    types: [published]
+  # release:
+  #   types: [published]
   workflow_dispatch:
 
 jobs:

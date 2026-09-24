@@ -1,10 +1,25 @@
 name: BongoCat Release
 
+# 本 fork 自用：推 `v*` 标签（或手动 Run workflow）就能在本仓库出安装包，
+# **不需要配任何 Secret**。与上游的三处不同都为此：
+#   1. `secrets.RELEASE_TOKEN` → `secrets.GITHUB_TOKEN`（上游用的是作者自己的 PAT；
+#      fork 里没有那个 Secret，第一个 job 直接失败，而后面依赖它）。自带令牌的权限
+#      由下面的 `permissions` 给，job 结束即失效，不用维护 PAT。
+#   2. `--no-sign`：本仓库自用不发布自动更新，不需要 updater 签名；而
+#      `tauri.conf.json` 里 `createUpdaterArtifacts: true` 时缺
+#      `TAURI_SIGNING_PRIVATE_KEY` 会让打包报错（「A public key has been found,
+#      but no private key」）。
+#   3. `includeUpdaterJson: false`：没有签名就不生成 `latest.json`。
+# 想恢复「签名 + 自动更新分发」，见文件末尾的说明。
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+
+# 自带令牌需要显式授权，否则无法建 Release / 传附件
+permissions:
+  contents: write
 
 jobs:
   create-release:
@@ -26,7 +41,7 @@ jobs:
         id: create_release
         run: npx changelogithub --draft --name ${{ steps.vars.outputs.tag }}
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-app:
     needs: create-release
@@ -97,13 +112,26 @@ jobs:
         env:
           CI: false
           PLATFORM: ${{ matrix.platform }}
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # 自用版不签名，所以这里**不读** TAURI_SIGNING_PRIVATE_KEY：
+          # 空值的同名变量反而会让签名那一步报错
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: BongoCat ${{ needs.create-release.outputs.APP_VERSION }}
+          # 上游这里引用的是 changelogithub 的 `APP_VERSION` 输出，而它并不存在
+          # （标题会变成「BongoCat 」）；自用版直接用标签名
+          releaseName: BongoCat ${{ github.ref_name }}
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.target }}
+          includeUpdaterJson: false
+          args: --target ${{ matrix.target }} --no-sign
+
+# 以后想恢复「安装包 + 自动更新」的完整分发（四步）：
+#   1. 生成本仓库自用的密钥对：`pnpm tauri signer generate -w $HOME/.tauri/bongocat.key`
+#   2. 把生成的**公钥**填进 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`
+#      （现在是上游的公钥，与自己的私钥不匹配，tauri 会直接拒绝）
+#   3. 在仓库 Settings → Secrets 里加 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）
+#      与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（私钥没设密码就留空）
+#   4. 去掉上面的 `--no-sign`、把 `includeUpdaterJson` 改回 `true`，
+#      并把 `plugins.updater.endpoints` 指向本仓库的
+#      `releases/latest/download/latest.json`（现在指的是上游，装了这个包会拉到上游版本）
