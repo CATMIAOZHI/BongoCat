@@ -3,7 +3,7 @@ name = "bongocat-pair-relay"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Self-hosted BongoCat pair relay: one instance serves exactly one pair"
+description = "Self-hosted BongoCat pair relay: one instance serves many two-device pair sessions"
 
 # 这个 crate 独立于仓库根目录的 workspace（根 workspace 只包含 src-tauri）。
 # 没有这张表时，cargo 会因为「目录在工作区里但不是成员」而拒绝编译。

@@ -1,7 +1,14 @@
-//! 会话层：一对连接、令牌桶限流、A ↔ B 转发、上下线控制帧。
+//! 会话层：多个双人会话（Room）、令牌桶限流、Room 内 A ↔ B 转发、上下线控制帧。
 //!
 //! 行为逐条对齐 `server-cloudflare/src/pair.ts` 的 Durable Object：顶替顺序、
 //! 「顶替之后还剩几个对端」的判定、`replaced` 过滤掉的伪离线通知，全部保持一样。
+//!
+//! 主要的差别是**分组**：CF 版一个部署就是一个 Room，这一版一套服务器同时承载
+//! `PAIR_MAX_SESSIONS` 个（§2）。分组键是客户端给的 `ROOM_ID`，而**所有**跨连接
+//! 的动作都必须先落进那个 Room：转发、上下线公告、同 deviceId 顶替、陈旧连接摘除、
+//! 停摆对端剔除。Room 之间互不可见是这一层的硬不变量（§15）。另外两条与分组无关的
+//! 差别（`4004` 离线帧的收件人集合、`FORWARD_TIMEOUT` 会摘掉停摆对端）逐条写在
+//! `../README.md` 的「与 Cloudflare 版的差异」那一节。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,24 +26,42 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::auth::{constant_time_eq, room_fingerprint};
 use crate::http::{write_upgrade, RequestHead};
 use crate::protocol::{
     self, close_code, is_known_frame_kind, Limits, ServerFrame, FRAME_HEADER_SIZE,
     FRAME_KIND_TRANSFER_CHUNK, LAST_SEEN_WRITE_INTERVAL_MS, MAX_BINARY_FRAME_SIZE, PAIR_SIZE,
 };
 
-struct Peer {
+/// 一条已经登记进某个 Room 的连接。
+struct ClientEntry {
     id: u64,
-    device_id: String,
     sender: mpsc::Sender<Message>,
     last_seen: Instant,
-    /// 这条连接被移出注册表时（顶替 / 停摆被摘）自动失效的信号，读循环据此退出。
+    /// 这条连接被移出所属 Room 时（顶替 / 停摆被摘）自动失效的信号，读循环据此退出。
     ///
-    /// 只为了它的 `Drop` 存在：注册表是「这条连接还算数」的唯一真相，一旦摘牌，
+    /// 只为了它的 `Drop` 存在：Room 里那份名单是「这条连接还算数」的唯一真相，一旦摘牌，
     /// 读循环必须跟着结束，否则 socket 会一直挂着——注册表说它离线，它却还在把
     /// 帧转给对方，两边都不会自愈。
     #[allow(dead_code)]
     ejected: oneshot::Sender<()>,
+}
+
+/// 一个双人会话：密钥相同的两个人落进同一个 Room，最多两台不同设备（§7 / §10）。
+struct PairRoom {
+    /// `SHA256(AUTH_TOKEN)`。中继**不保存明文 token**，后续连接按同样方式算一份，
+    /// 与它做恒定时间比较（§4 / §9）。
+    auth_hash: [u8; 32],
+    /// 按 deviceId 索引：同一个 deviceId 重连天然就是「换掉原来那条」。
+    clients: HashMap<String, ClientEntry>,
+    /// 已经由 `reserve` 放行、还没走进 `admit` 的连接数。
+    ///
+    /// 它让容量判定既不漏（握手途中也算占位）也不错放（握手失败要还回去）：
+    /// `PAIR_MAX_SESSIONS` 限制的是同时存在的 Room 数，而 Room 从放行那一刻就已经
+    /// 占住名额（§8）。
+    pending: usize,
+    created_at: Instant,
+    last_active: Instant,
 }
 
 /// 每个连接的出站队列容量。
@@ -102,7 +127,8 @@ impl Bucket {
 
 #[derive(Default)]
 struct State {
-    peers: Vec<Peer>,
+    /// `ROOM_ID` → 双人会话
+    rooms: HashMap<String, PairRoom>,
     buckets: HashMap<u64, Bucket>,
 }
 
@@ -114,11 +140,36 @@ enum Admit {
         peer_online: bool,
         ejected: oneshot::Receiver<()>,
     },
+    /// 这个 Room 里已经有两台不同设备在线（同一个联机密钥的第三台）
     Full,
+}
+
+/// `reserve` 的拒绝原因。
+///
+/// 两种都必须在 **WebSocket 升级之前**判定：客户端要按 HTTP 状态码区分「联机密钥不对」
+/// 与「服务器满员」，而升级成功之后只剩关闭码可以表达（§9 / §27）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomRejection {
+    /// 同名的 Room 已经存在，但这次带来的 token 摘要对不上 → 401
+    AuthMismatch,
+    /// 这是一个新 Room，而服务器已经承载了 `PAIR_MAX_SESSIONS` 个 → 503
+    Capacity,
+}
+
+/// 一次已经被计进容量的入场许可：`reserve` 签发，`serve` 消费。
+///
+/// 它的意义是让「握手成功之前就占住名额」与「握手失败要还回去」都有明确的归属：
+/// 拿到它就等于「这个 Room 的名额算在我头上」，所以**每一条签发都必须被消费或还回**，
+/// 否则名额会永久泄漏。
+#[derive(Debug)]
+pub struct Reservation {
+    room_id: String,
+    auth_hash: [u8; 32],
 }
 
 pub struct Relay {
     limits: Limits,
+    max_sessions: usize,
     stale_after: Duration,
     ice_servers: Option<serde_json::Value>,
     next_id: AtomicU64,
@@ -128,11 +179,13 @@ pub struct Relay {
 impl Relay {
     pub fn new(
         limits: Limits,
+        max_sessions: usize,
         stale_after: Duration,
         ice_servers: Option<serde_json::Value>,
     ) -> Arc<Self> {
         Arc::new(Self {
             limits,
+            max_sessions,
             stale_after,
             ice_servers,
             next_id: AtomicU64::new(1),
@@ -140,25 +193,85 @@ impl Relay {
         })
     }
 
+    /// 升级之前的容量与密钥判定（§8 / §9 / §27）。放行时**当场创建 Room**，让这份名额
+    /// 从这个连接算起；连接失败由 `release`（或 `serve` 内部的失败路径）还回来。
+    pub async fn reserve(
+        &self,
+        room_id: &str,
+        auth_hash: [u8; 32],
+    ) -> Result<Reservation, RoomRejection> {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+
+        match state.rooms.get_mut(room_id) {
+            Some(room) => {
+                if !constant_time_eq(&room.auth_hash, &auth_hash) {
+                    return Err(RoomRejection::AuthMismatch);
+                }
+
+                room.pending += 1;
+            }
+            None => {
+                // 满了只挡**新建**会话；已经在跑的 Room 走上面那一支，不受影响（§8）
+                if state.rooms.len() >= self.max_sessions {
+                    return Err(RoomRejection::Capacity);
+                }
+
+                state.rooms.insert(
+                    room_id.to_string(),
+                    PairRoom {
+                        auth_hash,
+                        clients: HashMap::new(),
+                        pending: 1,
+                        created_at: now,
+                        last_active: now,
+                    },
+                );
+            }
+        }
+
+        Ok(Reservation {
+            room_id: room_id.to_string(),
+            auth_hash,
+        })
+    }
+
+    /// 还回一份没用掉的入场许可（握手失败、后面的参数校验没过）。
+    pub async fn release(&self, reservation: Reservation) {
+        let mut state = self.state.lock().await;
+
+        release_pending(&mut state, &reservation.room_id);
+    }
+
     /// 完成握手、登记连接、跑读循环，直到这条连接结束。
     ///
     /// `head` 是已经被读掉的请求头（见 `http.rs`），这里不再重新解析。
+    /// `reservation` 由 `reserve` 签发，在这个函数里被消费——**成功走到 `admit`，
+    /// 或者在失败路径上还回去**，两条路都必须走完一条。
     pub async fn serve(
         self: Arc<Self>,
         stream: TcpStream,
         head: RequestHead,
         device_id: String,
+        reservation: Reservation,
     ) -> Result<(), String> {
+        let room_id = reservation.room_id.clone();
+
         let Some(key) = head.header("sec-websocket-key") else {
+            self.release(reservation).await;
+
             return Err("缺少 Sec-WebSocket-Key".into());
         };
 
         let accept_key = derive_accept_key(key.trim().as_bytes());
         let mut stream = stream;
 
-        write_upgrade(&mut stream, &accept_key)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = write_upgrade(&mut stream, &accept_key).await {
+            // 升级没成功就还回名额：否则一个连不上的客户端会永久占住一个会话位
+            self.release(reservation).await;
+
+            return Err(error.to_string());
+        }
 
         // 协议上限是 1 MiB，但这里故意把 WebSocket 层放到 8 MiB：超过 1 MiB 的帧必须
         // 由我们自己读完、再用 `close 1009` 关掉（这是线上契约的一部分）。
@@ -181,10 +294,12 @@ impl Relay {
         let (sender, receiver) = mpsc::channel::<Message>(OUTBOUND_QUEUE);
 
         // 先决定能不能进：满了就握手后立刻用 4003 关掉（CF 版同样是「升级成功再关」，
-        // 客户端才能把 4003 翻译成「配对已满」而不是一次普通连接失败）。
-        let (id, mut ejected) = match self.admit(&device_id, &sender).await {
+        // 客户端才能把 4003 显示成「该联机会话已有两台设备在线」而不是一次普通连接失败）。
+        let (id, mut ejected) = match self.admit(reservation, &device_id, &sender).await {
             Admit::Full => {
                 let _ = websocket
+                    // reason 与 CF 版逐字一致（`pair is full`）：关闭码才是契约，文案不是，
+                    // 但两个中继说同一句话能省掉一次「为什么这边说的是 room」的排查
                     .send(Message::Close(Some(close_frame(
                         close_code::PAIR_FULL,
                         "pair is full",
@@ -209,9 +324,9 @@ impl Relay {
 
                 // 此刻还没有 writer 任务，独占 socket，直接发
                 if let Err(error) = websocket.send(Message::Text(welcome.into())).await {
-                    // 已经登记进注册表了，必须先摘牌：否则会留下一个「幽灵对端」
+                    // 已经登记进 Room 了，必须先摘牌：否则会留下一个「幽灵对端」
                     // ——占着配对位，还让对方一直以为它在线上。
-                    self.drop_peer(id).await;
+                    self.drop_peer(&room_id, &device_id, id).await;
 
                     return Err(error.to_string());
                 }
@@ -304,8 +419,8 @@ impl Relay {
                         break;
                     }
 
-                    self.touch(id).await;
-                    self.forward(id, Message::Binary(bytes)).await;
+                    self.touch(&room_id, &device_id, id).await;
+                    self.forward(&room_id, id, Message::Binary(bytes)).await;
                 }
                 Message::Text(_) => {
                     // text 帧只用于服务端 → 客户端的控制帧。客户端发 text 属于协议偏离：
@@ -330,7 +445,7 @@ impl Relay {
         // 顺序很重要：注册表里也握着一份 sender，必须先摘掉它，writer 的 channel
         // 才会关闭；否则 `writer.await` 会一直等下去，离线通知永远发不出去。
         // 摘掉之后 channel 里已经排队的帧（例如刚才那条关闭帧）仍会被 writer 发完。
-        self.drop_peer(id).await;
+        self.drop_peer(&room_id, &device_id, id).await;
 
         // writer 有可能正卡在往一个停摆的 socket 写数据上：那时排队的关闭帧永远发不
         // 出去，`writer.await` 也永远不返回，socket 会一直挂着。给它一点时间把队列排
@@ -346,77 +461,101 @@ impl Relay {
         Ok(())
     }
 
-    /// 决定新连接能不能进来，并处理顶替。返回值里的 `peer_online` 用于 welcome。
-    async fn admit(&self, device_id: &str, sender: &mpsc::Sender<Message>) -> Admit {
+    /// 决定新连接能不能进这个 Room，并处理顶替。返回值里的 `peer_online` 用于 welcome。
+    ///
+    /// `reservation` 在这里被消费：名额已经用掉了，接受与否都不再还回去——拒绝只可能
+    /// 发生在「Room 里已经有两台不同设备在线」的时候，而那个 Room 本来就占着名额。
+    async fn admit(
+        &self,
+        reservation: Reservation,
+        device_id: &str,
+        sender: &mpsc::Sender<Message>,
+    ) -> Admit {
         let mut state = self.state.lock().await;
         let now = Instant::now();
+        let room_id = reservation.room_id.as_str();
 
-        let mine: Vec<u64> = state
-            .peers
-            .iter()
-            .filter(|peer| peer.device_id == device_id)
-            .map(|peer| peer.id)
-            .collect();
-        let others: Vec<u64> = state
-            .peers
-            .iter()
-            .filter(|peer| peer.device_id != device_id)
-            .map(|peer| peer.id)
-            .collect();
+        // 预留一定要在这里减掉：漏一次这个 Room 就永远清不掉（容量泄漏）。
+        match state.rooms.get_mut(room_id) {
+            Some(room) => room.pending = room.pending.saturating_sub(1),
+            // 理论上到不了：`reserve` 刚刚创建或命中过这个 Room。真被并发的清理摘掉时
+            // 就地按同一份 verifier 重建——名额在 `reserve` 那一侧已经算过，这里不重复判定。
+            None => {
+                state.rooms.insert(
+                    room_id.to_string(),
+                    PairRoom {
+                        auth_hash: reservation.auth_hash,
+                        clients: HashMap::new(),
+                        pending: 0,
+                        created_at: now,
+                        last_active: now,
+                    },
+                );
+            }
+        }
 
-        // 先算出「顶替之后还剩几个对端」，再决定是否动手关连接：先关再拒绝会把发起方
-        // 自己原来的连接也关掉，让本来能恢复的情况变成完全连不上。
-        let stale = if others.len() >= PAIR_SIZE {
-            state
-                .peers
-                .iter()
-                .find(|peer| {
-                    peer.device_id != device_id
-                        && now.duration_since(peer.last_seen) > self.stale_after
-                })
-                .map(|peer| peer.id)
-        } else {
-            None
+        let (others, stale) = {
+            let room = &state.rooms[room_id];
+
+            let others: Vec<String> = room
+                .clients
+                .keys()
+                .filter(|other| other.as_str() != device_id)
+                .cloned()
+                .collect();
+
+            // 先算出「顶替之后还剩几个对端」，再决定是否动手关连接：先关再拒绝会把发起方
+            // 自己原来的连接也关掉，让本来能恢复的情况变成完全连不上。
+            let stale = if others.len() >= PAIR_SIZE {
+                others
+                    .iter()
+                    .filter(|other| {
+                        now.duration_since(room.clients[*other].last_seen) > self.stale_after
+                    })
+                    // 顶替「先连进来的那一个」：CF 版按 Durable Object 的 WebSocket 插入
+                    // 顺序找第一个陈旧的连接，而每条连接的 id 正是按到达顺序单调发下去的，
+                    // 所以取最小的 id 与那边完全等价——`HashMap` 的迭代顺序是随机的，
+                    // 直接用它会让「顶替谁」变成抽签。
+                    .min_by_key(|other| room.clients[*other].id)
+                    .cloned()
+            } else {
+                None
+            };
+
+            (others, stale)
         };
 
-        let remaining = others.iter().filter(|id| Some(**id) != stale).count();
+        let remaining = others
+            .iter()
+            .filter(|other| Some(*other) != stale.as_ref())
+            .count();
 
         if remaining >= PAIR_SIZE {
-            // 持有同一个 PAIR_AUTH_TOKEN 的第三方无法进入：这是体验约束，不是安全边界（R9）
+            // 同一个联机密钥的第三方无法进入：这是体验约束，不是安全边界（R9 / §10）
             return Admit::Full;
         }
 
         // 同一 deviceId 重连（例如切换网络）：关掉旧连接再接受新连接
-        for id in mine {
-            close_peer(
-                &mut state,
-                id,
+        if let Some(entry) = take_client(&mut state, room_id, device_id) {
+            let _ = entry.sender.try_send(Message::Close(Some(close_frame(
                 close_code::REPLACED,
                 "replaced by a newer connection",
-            );
+            ))));
         }
 
-        if let Some(id) = stale {
-            let stale_device_id = state
-                .peers
-                .iter()
-                .find(|peer| peer.id == id)
-                .map(|peer| peer.device_id.clone());
+        if let Some(stale_device_id) = stale {
+            if let Some(entry) = take_client(&mut state, room_id, &stale_device_id) {
+                let _ = entry.sender.try_send(Message::Close(Some(close_frame(
+                    close_code::STALE,
+                    "stale connection replaced",
+                ))));
 
-            close_peer(
-                &mut state,
-                id,
-                close_code::STALE,
-                "stale connection replaced",
-            );
-
-            // CF 版靠被顶替连接的 close 事件补这条离线通知（`announceOffline` 只过滤
-            // 同一 deviceId 的伪通知，不排除 4004），所以这里也要补，否则同一个场景
-            // 在两侧会发出不同的控制帧。放在新连接上线**之前**：存活方看到的是
-            // 「旧的离线 → 新的上线」，终态仍然是在线（CF 靠事件时序拿到的是反过来的
-            // 顺序，反而会以「离线」收尾）。
-            if let Some(stale_device_id) = stale_device_id {
-                announce_offline(&mut state, id, stale_device_id);
+                // CF 版靠被顶替连接的 close 事件补这条离线通知（`announceOffline` 只过滤
+                // 同一 deviceId 的伪通知，不排除 4004），所以这里也要补，否则同一个场景
+                // 在两侧会发出不同的控制帧。放在新连接上线**之前**：存活方看到的是
+                // 「旧的离线 → 新的上线」，终态仍然是在线（CF 靠事件时序拿到的是反过来的
+                // 顺序，反而会以「离线」收尾）。
+                announce_offline(&mut state, room_id, entry.id, stale_device_id);
             }
         }
 
@@ -424,16 +563,33 @@ impl Relay {
         let (ejected, ejected_receiver) = oneshot::channel();
 
         state.buckets.insert(id, Bucket::full(self.limits, now));
-        state.peers.push(Peer {
-            id,
-            device_id: device_id.to_string(),
-            sender: sender.clone(),
-            last_seen: now,
-            ejected,
-        });
+
+        {
+            let room = state
+                .rooms
+                .get_mut(room_id)
+                .expect("`reserve` 刚刚确保过这个 Room 存在");
+
+            if room.clients.is_empty() {
+                println!("[{}] 双人会话建立", room_fingerprint(room_id));
+            }
+
+            room.clients.insert(
+                device_id.to_string(),
+                ClientEntry {
+                    id,
+                    sender: sender.clone(),
+                    last_seen: now,
+                    ejected,
+                },
+            );
+
+            room.last_active = now;
+        }
 
         broadcast(
             &mut state,
+            room_id,
             id,
             ServerFrame::Peer {
                 online: true,
@@ -448,38 +604,61 @@ impl Relay {
         }
     }
 
-    async fn drop_peer(&self, id: u64) {
+    /// 收尾一条连接。
+    ///
+    /// 必须在**所属 Room** 里按 `(deviceId, connectionId)` 双重匹配（§14）：同一个
+    /// deviceId 的新连接已经把旧连接顶掉时，旧连接那条迟到的清理绝不能把新连接删掉
+    /// ——那是「新连接刚连上就被判离线」，两端都会卡住。
+    async fn drop_peer(&self, room_id: &str, device_id: &str, id: u64) {
         let mut state = self.state.lock().await;
 
-        let Some(index) = state.peers.iter().position(|peer| peer.id == id) else {
+        let is_current = state
+            .rooms
+            .get(room_id)
+            .and_then(|room| room.clients.get(device_id))
+            .is_some_and(|entry| entry.id == id);
+
+        // 名单里那条不是我了：这是一条已经被顶替的旧连接的迟到清理，什么都别做
+        if !is_current {
+            return;
+        }
+
+        let Some(entry) = take_client(&mut state, room_id, device_id) else {
             return;
         };
 
-        let peer = state.peers.remove(index);
-
-        state.buckets.remove(&id);
-
-        announce_offline(&mut state, id, peer.device_id.clone());
+        announce_offline(&mut state, room_id, entry.id, device_id.to_string());
+        sweep(&mut state, room_id);
     }
 
     /// 最后活动时间最多每 10 秒更新一次，避免高频写（顶替判定只需要粗粒度）
-    async fn touch(&self, id: u64) {
+    async fn touch(&self, room_id: &str, device_id: &str, id: u64) {
         let mut state = self.state.lock().await;
         let now = Instant::now();
 
-        if let Some(peer) = state.peers.iter_mut().find(|peer| peer.id == id) {
-            if now.duration_since(peer.last_seen)
+        let Some(room) = state.rooms.get_mut(room_id) else {
+            return;
+        };
+
+        room.last_active = now;
+
+        let Some(entry) = room.clients.get_mut(device_id) else {
+            return;
+        };
+
+        // 只有当前这条连接能刷新自己的时钟：旧连接的帧不该让新连接看起来还活着
+        if entry.id == id
+            && now.duration_since(entry.last_seen)
                 >= Duration::from_millis(LAST_SEEN_WRITE_INTERVAL_MS)
-            {
-                peer.last_seen = now;
-            }
+        {
+            entry.last_seen = now;
         }
     }
 
     async fn allow(&self, id: u64, frames: f64, chunks: f64, bytes: f64) -> bool {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        // 已经不在注册表里的连接不再有桶：`entry().or_insert_with()` 会把桶重建出来，
+        // 已经不在名单里的连接不再有桶：`entry().or_insert_with()` 会把桶重建出来，
         // 被摘掉的对端再发一帧就永久留下一条残留。这里直接拒绝，让读循环退出。
         let Some(bucket) = state.buckets.get_mut(&id) else {
             return false;
@@ -488,29 +667,32 @@ impl Relay {
         bucket.take(self.limits, now, frames, chunks, bytes)
     }
 
-    /// 只转发给对端，不回发给发送者。
+    /// 只转发给**同一个 Room** 的对端，不回发给发送者，也不遍历别的 Room（§15）。
     ///
     /// 队列是有限的：对端消费不过来时这里会 await 等空位（反压回发送方的 TCP），
-    /// 而不是把帧堆在内存里。真被拖过 `FORWARD_TIMEOUT` 就把那个对端摘掉——一条
-    /// 停摆的连接不该拖死整台中继。
-    async fn forward(&self, from: u64, message: Message) {
-        let targets: Vec<(u64, mpsc::Sender<Message>)> = {
+    /// 而不是把帧堆在内存里。真被拖过 `FORWARD_TIMEOUT` 就把那个对端摘掉（只摘那一条，
+    /// 而且只摘在它自己的 Room 里）——一条停摆的连接不该拖死整台中继。
+    async fn forward(&self, room_id: &str, from: u64, message: Message) {
+        let targets: Vec<(String, u64, mpsc::Sender<Message>)> = {
             let state = self.state.lock().await;
 
-            state
-                .peers
-                .iter()
-                .filter(|peer| peer.id != from)
-                .map(|peer| (peer.id, peer.sender.clone()))
-                .collect()
+            match state.rooms.get(room_id) {
+                None => Vec::new(),
+                Some(room) => room
+                    .clients
+                    .iter()
+                    .filter(|(_, entry)| entry.id != from)
+                    .map(|(device_id, entry)| (device_id.clone(), entry.id, entry.sender.clone()))
+                    .collect(),
+            }
         };
 
-        for (id, sender) in targets {
+        for (device_id, id, sender) in targets {
             match tokio::time::timeout(FORWARD_TIMEOUT, sender.send(message.clone())).await {
                 Ok(Ok(())) => {}
                 _ => {
                     // 队列已满且超时 / channel 已关闭：这个对端已经停摆
-                    self.drop_peer(id).await;
+                    self.drop_peer(room_id, &device_id, id).await;
                 }
             }
         }
@@ -534,18 +716,19 @@ fn too_large_close(error: &WsError) -> Option<CloseFrame> {
     .then(|| close_frame(close_code::TOO_LARGE, "frame too large"))
 }
 
-/// 广播「某台设备离线了」。
+/// 广播「某台设备离线了」——**只发给同一个 Room**（§15）。
 ///
-/// 同一 deviceId 的新连接已经在注册表里时（顶替重连）这条是伪广播：对端会看到
+/// 同一 deviceId 的新连接还在这个 Room 里时（顶替重连）这条是伪广播：对端会看到
 /// 「上线 → 下线」，最终以为对方离线，所以要过滤掉。CF 版的 `announceOffline` 是
 /// 同一套规则（靠 close 事件晚于 accept 达到同样效果）。
-fn announce_offline(state: &mut State, except: u64, device_id: String) {
-    if is_false_offline(state, &device_id) {
+fn announce_offline(state: &mut State, room_id: &str, except: u64, device_id: String) {
+    if is_false_offline(state, room_id, &device_id) {
         return;
     }
 
     broadcast(
         state,
+        room_id,
         except,
         ServerFrame::Peer {
             online: false,
@@ -554,75 +737,163 @@ fn announce_offline(state: &mut State, except: u64, device_id: String) {
     );
 }
 
-/// 同一 deviceId 的连接还在注册表里时（顶替重连），这条离线通知是伪广播
-fn is_false_offline(state: &State, device_id: &str) -> bool {
-    state.peers.iter().any(|other| other.device_id == device_id)
+/// 同一 deviceId 的连接还在**这个 Room** 里时（顶替重连），这条离线通知是伪广播
+fn is_false_offline(state: &State, room_id: &str, device_id: &str) -> bool {
+    state
+        .rooms
+        .get(room_id)
+        .is_some_and(|room| room.clients.contains_key(device_id))
 }
 
-/// 把一条控制帧广播给 `except` 之外的连接。
+/// 把一条控制帧广播给**同一个 Room** 里 `except` 之外的连接。
 ///
 /// 用 `try_send` 而不是 `send().await`：这里在锁内，等空位会把整个会话层卡住。
-/// 投不进去说明那条连接已经停摆（出站队列满），把它从注册表里摘掉——留在里面会让
+/// 投不进去说明那条连接已经停摆（出站队列满），把它从名单里摘掉——留在里面会让
 /// 另一方永远以为它在线，而它其实什么也收不到。
-fn broadcast(state: &mut State, except: u64, frame: ServerFrame) {
-    let mut pending = vec![(except, frame.to_json())];
+fn broadcast(state: &mut State, room_id: &str, except: u64, frame: ServerFrame) {
+    let mut pending = vec![(room_id.to_string(), except, frame.to_json())];
 
-    while let Some((except, json)) = pending.pop() {
+    while let Some((room_id, except, json)) = pending.pop() {
         let mut stalled = Vec::new();
 
-        for peer in state.peers.iter().filter(|peer| peer.id != except) {
-            if peer
-                .sender
-                .try_send(Message::Text(json.clone().into()))
-                .is_err()
-            {
-                stalled.push(peer.id);
+        if let Some(room) = state.rooms.get(&room_id) {
+            for (device_id, entry) in room.clients.iter().filter(|(_, entry)| entry.id != except) {
+                if entry
+                    .sender
+                    .try_send(Message::Text(json.clone().into()))
+                    .is_err()
+                {
+                    stalled.push(device_id.clone());
+                }
             }
         }
 
-        for id in stalled {
-            let Some(index) = state.peers.iter().position(|peer| peer.id == id) else {
+        for device_id in stalled {
+            let Some(entry) = take_client(state, &room_id, &device_id) else {
                 continue;
             };
 
-            let peer = state.peers.remove(index);
-
-            state.buckets.remove(&id);
-
-            // 它一条通知都没收到，所以剩下的人也必须知道它离线了。同一 deviceId 的
+            // 它一条通知都没收到，所以同 Room 剩下的人也必须知道它离线了。同一 deviceId 的
             // 新连接已经在列表里时（顶替重连），这条同样是伪通知，要一起过滤掉。
-            if !is_false_offline(state, &peer.device_id) {
+            if !is_false_offline(state, &room_id, &device_id) {
                 pending.push((
-                    id,
+                    room_id.clone(),
+                    entry.id,
                     ServerFrame::Peer {
                         online: false,
-                        device_id: peer.device_id,
+                        device_id,
                     }
                     .to_json(),
                 ));
             }
+
+            // 摘掉最后一个连接之后这个 Room 就空了：名额要跟着还回去
+            sweep(state, &room_id);
         }
     }
 }
 
-/// 顶替一个已经登记的连接：移出注册表并把关闭帧交给它的 writer
-fn close_peer(state: &mut State, id: u64, code: u16, reason: &str) {
-    let Some(index) = state.peers.iter().position(|peer| peer.id == id) else {
+/// 把一条连接从所属 Room 里摘下来（顶替 / 停摆 / 正常断开共用）。
+///
+/// 顺便丢掉它的限流桶：已经不在名单里的连接不该再留桶。
+fn take_client(state: &mut State, room_id: &str, device_id: &str) -> Option<ClientEntry> {
+    let room = state.rooms.get_mut(room_id)?;
+    let entry = room.clients.remove(device_id)?;
+
+    state.buckets.remove(&entry.id);
+
+    Some(entry)
+}
+
+/// 还回一份没用掉的入场许可。Room 空了就跟着删掉，把名额让出来（§13）。
+fn release_pending(state: &mut State, room_id: &str) {
+    let Some(room) = state.rooms.get_mut(room_id) else {
         return;
     };
 
-    let peer = state.peers.remove(index);
+    room.pending = room.pending.saturating_sub(1);
 
-    state.buckets.remove(&id);
-    let _ = peer
-        .sender
-        .try_send(Message::Close(Some(close_frame(code, reason))));
+    sweep(state, room_id);
+}
+
+/// 一个人都不剩的 Room 就地删除——`PAIR_MAX_SESSIONS` 的名额随之释放（§13）。
+///
+/// **还在握手里的 Room 不能删**（`pending > 0`）：那份许可已经算进容量了，删掉它会让
+/// 随后到达的 `admit` 落进「Room 不存在」的分支，两边的账就对不上了。
+fn sweep(state: &mut State, room_id: &str) {
+    let Some(room) = state.rooms.get(room_id) else {
+        return;
+    };
+
+    if !room.clients.is_empty() || room.pending > 0 {
+        return;
+    }
+
+    let created_at = room.created_at;
+    let last_active = room.last_active;
+
+    state.rooms.remove(room_id);
+
+    println!(
+        "[{}] 双人会话已释放（存活 {:.0}s，最后活动在 {:.0}s 前）",
+        room_fingerprint(room_id),
+        created_at.elapsed().as_secs_f64(),
+        last_active.elapsed().as_secs_f64()
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth;
     use tokio::sync::oneshot::error::TryRecvError;
+
+    /// 固定向量用的联机密钥（与 `crypto.rs` / `auth.rs` 里那份是同一个）
+    const SECRET: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+    /// 三个互不相干的会话。中继本身不校验 `ROOM_ID` 的格式（那是 `server.rs` 的事），
+    /// 所以这里用短名字就够了。
+    const ROOM_A: &str = "room-a";
+    const ROOM_B: &str = "room-b";
+    const ROOM_C: &str = "room-c";
+
+    fn relay(max_sessions: usize, stale_after: Duration) -> Arc<Relay> {
+        Relay::new(Limits::default(), max_sessions, stale_after, None)
+    }
+
+    /// 走完 `reserve` + `admit` 的正常路径（不 panic，拒绝的情况也返回给用例断言）
+    async fn join(
+        relay: &Arc<Relay>,
+        room_id: &str,
+        token: &str,
+        device_id: &str,
+        sender: &mpsc::Sender<Message>,
+    ) -> Admit {
+        let reservation = relay
+            .reserve(room_id, auth::auth_verifier(token))
+            .await
+            .unwrap_or_else(|rejection| panic!("预留 {room_id} 不该被拒：{rejection:?}"));
+
+        relay.admit(reservation, device_id, sender).await
+    }
+
+    /// `join` 的成功路径
+    async fn join_ok(
+        relay: &Arc<Relay>,
+        room_id: &str,
+        token: &str,
+        device_id: &str,
+        sender: &mpsc::Sender<Message>,
+    ) -> (u64, bool, oneshot::Receiver<()>) {
+        match join(relay, room_id, token, device_id, sender).await {
+            Admit::Accepted {
+                id,
+                peer_online,
+                ejected,
+            } => (id, peer_online, ejected),
+            Admit::Full => panic!("{device_id} 不该被拒绝"),
+        }
+    }
 
     fn drain(receiver: &mut mpsc::Receiver<Message>) -> Vec<Message> {
         let mut messages = Vec::new();
@@ -652,6 +923,16 @@ mod tests {
                 }),
             _ => false,
         })
+    }
+
+    /// 队列里的第一条二进制帧（转发出去的正是它）
+    fn next_binary(receiver: &mut mpsc::Receiver<Message>) -> Option<Vec<u8>> {
+        drain(receiver)
+            .into_iter()
+            .find_map(|message| match message {
+                Message::Binary(bytes) => Some(bytes.to_vec()),
+                _ => None,
+            })
     }
 
     #[test]
@@ -724,115 +1005,150 @@ mod tests {
         assert!(!bucket.take(limits, start, 0.0, 0.0, 1.0));
     }
 
+    /// §30「Room 创建」：第一个人进来就把会话建起来，另一个人还没在
     #[tokio::test]
-    async fn admits_two_distinct_devices_and_rejects_the_third() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
-        let (sender_a, mut receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, mut receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_c, _receiver_c) = mpsc::channel(OUTBOUND_QUEUE);
+    async fn a_room_is_created_by_its_first_client() {
+        let relay = relay(2, Duration::from_secs(120));
+        let (sender, _receiver) = mpsc::channel(OUTBOUND_QUEUE);
 
-        let Admit::Accepted { peer_online, .. } = relay.admit("a", &sender_a).await else {
-            panic!("第一个连接应当被接受");
-        };
+        let (_, peer_online, _) = join_ok(&relay, ROOM_A, "token-a", "a1", &sender).await;
 
         assert!(!peer_online, "第一个人进来时对端还没上线");
-
-        let Admit::Accepted { peer_online, .. } = relay.admit("b", &sender_b).await else {
-            panic!("第二个连接应当被接受");
-        };
-
-        assert!(peer_online, "第二个人进来时对方已在线");
-
-        let announced = drain(&mut receiver_a);
-        let json: serde_json::Value =
-            serde_json::from_str(announced[0].to_text().unwrap()).unwrap();
-
-        assert_eq!(json["type"], "server.peer");
-        assert_eq!(json["online"], true);
-        assert_eq!(json["deviceId"], "b");
-        assert!(drain(&mut receiver_b).is_empty(), "上线通知不能回发给本人");
-
-        assert!(matches!(relay.admit("c", &sender_c).await, Admit::Full));
     }
 
+    /// §18 / §30「双人加入」：同一个 secret 派生出的 Room 与 token 会让两个人落在同一会话里；
+    /// 另一个 secret 走的是**另一个** Room，而不是被当成第三台设备
     #[tokio::test]
-    async fn reconnecting_with_the_same_device_id_replaces_without_a_false_offline() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
-        let (sender_a1, mut receiver_a1) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_a2, mut receiver_a2) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, mut receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
+    async fn the_same_secret_lands_in_the_same_room() {
+        let relay = relay(4, Duration::from_secs(120));
+        let secret = auth::decode_pair_secret(SECRET).unwrap();
+        let room = auth::derive_room_id(&secret);
+        let token = auth::derive_auth_token(&secret);
+        let (a1_tx, _a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, _a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b1_tx, _b1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        // 真实形态：32 字节 base64url 无填充
+        assert_eq!(room.len(), 43);
+
+        let (_, first_online, _) = join_ok(&relay, &room, &token, "a1", &a1_tx).await;
+
+        assert!(!first_online);
+
+        let (_, second_online, _) = join_ok(&relay, &room, &token, "a2", &a2_tx).await;
+
+        assert!(second_online, "同一个密钥的第二个人应当看到对端在线");
+
+        let other_secret = [7u8; auth::PAIR_SECRET_BYTES];
+        let other_room = auth::derive_room_id(&other_secret);
+        let other_token = auth::derive_auth_token(&other_secret);
+        let (_, other_online, _) = join_ok(&relay, &other_room, &other_token, "b1", &b1_tx).await;
+
+        assert_ne!(other_room, room);
+        assert!(!other_online, "另一个会话的第一个人也不该看到对端在线");
+    }
+
+    /// §30「第三台设备」：同一个 Room 里的第三台不同设备进不来，但**别的** Room 不受影响
+    #[tokio::test]
+    async fn the_third_device_of_a_room_is_rejected_while_other_rooms_are_not() {
+        let relay = relay(4, Duration::from_secs(120));
+        let (a1_tx, _a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, _a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a3_tx, _a3_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b1_tx, _b1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        join_ok(&relay, ROOM_A, "token-a", "a1", &a1_tx).await;
+        join_ok(&relay, ROOM_A, "token-a", "a2", &a2_tx).await;
 
         assert!(matches!(
-            relay.admit("a", &sender_a1).await,
-            Admit::Accepted { .. }
-        ));
-        assert!(matches!(
-            relay.admit("b", &sender_b).await,
-            Admit::Accepted { .. }
+            join(&relay, ROOM_A, "token-a", "a3", &a3_tx).await,
+            Admit::Full
         ));
 
-        let Admit::Accepted { peer_online, .. } = relay.admit("a", &sender_a2).await else {
-            panic!("同一个 deviceId 重连不能被当成第三个人");
-        };
+        // 别的会话一点都没被牵连
+        let (_, peer_online, _) = join_ok(&relay, ROOM_B, "token-b", "b1", &b1_tx).await;
+
+        assert!(!peer_online);
+    }
+
+    /// §9 / §30「Secret 错误」：同名 Room 上拿错 token 必须 401，而且**不能**建出第二个房间
+    #[tokio::test]
+    async fn a_wrong_token_on_an_existing_room_is_refused() {
+        let relay = relay(1, Duration::from_secs(120));
+        let (a1_tx, _a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, _a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        join_ok(&relay, ROOM_A, "token-a", "a1", &a1_tx).await;
+
+        assert_eq!(
+            relay
+                .reserve(ROOM_A, auth::auth_verifier("token-wrong"))
+                .await
+                .unwrap_err(),
+            RoomRejection::AuthMismatch
+        );
+
+        // 被拒之后这个房间还是原来那个（没被清掉、也没被替换）
+        let (_, peer_online, _) = join_ok(&relay, ROOM_A, "token-a", "a2", &a2_tx).await;
 
         assert!(peer_online);
-        assert_eq!(
-            drain(&mut receiver_a1)
-                .iter()
-                .filter_map(close_code_of)
-                .next(),
-            Some(close_code::REPLACED)
-        );
-        assert!(drain(&mut receiver_a2).is_empty(), "新连接不该收到关闭帧");
-
-        // B 只看到 A 上线的通知，不该看到「A 下线」
-        let seen = drain(&mut receiver_b);
-
-        assert_eq!(seen.iter().filter_map(close_code_of).count(), 0);
-        assert_eq!(seen.len(), 1);
     }
 
+    /// §11：同一个 deviceId 重连顶替旧连接，不能算第三个人，也不该发伪离线公告
+    #[tokio::test]
+    async fn reconnecting_with_the_same_device_id_replaces_without_a_false_offline() {
+        let relay = relay(2, Duration::from_secs(120));
+        let (a1_tx, mut a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, mut a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, mut b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        join_ok(&relay, ROOM_A, "token-a", "a", &a1_tx).await;
+        join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
+
+        let (_, peer_online, _) = join_ok(&relay, ROOM_A, "token-a", "a", &a2_tx).await;
+
+        assert!(peer_online, "同一个 deviceId 重连不能被当成第三个人");
+        assert_eq!(
+            drain(&mut a1_rx).iter().filter_map(close_code_of).next(),
+            Some(close_code::REPLACED)
+        );
+        assert!(drain(&mut a2_rx).is_empty(), "新连接不该收到关闭帧");
+
+        // B 只看到 A 上线的通知（第二条），不该看到「A 下线」
+        let seen = drain(&mut b_rx);
+
+        assert_eq!(seen.iter().filter_map(close_code_of).count(), 0);
+        assert!(!announced_offline(&mut b_rx, "a"), "不该有伪离线");
+    }
+
+    /// §12：陈旧连接被顶替（4004），并且只在这个 Room 里发生
     #[tokio::test]
     async fn a_stale_peer_is_evicted_with_4004() {
-        let relay = Relay::new(Limits::default(), Duration::ZERO, None);
-        let (sender_a, mut receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, mut receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_c, _receiver_c) = mpsc::channel(OUTBOUND_QUEUE);
+        let relay = relay(2, Duration::ZERO);
+        let (a_tx, mut a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, mut b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (c_tx, _c_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
-        assert!(matches!(
-            relay.admit("a", &sender_a).await,
-            Admit::Accepted { .. }
-        ));
-        assert!(matches!(
-            relay.admit("b", &sender_b).await,
-            Admit::Accepted { .. }
-        ));
+        join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
+        join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
-        drain(&mut receiver_a);
-        drain(&mut receiver_b);
+        drain(&mut a_rx);
+        drain(&mut b_rx);
 
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let Admit::Accepted { peer_online, .. } = relay.admit("c", &sender_c).await else {
-            panic!("陈旧连接应当被顶替，而不是让第三个人被拒");
-        };
+        let (_, peer_online, _) = join_ok(&relay, ROOM_A, "token-a", "c", &c_tx).await;
 
         assert!(peer_online, "顶替之后还剩一个对端");
 
-        // 顶替的是列表里第一个陈旧的连接（先连进来的那个）
+        // 顶替的是先连进来的那个
         assert_eq!(
-            drain(&mut receiver_a)
-                .iter()
-                .filter_map(close_code_of)
-                .next(),
+            drain(&mut a_rx).iter().filter_map(close_code_of).next(),
             Some(close_code::STALE)
         );
-        // 活下来的那个收到「a 离线」再收到「c 上线」，而不是关闭帧。
-        //
-        // 离线这条是 CF 版也有的（它的 `announceOffline` 只过滤同一 deviceId 的伪通知，
-        // 4004 被顶替的那台不属于新连接的 deviceId）；顺序放在上线之前，存活方最后的
-        // 判断才是「在线」。
-        let seen: Vec<serde_json::Value> = drain(&mut receiver_b)
+
+        // 活下来的那个收到「a 离线」再收到「c 上线」，而不是关闭帧
+        let seen: Vec<serde_json::Value> = drain(&mut b_rx)
             .iter()
             .map(|message| serde_json::from_str(message.to_text().unwrap()).unwrap())
             .collect();
@@ -848,23 +1164,18 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_peer_announces_offline_to_the_other_side() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
-        let (sender_a, mut receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, _receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
+        let relay = relay(2, Duration::from_secs(120));
+        let (a_tx, mut a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, _b_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
-        assert!(matches!(
-            relay.admit("a", &sender_a).await,
-            Admit::Accepted { .. }
-        ));
+        join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
 
-        let Admit::Accepted { id, .. } = relay.admit("b", &sender_b).await else {
-            panic!("第二个连接应当被接受");
-        };
+        let (b_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
-        drain(&mut receiver_a);
-        relay.drop_peer(id).await;
+        drain(&mut a_rx);
+        relay.drop_peer(ROOM_A, "b", b_id).await;
 
-        let seen = drain(&mut receiver_a);
+        let seen = drain(&mut a_rx);
         let json: serde_json::Value = serde_json::from_str(seen[0].to_text().unwrap()).unwrap();
 
         assert_eq!(json["type"], "server.peer");
@@ -872,18 +1183,211 @@ mod tests {
         assert_eq!(json["deviceId"], "b");
     }
 
+    /// §15 / §30「Room 隔离」：A 房发的帧只有 A 房的另一个人收到，必须做负向断言
+    #[tokio::test]
+    async fn binary_frames_never_cross_rooms() {
+        let relay = relay(4, Duration::from_secs(120));
+        let (a1_tx, mut a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, mut a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b1_tx, mut b1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b2_tx, mut b2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        let (a1_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "a1", &a1_tx).await;
+
+        join_ok(&relay, ROOM_A, "token-a", "a2", &a2_tx).await;
+        join_ok(&relay, ROOM_B, "token-b", "b1", &b1_tx).await;
+        join_ok(&relay, ROOM_B, "token-b", "b2", &b2_tx).await;
+
+        drain(&mut a1_rx);
+        drain(&mut a2_rx);
+        drain(&mut b1_rx);
+        drain(&mut b2_rx);
+
+        relay
+            .forward(ROOM_A, a1_id, Message::Binary(vec![9u8; 32].into()))
+            .await;
+
+        assert_eq!(next_binary(&mut a2_rx), Some(vec![9u8; 32]));
+        // 负向断言：B 房一条都收不到，发送者自己也不回环
+        assert!(next_binary(&mut b1_rx).is_none(), "B 房收到了 A 房的帧");
+        assert!(next_binary(&mut b2_rx).is_none(), "B 房收到了 A 房的帧");
+        assert!(next_binary(&mut a1_rx).is_none(), "不该回发给发送者");
+    }
+
+    /// §30「server.peer 隔离」：上下线公告不能跨 Room
+    #[tokio::test]
+    async fn peer_announcements_stay_inside_the_room() {
+        let relay = relay(4, Duration::from_secs(120));
+        let (a1_tx, mut a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, _a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b1_tx, mut b1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b2_tx, mut b2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        join_ok(&relay, ROOM_A, "token-a", "a1", &a1_tx).await;
+
+        let (a2_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "a2", &a2_tx).await;
+
+        join_ok(&relay, ROOM_B, "token-b", "b1", &b1_tx).await;
+        join_ok(&relay, ROOM_B, "token-b", "b2", &b2_tx).await;
+
+        drain(&mut a1_rx);
+        drain(&mut b1_rx);
+        drain(&mut b2_rx);
+
+        relay.drop_peer(ROOM_A, "a2", a2_id).await;
+
+        assert!(announced_offline(&mut a1_rx, "a2"), "同房的人应当收到离线");
+        assert!(drain(&mut b1_rx).is_empty(), "B 房收到了 A 房的离线公告");
+        assert!(drain(&mut b2_rx).is_empty(), "B 房收到了 A 房的离线公告");
+    }
+
+    /// §8 / §27 / §30「已有 Room 不受容量影响」：满员只挡**新建**会话
+    #[tokio::test]
+    async fn capacity_only_blocks_new_rooms() {
+        let relay = relay(2, Duration::from_secs(120));
+        let (a1_tx, _a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, _a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b1_tx, _b1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        join_ok(&relay, ROOM_A, "token-a", "a1", &a1_tx).await;
+        join_ok(&relay, ROOM_B, "token-b", "b1", &b1_tx).await;
+
+        // 新的会话被拒（就是 server.rs 翻成 HTTP 503 的那条路径）
+        assert_eq!(
+            relay
+                .reserve(ROOM_C, auth::auth_verifier("token-c"))
+                .await
+                .unwrap_err(),
+            RoomRejection::Capacity
+        );
+
+        // 已存在的会话里，第二个人照样能进
+        let (_, peer_online, _) = join_ok(&relay, ROOM_A, "token-a", "a2", &a2_tx).await;
+
+        assert!(peer_online);
+
+        // 同 deviceId 重连也不受影响（用的是同一个 Room 的第二条连接）
+        let (_, _, _) = join_ok(&relay, ROOM_A, "token-a", "a1", &a2_tx).await;
+    }
+
+    /// §13 / §30「capacity 释放」：最后一个客户端走了，会话被删除，名额让给新会话
+    #[tokio::test]
+    async fn a_room_that_empties_frees_its_slot() {
+        let relay = relay(1, Duration::from_secs(120));
+        let (a1_tx, _a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        let (a1_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "a1", &a1_tx).await;
+
+        assert_eq!(
+            relay
+                .reserve(ROOM_B, auth::auth_verifier("token-b"))
+                .await
+                .unwrap_err(),
+            RoomRejection::Capacity
+        );
+
+        relay.drop_peer(ROOM_A, "a1", a1_id).await;
+
+        assert!(
+            relay
+                .reserve(ROOM_B, auth::auth_verifier("token-b"))
+                .await
+                .is_ok(),
+            "会话空了就该把名额还回来"
+        );
+    }
+
+    /// §14 / §30「disconnect race」：旧连接的迟到清理不能把新连接删掉
+    #[tokio::test]
+    async fn a_late_cleanup_from_a_replaced_connection_keeps_the_new_one() {
+        let relay = relay(2, Duration::from_secs(120));
+        let (a1_tx, mut a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, mut a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, mut b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        let (a1_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "a", &a1_tx).await;
+        let (b_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
+        let (a2_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "a", &a2_tx).await;
+
+        assert_ne!(a1_id, a2_id);
+
+        drain(&mut a1_rx);
+        drain(&mut a2_rx);
+        drain(&mut b_rx);
+
+        // 旧 socket 的读循环结束得比顶替晚：这条清理必须被识别成「名单里那条不是我」
+        relay.drop_peer(ROOM_A, "a", a1_id).await;
+
+        // 新连接还在：B 发的帧必须送到它手上
+        relay
+            .forward(ROOM_A, b_id, Message::Binary(vec![5u8; 8].into()))
+            .await;
+
+        assert_eq!(next_binary(&mut a2_rx), Some(vec![5u8; 8]));
+        // 而且不能因此冒出「a 离线」这种伪公告
+        assert!(!announced_offline(&mut b_rx, "a"));
+    }
+
+    /// 握手失败要还名额：`release` 之后那个会话就不该再占位置
+    #[tokio::test]
+    async fn a_reservation_that_never_reaches_admit_is_given_back() {
+        let relay = relay(1, Duration::from_secs(120));
+        let reservation = relay
+            .reserve(ROOM_A, auth::auth_verifier("token-a"))
+            .await
+            .unwrap();
+
+        relay.release(reservation).await;
+
+        assert!(
+            relay
+                .reserve(ROOM_B, auth::auth_verifier("token-b"))
+                .await
+                .is_ok(),
+            "没用掉的预留必须把名额还回来"
+        );
+    }
+
+    /// 还有连接在握手里的会话不能被清掉：那份预留已经算进容量了
+    #[tokio::test]
+    async fn a_room_with_a_handshake_in_flight_is_not_swept() {
+        let relay = relay(1, Duration::from_secs(120));
+        let first = relay
+            .reserve(ROOM_A, auth::auth_verifier("token-a"))
+            .await
+            .unwrap();
+        let second = relay
+            .reserve(ROOM_A, auth::auth_verifier("token-a"))
+            .await
+            .unwrap();
+
+        relay.release(first).await;
+
+        // 房间还在，而且仍然认同一份密钥（没有被清掉再重建）
+        assert_eq!(
+            relay
+                .reserve(ROOM_A, auth::auth_verifier("wrong"))
+                .await
+                .unwrap_err(),
+            RoomRejection::AuthMismatch
+        );
+
+        let (sender, _receiver) = mpsc::channel(OUTBOUND_QUEUE);
+
+        assert!(matches!(
+            relay.admit(second, "a1", &sender).await,
+            Admit::Accepted { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn the_rate_limit_is_per_socket() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
-        let (sender_a, _receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, _receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
+        let relay = relay(2, Duration::from_secs(120));
+        let (a_tx, _a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, _b_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
-        let Admit::Accepted { id: id_a, .. } = relay.admit("a", &sender_a).await else {
-            panic!("A 应当被接受");
-        };
-        let Admit::Accepted { id: id_b, .. } = relay.admit("b", &sender_b).await else {
-            panic!("B 应当被接受");
-        };
+        let (id_a, _, _) = join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
+        let (id_b, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
         for _ in 0..30 {
             assert!(relay.allow(id_a, 1.0, 0.0, 64.0).await);
@@ -894,114 +1398,106 @@ mod tests {
         assert!(relay.allow(id_b, 1.0, 0.0, 64.0).await);
 
         // 已经摘掉的连接不再有桶，也不会被 `entry().or_insert_with()` 重新造出来
-        relay.drop_peer(id_b).await;
+        relay.drop_peer(ROOM_A, "b", id_b).await;
         assert!(!relay.allow(id_b, 1.0, 0.0, 64.0).await);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_stalled_peer_is_ejected_after_the_forward_timeout() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
+        let relay = relay(2, Duration::from_secs(120));
         // A 的接收端一直活着但不消费：队列会满，`send` 会一直等空位
-        let (sender_a, mut receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, mut receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_c, _receiver_c) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a_tx, mut a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, mut b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (c_tx, _c_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
-        let Admit::Accepted { mut ejected, .. } = relay.admit("a", &sender_a).await else {
-            panic!("A 应当被接受");
-        };
-        let Admit::Accepted { id: id_b, .. } = relay.admit("b", &sender_b).await else {
-            panic!("B 应当被接受");
-        };
+        let (_, _, mut ejected) = join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
+        let (b_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
-        drain(&mut receiver_a);
-        drain(&mut receiver_b);
+        drain(&mut a_rx);
+        drain(&mut b_rx);
 
         let frame = Message::Binary(vec![0u8; FRAME_HEADER_SIZE].into());
 
         for _ in 0..OUTBOUND_QUEUE {
-            relay.forward(id_b, frame.clone()).await;
+            relay.forward(ROOM_A, b_id, frame.clone()).await;
         }
 
         // 队列满了，这一帧要等满 FORWARD_TIMEOUT 才会被放弃（`start_paused` 会自动
         // 把时钟推到那个定时器）
-        relay.forward(id_b, frame).await;
+        relay.forward(ROOM_A, b_id, frame).await;
 
         // 摘牌之后 A 的读循环必须能收到信号，否则它的 socket 会一直挂着
         assert!(matches!(ejected.try_recv(), Err(TryRecvError::Closed)));
 
         // 配对位也空出来了：第三个人进来不该被当成第三人
         assert!(matches!(
-            relay.admit("c", &sender_c).await,
+            join(&relay, ROOM_A, "token-a", "c", &c_tx).await,
             Admit::Accepted { .. }
         ));
 
         // B 也收到了「A 离线」，不会一直以为对方在线
-        assert!(announced_offline(&mut receiver_b, "a"));
+        assert!(announced_offline(&mut b_rx, "a"));
     }
 
     #[tokio::test]
     async fn an_observer_that_cannot_be_reached_is_evicted() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
-        let (sender_a, mut receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, mut receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_c, _receiver_c) = mpsc::channel(OUTBOUND_QUEUE);
+        let relay = relay(2, Duration::from_secs(120));
+        let (a_tx, mut a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, mut b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (c_tx, _c_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
-        let Admit::Accepted { mut ejected, .. } = relay.admit("a", &sender_a).await else {
-            panic!("A 应当被接受");
-        };
-        let Admit::Accepted { id: id_b, .. } = relay.admit("b", &sender_b).await else {
-            panic!("B 应当被接受");
-        };
+        let (_, _, mut ejected) = join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
+        let (b_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
-        drain(&mut receiver_a);
-        drain(&mut receiver_b);
+        drain(&mut a_rx);
+        drain(&mut b_rx);
 
         let frame = Message::Binary(vec![0u8; FRAME_HEADER_SIZE].into());
 
         for _ in 0..OUTBOUND_QUEUE {
-            relay.forward(id_b, frame.clone()).await;
+            relay.forward(ROOM_A, b_id, frame.clone()).await;
         }
 
         // B 断开时的离线通知投不进 A（队列满）：A 必须被摘掉，而不是被静默跳过
-        relay.drop_peer(id_b).await;
+        relay.drop_peer(ROOM_A, "b", b_id).await;
 
         assert!(matches!(ejected.try_recv(), Err(TryRecvError::Closed)));
         assert!(matches!(
-            relay.admit("c", &sender_c).await,
+            join(&relay, ROOM_A, "token-a", "c", &c_tx).await,
             Admit::Accepted { .. }
         ));
     }
 
     #[tokio::test]
     async fn forwarding_to_a_closed_queue_drops_the_stalled_peer() {
-        let relay = Relay::new(Limits::default(), Duration::from_secs(120), None);
-        let (sender_a, receiver_a) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_b, mut receiver_b) = mpsc::channel(OUTBOUND_QUEUE);
-        let (sender_c, _receiver_c) = mpsc::channel(OUTBOUND_QUEUE);
+        let relay = relay(2, Duration::from_secs(120));
+        let (a_tx, a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, mut b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (c_tx, _c_rx) = mpsc::channel(OUTBOUND_QUEUE);
 
-        let Admit::Accepted { id: id_a, .. } = relay.admit("a", &sender_a).await else {
-            panic!("A 应当被接受");
-        };
-        let Admit::Accepted { id: id_b, .. } = relay.admit("b", &sender_b).await else {
-            panic!("B 应当被接受");
-        };
+        let (id_a, _, _) = join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
+        let (b_id, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
         // 让 A 的连接「死掉」：接收端被丢掉，转发时会立刻发现 channel 关闭
-        drop(receiver_a);
-        drain(&mut receiver_b);
+        drop(a_rx);
+        drain(&mut b_rx);
 
         relay
-            .forward(id_b, Message::Binary(vec![0u8; FRAME_HEADER_SIZE].into()))
+            .forward(
+                ROOM_A,
+                b_id,
+                Message::Binary(vec![0u8; FRAME_HEADER_SIZE].into()),
+            )
             .await;
 
         // A 被摘掉后，配对位空出来了：第三个人进来不该被当成第三人
         assert!(matches!(
-            relay.admit("c", &sender_c).await,
+            join(&relay, ROOM_A, "token-a", "c", &c_tx).await,
             Admit::Accepted { .. }
         ));
-        assert_ne!(id_a, id_b);
+        assert_ne!(id_a, b_id);
 
         // 而且 B 收到了「A 离线」，不会一直以为对方在线
-        assert!(announced_offline(&mut receiver_b, "a"));
+        assert!(announced_offline(&mut b_rx, "a"));
     }
 }

@@ -1,0 +1,23 @@
+# 裸 IP 模式：不套 Caddy，直接暴露 :8080。
+#
+#   docker compose -f docker-compose.direct.yml up -d
+#
+# 适合临时测试、内网、以及本来就不想折腾证书的个人服务器。
+#
+# ⚠️ 没有 TLS：客户端与服务器之间的握手与信令（WebSocket 头、上下线控制帧）是明文，
+#    只有聊天、附件与桌宠状态本身仍然是端到端加密的（E2EE，服务器解不开）。
+#    客户端在填了明文地址时也会显示一条同样的提醒。
+#
+# 客户端填法：服务器地址填 <公网 IP>:8080（不带 scheme，客户端会按 ws:// 处理）。
+
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    environment:
+      PAIR_LISTEN: 0.0.0.0:8080
+      PAIR_MAX_SESSIONS: ${PAIR_MAX_SESSIONS:-20}
+      PAIR_MAX_FRAMES_PER_SECOND: ${PAIR_MAX_FRAMES_PER_SECOND:-90}
+      # PAIR_ICE_SERVERS: '[{"urls":["stun:cat.example.com:3478"]}]'
+    ports:
+      - "8080:8080"

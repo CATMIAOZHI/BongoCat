@@ -1,8 +1,5 @@
 # 编译产物
 target
 
-# 真实配置（含 Pair Secret），只提交 .env.example
+# 真实部署配置（域名、容量、ICE），只提交 .env.example
 .env
-
-# generate-pair 显式落盘时的产物
-pair-secret.txt

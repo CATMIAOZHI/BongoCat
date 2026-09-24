@@ -6,7 +6,12 @@
 //! ```text
 //! PAIR_SECRET --HKDF-SHA256(info="bongocat-pair-auth-v1")--> PAIR_AUTH_TOKEN
 //! PAIR_SECRET --HKDF-SHA256(info="bongocat-pair-e2ee-v1")--> E2EE_ROOT_KEY
+//! PAIR_SECRET --HKDF-SHA256(info="bongocat-pair-room-v1")--> ROOM_ID
 //! ```
+//!
+//! 多会话（§4 / §7）下中继**不再配置任何 secret**：`ROOM_ID` 与 `AUTH_TOKEN` 都由
+//! 客户端在连接时给出。中继只保存 `SHA256(AUTH_TOKEN)`（见 [`auth_verifier`]），
+//! 用它判断「后面进来的人是不是同一对」——它永远拿不到 Pair Secret 与 E2EE 根密钥。
 
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -15,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 
 pub const AUTH_INFO: &[u8] = b"bongocat-pair-auth-v1";
 pub const E2EE_INFO: &[u8] = b"bongocat-pair-e2ee-v1";
+pub const ROOM_INFO: &[u8] = b"bongocat-pair-room-v1";
 pub const PAIR_SECRET_BYTES: usize = 32;
 
 /// HKDF-SHA256，salt 为空（RFC 5869 的「无 salt」与「32 字节零 salt」等价，
@@ -38,6 +44,36 @@ pub fn derive_auth_token(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
 #[allow(dead_code)]
 pub fn derive_root_key(secret: &[u8; PAIR_SECRET_BYTES]) -> [u8; 32] {
     hkdf_sha256(secret, E2EE_INFO)
+}
+
+/// 派生多会话分组用的 `ROOM_ID`（§18）。中继自己不用它分组（分组键由客户端给出），
+/// 保留这份实现是为了 `generate-pair` 能算出「这个密钥属于哪个会话」的指纹，
+/// 并用**独立实现的固定向量**守住两端派生不漂移。
+pub fn derive_room_id(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
+    URL_SAFE_NO_PAD.encode(hkdf_sha256(secret, ROOM_INFO))
+}
+
+/// Room 的不可逆 verifier：`SHA256(AUTH_TOKEN)`（§7）。
+///
+/// 中继**不保存明文 token**：创建 Room 时算一次，之后每个连接都按同样方式算一份，
+/// 与 Room 里存的做恒定时间比较（见 [`constant_time_eq`]）。
+pub fn auth_verifier(auth_token: &str) -> [u8; 32] {
+    Sha256::digest(auth_token.as_bytes()).into()
+}
+
+/// Room 的日志指纹（§29）：`SHA256(ROOM_ID)` 的前 8 字节，小写 hex。
+///
+/// 日志里**绝不打印完整的 `ROOM_ID`**——它是「谁是同一对」的直接证据，写进日志就等于
+/// 把分组关系泄露给了任何能看到日志的人。指纹够用来定位「同一个会话的几行日志」，
+/// 而且不可逆。
+pub fn room_fingerprint(room_id: &str) -> String {
+    let digest = Sha256::digest(room_id.as_bytes());
+
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Pair Secret 的文本形态
@@ -152,8 +188,35 @@ mod tests {
             URL_SAFE_NO_PAD.encode(derive_root_key(&secret())),
             "am2bbPWK0R-fwuEky_8ZcFXCysV2gSD_UV6ONiWMsQk"
         );
+        // 与 src-tauri/src/core/pair/crypto.rs 的 room_id_matches_the_fixed_vector
+        // 必须是同一个值：两侧各写一遍，任何一侧改坏都会被对方抓住（§18）
+        assert_eq!(
+            derive_room_id(&secret()),
+            "r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97M"
+        );
         assert_eq!(fingerprint(&secret()), "63 0d cd 29 66 c4 33 66");
         assert_eq!(encode_pair_secret(&secret()), SECRET);
+    }
+
+    #[test]
+    fn room_verifiers_are_stable_and_do_not_leak_the_token() {
+        let verifier = auth_verifier("test-token");
+
+        assert_eq!(verifier, auth_verifier("test-token"));
+        assert_ne!(verifier, auth_verifier("test-token2"));
+        // verifier 里不允许出现 token 本身（哪怕只是首字节）
+        assert_ne!(verifier[0], b't');
+
+        // 日志指纹：固定长度、十六进制、与 Room ID 文本不同
+        let fingerprint = room_fingerprint("r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97M");
+
+        assert_eq!(fingerprint.len(), 16);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(fingerprint, "r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97M");
+        assert_eq!(
+            room_fingerprint("r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97M"),
+            fingerprint
+        );
     }
 
     #[test]

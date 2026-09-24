@@ -1,22 +1,22 @@
-# 一对用户跑一套：relay 只说 HTTP/WS，Caddy 负责 TLS。
+# 推荐模式：域名 + Caddy 自动 HTTPS。
+#
+# 一套服务器同时承载 PAIR_MAX_SESSIONS 个双人会话，服务器本身**没有**联机密钥。
 #
 # 用法：
-#   1. 生成 Pair Secret 并写入 .env：cargo run --release --bin generate-pair -- --write
-#   2. 在 .env 里补一行 PAIR_DOMAIN=<你的域名>
-#   3. docker compose up -d
+#   1. cp .env.example .env，填 PAIR_DOMAIN=<你的域名>
+#   2. docker compose up -d
+#   3. 客户端双方都填 https://<你的域名> 与同一个「联机密钥」
 
 services:
   relay:
     build: .
     restart: unless-stopped
     environment:
-      # 中继自己按 R17 从 Pair Secret 派生 PAIR_AUTH_TOKEN，用户只需要保存一个值。
-      # 也可以用 PAIR_AUTH_TOKEN 直接给派生结果（两者二选一）。
-      PAIR_SECRET: ${PAIR_SECRET:?请先在 .env 里设置 PAIR_SECRET}
       PAIR_LISTEN: 0.0.0.0:8080
+      PAIR_MAX_SESSIONS: ${PAIR_MAX_SESSIONS:-20}
       # 想放开额度（例如为了 60Hz）时改这三行；不给就是 CF 的 30 / 20 / 12MiB。
       # 客户端按 2/3 推导自己的速率：广告 90 → 客户端 60。
-      # PAIR_MAX_FRAMES_PER_SECOND: "90"
+      PAIR_MAX_FRAMES_PER_SECOND: ${PAIR_MAX_FRAMES_PER_SECOND:-90}
       # PAIR_MAX_CHUNKS_PER_SECOND: "20"
       # PAIR_MAX_BYTES_PER_SECOND: "12582912"
       # 自建 coturn 后把地址广告给客户端（见 docker-compose.coturn.yml）

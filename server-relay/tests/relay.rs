@@ -1,18 +1,19 @@
 //! 端到端：真的起一个中继、真的连 WebSocket，逐条验证线上契约。
 //!
-//! 这里覆盖的都是「客户端看到的行为」：健康检查与 404、鉴权 / 协议 / deviceId 的
-//! HTTP 错误、`server.welcome` / `server.peer`、A↔B 转发、text 被拒、未知 kind、
-//! 单帧过大、限流、配对已满、同 deviceId 顶替。这些行为必须与 `server-cloudflare/`
-//! 一致，否则换 URL 就会有功能差异。
+//! 这里覆盖的都是「客户端看到的行为」：健康检查与 404、鉴权 / 协议 / deviceId / 会话
+//! 标识的 HTTP 错误、`server.welcome` / `server.peer`、Room 内 A↔B 转发、**跨 Room
+//! 的负向断言**、容量 503、text 被拒、未知 kind、单帧过大、限流、配对已满、同 deviceId
+//! 顶替。这些行为必须与 `server-cloudflare/` 一致（除了「一个部署只服务一对用户」这条
+//! 被多会话取代），否则换 URL 就会有功能差异。
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -21,37 +22,53 @@ use bongocat_pair_relay::protocol::{self, close_code, Limits};
 use bongocat_pair_relay::relay::Relay;
 use bongocat_pair_relay::server::{self, Config};
 
-const TOKEN: &str = "test-token";
+/// 两个互不相干的会话：多会话的隔离性全靠它们来验
+const ROOM_A: &str = "room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ROOM_B: &str = "room-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const ROOM_C: &str = "room-cccccccccccccccccccccccccccccccccccccc";
+const TOKEN_A: &str = "token-a";
+const TOKEN_B: &str = "token-b";
+const TOKEN_C: &str = "token-c";
+
 const PATIENCE: Duration = Duration::from_secs(5);
+/// 负向断言等的时长：足够让一条真的会串房的帧走到对面
+const NEGATIVE_PATIENCE: Duration = Duration::from_millis(400);
 
 type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start_relay(limits: Limits, stale_after: Duration) -> SocketAddr {
-    start_relay_with(limits, stale_after, None).await
+    start_relay_with(limits, 20, stale_after, None).await
 }
 
 async fn start_relay_with(
     limits: Limits,
+    max_sessions: usize,
     stale_after: Duration,
     ice_servers: Option<serde_json::Value>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let config = Arc::new(Config {
-        token: TOKEN.to_string(),
+    let config = Config {
         limits,
+        max_sessions,
         stale_after,
         ice_servers: ice_servers.clone(),
-    });
-    let relay = Relay::new(limits, stale_after, ice_servers);
+    };
+    let relay = Relay::new(
+        config.limits,
+        config.max_sessions,
+        config.stale_after,
+        ice_servers,
+    );
 
-    tokio::spawn(server::serve(listener, config, relay));
+    tokio::spawn(server::serve(listener, relay));
 
     address
 }
 
 async fn connect(
     address: SocketAddr,
+    room_id: &str,
     token: &str,
     protocol_version: &str,
     device_id: &str,
@@ -64,6 +81,7 @@ async fn connect(
         headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
         headers.insert("x-bongo-client", device_id.parse().unwrap());
         headers.insert("x-bongo-protocol", protocol_version.parse().unwrap());
+        headers.insert("x-bongo-room", room_id.parse().unwrap());
     }
 
     let (socket, _) = connect_async(request).await?;
@@ -71,14 +89,26 @@ async fn connect(
     Ok(socket)
 }
 
+/// A 房默认那条连接（大多数用例只关心一个会话）
+async fn connect_a(address: SocketAddr, device_id: &str) -> Client {
+    connect(address, ROOM_A, TOKEN_A, "1", device_id)
+        .await
+        .unwrap()
+}
+
 /// 握手成功返回 101，否则返回 HTTP 状态码
-async fn handshake_status(
+async fn handshake_status(address: SocketAddr, room_id: &str, token: &str, device_id: &str) -> u16 {
+    handshake_status_with(address, room_id, token, "1", device_id).await
+}
+
+async fn handshake_status_with(
     address: SocketAddr,
+    room_id: &str,
     token: &str,
     protocol_version: &str,
     device_id: &str,
 ) -> u16 {
-    match connect(address, token, protocol_version, device_id).await {
+    match connect(address, room_id, token, protocol_version, device_id).await {
         Ok(_) => 101,
         Err(WsError::Http(response)) => response.status().as_u16(),
         Err(other) => panic!("期望 HTTP 错误，实际 {other:?}"),
@@ -110,18 +140,31 @@ async fn next_json(client: &mut Client) -> serde_json::Value {
     }
 }
 
-async fn wait_close(client: &mut Client) -> Option<u16> {
+/// 负向断言：这段时间内一条消息都不该来
+async fn expect_silence(client: &mut Client, what: &str) {
+    let quiet = tokio::time::timeout(NEGATIVE_PATIENCE, client.next()).await;
+
+    assert!(quiet.is_err(), "{what} 收到了不该收到的消息：{quiet:?}");
+}
+
+async fn wait_close_frame(client: &mut Client) -> Option<CloseFrame> {
     loop {
         let message = tokio::time::timeout(PATIENCE, client.next())
             .await
             .expect("等关闭帧超时")?;
 
         match message {
-            Ok(Message::Close(Some(frame))) => return Some(frame.code.into()),
+            Ok(Message::Close(Some(frame))) => return Some(frame),
             Ok(_) => continue,
             Err(_) => return None,
         }
     }
+}
+
+async fn wait_close(client: &mut Client) -> Option<u16> {
+    wait_close_frame(client)
+        .await
+        .map(|frame| u16::from(frame.code))
 }
 
 fn frame(kind: u8, payload: usize) -> Vec<u8> {
@@ -140,6 +183,9 @@ async fn health_is_public_and_unknown_paths_are_not_found() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "实际：{response}");
     assert!(response.contains("\"ok\":true"));
     assert!(response.contains("\"protocol\":1"));
+    // §28：只说自己是多会话模式，不暴露任何会话列表
+    assert!(response.contains("\"mode\":\"multi-pair\""));
+    assert!(!response.contains(ROOM_A));
 
     let response = raw_request(address, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
 
@@ -150,19 +196,66 @@ async fn health_is_public_and_unknown_paths_are_not_found() {
 async fn rejects_bad_auth_protocol_and_device_ids() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
 
-    assert_eq!(handshake_status(address, "wrong", "1", "aaaa").await, 401);
-    assert_eq!(handshake_status(address, TOKEN, "2", "aaaa").await, 426);
-    assert_eq!(handshake_status(address, TOKEN, "1", "bad id").await, 400);
-    assert_eq!(handshake_status(address, TOKEN, "1", "").await, 400);
-    // 先鉴权再看 deviceId：错 token 配非法 deviceId 也必须是 401，
-    // 否则未鉴权的人能靠响应码探测 deviceId 的合法性
-    assert_eq!(handshake_status(address, "wrong", "1", "bad id").await, 401);
-    assert_eq!(handshake_status(address, TOKEN, "1", "aaaa").await, 101);
+    // 空的 Authorization 连摘要都算不出来
+    assert_eq!(handshake_status(address, ROOM_A, "", "aaaa").await, 401);
+    assert_eq!(
+        handshake_status_with(address, ROOM_A, TOKEN_A, "2", "aaaa").await,
+        426
+    );
+    assert_eq!(
+        handshake_status(address, ROOM_A, TOKEN_A, "bad id").await,
+        400
+    );
+    assert_eq!(handshake_status(address, ROOM_A, TOKEN_A, "").await, 400);
+    assert_eq!(
+        handshake_status(address, ROOM_A, TOKEN_A, "aaaa").await,
+        101
+    );
+
+    // 已有会话上，错 token 配非法 deviceId 必须是 401：没通过房间校验的人
+    // 不能靠状态码探测 deviceId 的合法性
+    let first = connect_a(address, "aaaa").await;
+
+    assert_eq!(
+        handshake_status(address, ROOM_A, "wrong", "bad id").await,
+        401
+    );
+    assert_eq!(
+        handshake_status(address, ROOM_A, "wrong", "aaaa").await,
+        401
+    );
+
+    drop(first);
 
     // 不是 WebSocket 升级
     let response = raw_request(address, "GET /ws HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
 
     assert!(response.starts_with("HTTP/1.1 426 "), "实际：{response}");
+}
+
+#[tokio::test]
+async fn the_room_header_is_required_and_validated() {
+    let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
+    let head = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nX-Bongo-Protocol: 1\r\nAuthorization: Bearer token-a\r\nX-Bongo-Client: aaaa\r\n";
+
+    // 完全没带 X-Bongo-Room
+    let response = raw_request(address, &format!("{head}\r\n")).await;
+
+    assert!(response.starts_with("HTTP/1.1 400 "), "实际：{response}");
+
+    // 字符集非法
+    let response = raw_request(address, &format!("{head}X-Bongo-Room: bad room!\r\n\r\n")).await;
+
+    assert!(response.starts_with("HTTP/1.1 400 "), "实际：{response}");
+
+    // 太长（上界 64）
+    let response = raw_request(
+        address,
+        &format!("{head}X-Bongo-Room: {}\r\n\r\n", "a".repeat(65)),
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 400 "), "实际：{response}");
 }
 
 #[tokio::test]
@@ -172,7 +265,7 @@ async fn rejects_a_broken_websocket_handshake() {
     // 缺 Sec-WebSocket-Key
     let response = raw_request(
         address,
-        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nX-Bongo-Protocol: 1\r\n\r\n",
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nX-Bongo-Protocol: 1\r\nX-Bongo-Room: room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n",
     )
     .await;
 
@@ -181,7 +274,7 @@ async fn rejects_a_broken_websocket_handshake() {
     // Key 不是 16 字节的 base64
     let response = raw_request(
         address,
-        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: short\r\nX-Bongo-Protocol: 1\r\n\r\n",
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: short\r\nX-Bongo-Protocol: 1\r\nX-Bongo-Room: room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n",
     )
     .await;
 
@@ -190,7 +283,7 @@ async fn rejects_a_broken_websocket_handshake() {
     // 版本不是 13：按 RFC 6455 §4.4 回 426 并带上支持的版本
     let response = raw_request(
         address,
-        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 8\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nX-Bongo-Protocol: 1\r\n\r\n",
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 8\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nX-Bongo-Protocol: 1\r\nX-Bongo-Room: room-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n",
     )
     .await;
 
@@ -204,7 +297,7 @@ async fn rejects_a_broken_websocket_handshake() {
 #[tokio::test]
 async fn welcome_peer_state_and_forwarding_match_the_cloudflare_relay() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut first = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut first = connect_a(address, "aaaa").await;
     let welcome = next_json(&mut first).await;
 
     assert_eq!(welcome["type"], "server.welcome");
@@ -215,7 +308,7 @@ async fn welcome_peer_state_and_forwarding_match_the_cloudflare_relay() {
     assert_eq!(welcome["limits"]["bytesPerSecond"], 12.0 * 1024.0 * 1024.0);
     assert!(welcome.get("iceServers").is_none());
 
-    let mut second = connect(address, TOKEN, "1", "bbbb").await.unwrap();
+    let mut second = connect_a(address, "bbbb").await;
 
     assert_eq!(next_json(&mut second).await["peerOnline"], true);
 
@@ -225,7 +318,7 @@ async fn welcome_peer_state_and_forwarding_match_the_cloudflare_relay() {
     assert_eq!(announced["online"], true);
     assert_eq!(announced["deviceId"], "bbbb");
 
-    // 应用帧只转发给对端
+    // 应用帧只转发给同会话的对端
     // kind 4 = chat：随便挑一个已知 kind，中继不看内容
     let sent = frame(4, 16);
 
@@ -249,11 +342,11 @@ async fn welcome_peer_state_and_forwarding_match_the_cloudflare_relay() {
 #[tokio::test]
 async fn a_disconnect_is_announced_to_the_other_side() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut first = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut first = connect_a(address, "aaaa").await;
 
     next_json(&mut first).await;
 
-    let second = connect(address, TOKEN, "1", "bbbb").await.unwrap();
+    let second = connect_a(address, "bbbb").await;
 
     next_json(&mut first).await;
     drop(second);
@@ -268,31 +361,152 @@ async fn a_disconnect_is_announced_to_the_other_side() {
 #[tokio::test]
 async fn the_third_device_is_rejected_and_a_reconnect_replaces() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut first = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut first = connect_a(address, "aaaa").await;
 
     next_json(&mut first).await;
 
-    let mut second = connect(address, TOKEN, "1", "bbbb").await.unwrap();
+    let mut second = connect_a(address, "bbbb").await;
 
     next_json(&mut second).await;
     next_json(&mut first).await;
 
-    let mut third = connect(address, TOKEN, "1", "cccc").await.unwrap();
+    let mut third = connect_a(address, "cccc").await;
 
-    assert_eq!(wait_close(&mut third).await, Some(close_code::PAIR_FULL));
+    // 关闭码是契约、reason 不是，但两边（本中继与 CF 版）说同一句话能省掉一次
+    // 「为什么这边说的是 room」的排查，所以这里连 reason 一起钉住
+    let full = wait_close_frame(&mut third)
+        .await
+        .expect("第三人没有被关掉");
+
+    assert_eq!(u16::from(full.code), close_code::PAIR_FULL);
+    let reason: &str = full.reason.as_ref();
+
+    assert_eq!(reason, "pair is full");
 
     // 同一个 deviceId 用大写重连：顶替旧连接（4002），不是第三人（4003）
-    let mut reconnected = connect(address, TOKEN, "1", "AAAA").await.unwrap();
+    let mut reconnected = connect_a(address, "AAAA").await;
 
     assert_eq!(wait_close(&mut first).await, Some(close_code::REPLACED));
     assert_eq!(next_json(&mut reconnected).await["peerOnline"], true);
     assert_eq!(next_json(&mut second).await["deviceId"], "aaaa");
 }
 
+/// §32 的「两台 A + 两台 B」在真实 socket 上的版本：帧与公告都不能串房
+#[tokio::test]
+async fn rooms_are_isolated_end_to_end() {
+    let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
+
+    let mut a1 = connect(address, ROOM_A, TOKEN_A, "1", "a1").await.unwrap();
+
+    next_json(&mut a1).await;
+
+    let mut a2 = connect(address, ROOM_A, TOKEN_A, "1", "a2").await.unwrap();
+
+    next_json(&mut a2).await;
+    next_json(&mut a1).await;
+
+    let mut b1 = connect(address, ROOM_B, TOKEN_B, "1", "b1").await.unwrap();
+
+    next_json(&mut b1).await;
+
+    let mut b2 = connect(address, ROOM_B, TOKEN_B, "1", "b2").await.unwrap();
+
+    next_json(&mut b2).await;
+    next_json(&mut b1).await;
+
+    // A 房里的帧只到 A 房的另一个人
+    let sent = frame(4, 24);
+
+    a1.send(Message::Binary(sent.clone().into())).await.unwrap();
+
+    let received = tokio::time::timeout(PATIENCE, a2.next())
+        .await
+        .expect("A 房内部应当收到转发帧")
+        .unwrap()
+        .unwrap();
+
+    match received {
+        Message::Binary(bytes) => assert_eq!(&bytes[..], &sent[..]),
+        other => panic!("期望二进制帧，实际 {other:?}"),
+    }
+
+    // 负向断言：B 房两边都得安静
+    expect_silence(&mut b1, "B 房的第一台").await;
+    expect_silence(&mut b2, "B 房的第二台").await;
+
+    // B 房下线也不该惊动 A 房
+    drop(b2);
+
+    expect_silence(&mut a1, "A 房（B 房下线时）").await;
+    expect_silence(&mut a2, "A 房（B 房下线时）").await;
+
+    // 而 B 房自己的两台之间照常工作（b1 只收到 b2 的离线公告，那正是该收到的）
+    let offline = next_json(&mut b1).await;
+
+    assert_eq!(offline["type"], "server.peer");
+    assert_eq!(offline["online"], false);
+    assert_eq!(offline["deviceId"], "b2");
+}
+
+/// §9：同一个会话上拿错联机密钥 = 401，而且不会因此多出一个会话
+#[tokio::test]
+async fn a_wrong_token_on_an_existing_room_is_refused() {
+    let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
+    let mut first = connect_a(address, "aaaa").await;
+
+    next_json(&mut first).await;
+
+    assert_eq!(
+        handshake_status(address, ROOM_A, "wrong", "bbbb").await,
+        401
+    );
+
+    // 正确的那份密钥照旧能用
+    let mut second = connect_a(address, "bbbb").await;
+
+    assert_eq!(next_json(&mut second).await["peerOnline"], true);
+}
+
+/// §8 / §27：满员只挡**新建**会话，503 而不是关闭码；已有会话的第二个人照进不误
+#[tokio::test]
+async fn a_full_server_only_refuses_new_rooms() {
+    let address = start_relay_with(Limits::default(), 1, Duration::from_secs(120), None).await;
+    let mut first = connect_a(address, "aaaa").await;
+
+    next_json(&mut first).await;
+
+    // 第二个会话：服务器只有一个名额，已经用在 A 房上了
+    assert_eq!(
+        handshake_status(address, ROOM_B, TOKEN_B, "bbbb").await,
+        503
+    );
+
+    // 已有会话的第二个人不受影响
+    let mut second = connect_a(address, "bbbb").await;
+
+    assert_eq!(next_json(&mut second).await["peerOnline"], true);
+
+    // 最后一个客户端走了，名额让出来（§13 / §30）
+    drop(second);
+    drop(first);
+
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+
+    while tokio::time::Instant::now() < deadline {
+        if handshake_status(address, ROOM_C, TOKEN_C, "cccc").await == 101 {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("会话空了之后名额应当释放，但新会话始终被拒");
+}
+
 #[tokio::test]
 async fn text_frames_close_with_1008() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
     client.send(Message::Text("hi".into())).await.unwrap();
@@ -305,10 +519,10 @@ async fn text_frames_close_with_1008() {
 
 #[tokio::test]
 async fn unknown_frame_kinds_close_with_1008() {
-    // 每个子用例单独起一个中继：配对位只有两个，复用同一个端口会让「第三人」的
+    // 每个子用例单独起一个中继：会话里的位置只有两个，复用同一个端口会让「第三人」的
     // 判定和上一条连接的清理时机互相干扰，用例就会抖
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
     client
@@ -325,7 +539,7 @@ async fn unknown_frame_kinds_close_with_1008() {
 #[tokio::test]
 async fn malformed_frames_close_with_1008() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
     client
@@ -342,7 +556,7 @@ async fn malformed_frames_close_with_1008() {
 #[tokio::test]
 async fn an_oversized_frame_closes_with_1009() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
 
@@ -356,7 +570,7 @@ async fn an_oversized_frame_closes_with_1009() {
 #[tokio::test]
 async fn a_frame_far_above_the_protocol_limit_still_closes_with_1009() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
 
@@ -376,16 +590,16 @@ async fn a_frame_far_above_the_protocol_limit_still_closes_with_1009() {
 async fn a_stale_connection_is_replaced_and_the_survivor_sees_it_go_offline() {
     // stale_after = 0：任何连接都算陈旧，C 进来时顶替先连进来的那个
     let address = start_relay(Limits::default(), Duration::ZERO).await;
-    let mut first = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut first = connect_a(address, "aaaa").await;
 
     next_json(&mut first).await;
 
-    let mut second = connect(address, TOKEN, "1", "bbbb").await.unwrap();
+    let mut second = connect_a(address, "bbbb").await;
 
     next_json(&mut second).await;
     next_json(&mut first).await;
 
-    let mut third = connect(address, TOKEN, "1", "cccc").await.unwrap();
+    let mut third = connect_a(address, "cccc").await;
 
     assert_eq!(next_json(&mut third).await["peerOnline"], true);
 
@@ -406,9 +620,7 @@ async fn a_stale_connection_is_replaced_and_the_survivor_sees_it_go_offline() {
 
     // 而且这条离线帧只发给多出来的那一方：新连接不该收到「对方离线」（CF 会连新连接
     // 一起发，那边的新连接反而会显示「对方离线」）
-    let extra = tokio::time::timeout(Duration::from_millis(300), third.next()).await;
-
-    assert!(extra.is_err(), "新连接不该收到离线通知: {extra:?}");
+    expect_silence(&mut third, "新连接").await;
 }
 
 #[tokio::test]
@@ -420,7 +632,7 @@ async fn the_rate_limit_closes_with_1008() {
         bytes_per_second: 1024.0 * 1024.0,
     };
     let address = start_relay(limits, Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
 
@@ -437,7 +649,7 @@ async fn the_rate_limit_closes_with_1008() {
 #[tokio::test]
 async fn the_relay_answers_pings() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
 
     next_json(&mut client).await;
     client.send(Message::Ping(Vec::new().into())).await.unwrap();
@@ -463,11 +675,12 @@ async fn the_welcome_advertises_configured_ice_servers() {
     ]);
     let address = start_relay_with(
         Limits::default(),
+        20,
         Duration::from_secs(120),
         Some(ice_servers.clone()),
     )
     .await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
     let welcome = next_json(&mut client).await;
 
     assert_eq!(welcome["iceServers"], ice_servers);
@@ -476,7 +689,7 @@ async fn the_welcome_advertises_configured_ice_servers() {
 #[tokio::test]
 async fn the_welcome_omits_ice_servers_when_not_configured() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
-    let mut client = connect(address, TOKEN, "1", "aaaa").await.unwrap();
+    let mut client = connect_a(address, "aaaa").await;
     let welcome = next_json(&mut client).await;
 
     assert!(welcome.get("iceServers").is_none());
