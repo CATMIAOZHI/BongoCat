@@ -38,6 +38,7 @@ pub fn run() {
             core::pair::pair_get_device_id,
             core::pair::pair_set_secret,
             core::pair::pair_has_secret,
+            core::pair::pair_generate_secret,
             core::pair::pair_get_secret_fingerprint,
             core::pair::pair_delete_secret,
             core::pair::pair_connect,

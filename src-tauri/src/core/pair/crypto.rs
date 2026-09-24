@@ -5,10 +5,15 @@
 //! ```text
 //! PAIR_SECRET --HKDF-SHA256(info="bongocat-pair-auth-v1")--> PAIR_AUTH_TOKEN
 //! PAIR_SECRET --HKDF-SHA256(info="bongocat-pair-e2ee-v1")--> E2EE_ROOT_KEY
+//! PAIR_SECRET --HKDF-SHA256(info="bongocat-pair-room-v1")--> ROOM_ID
 //! ```
 //!
 //! 每个应用帧：`header(14B) || nonce(24B) || XChaCha20-Poly1305(ciphertext + tag)`，
 //! 其中 header 作为 AEAD 的 associated data 参与认证。
+//!
+//! `ROOM_ID`（多会话，§7）只用于**分组**：中继按它把连接划进不同的双人会话，
+//! 它既不是密钥材料，也不能反推出 secret（HKDF 是单向的）。中继永远拿不到
+//! secret 与 E2EE 根密钥——它只看到 `ROOM_ID` 与 `PAIR_AUTH_TOKEN`。
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
@@ -23,7 +28,10 @@ use super::protocol::{FRAME_HEADER_SIZE, FrameHeader, NONCE_SIZE};
 pub const AUTH_INFO: &[u8] = b"bongocat-pair-auth-v1";
 pub const E2EE_INFO: &[u8] = b"bongocat-pair-e2ee-v1";
 pub const TRANSFER_INFO: &[u8] = b"bongocat-pair-transfer-v1";
+pub const ROOM_INFO: &[u8] = b"bongocat-pair-room-v1";
 pub const PAIR_SECRET_BYTES: usize = 32;
+/// `ROOM_ID` 的文本形态：32 字节的 base64url 无填充，固定 43 个字符。
+pub const ROOM_ID_LENGTH: usize = 43;
 
 /// HKDF-SHA256，salt 为空（RFC 5869 的「无 salt」与「32 字节零 salt」等价，
 /// 因此与 WebCrypto 里 `salt: new Uint8Array(0)` 的结果一致）。
@@ -45,6 +53,15 @@ pub fn derive_root_key(secret: &[u8; PAIR_SECRET_BYTES]) -> [u8; 32] {
     hkdf_sha256(secret, E2EE_INFO)
 }
 
+/// 派生多会话分组用的 `ROOM_ID`（base64url 无填充，43 字符）。
+///
+/// 两个人填同一个 Pair Secret 就派生出同一个 `ROOM_ID`，中继据此把他们放进同一个
+/// 双人会话；填不同的 secret 就是两个互不可见的会话。派生方式和 token / 根密钥
+/// 一样是 HKDF（不直接用 `SHA256(secret)`），这样三路输出彼此独立。
+pub fn derive_room_id(secret: &[u8; PAIR_SECRET_BYTES]) -> String {
+    URL_SAFE_NO_PAD.encode(hkdf_sha256(secret, ROOM_INFO))
+}
+
 /// 每个 transfer 一把临时密钥（R17）：
 /// `HKDF-SHA256(ikm = E2EE_ROOT_KEY, salt = 空, info = "bongocat-pair-transfer-v1" || transferId(8 字节大端))`。
 ///
@@ -59,24 +76,26 @@ pub fn derive_transfer_key(root_key: &[u8; 32], transfer_id: u64) -> [u8; 32] {
     hkdf_sha256(root_key, &info)
 }
 
-/// 解析用户粘贴的 Pair Secret（base64url，32 字节）
+/// 解析用户粘贴的联机密钥（base64url，32 字节）
+///
+/// §21：用户可见的错误文案一律叫「联机密钥」；`PAIR_SECRET` 只留作内部标识。
 pub fn decode_pair_secret(text: &str) -> Result<[u8; PAIR_SECRET_BYTES], String> {
     let trimmed = text.trim();
 
     if trimmed.is_empty() {
-        return Err("Pair Secret 不能为空".into());
+        return Err("联机密钥不能为空".into());
     }
 
     let bytes = URL_SAFE_NO_PAD
         .decode(trimmed)
         .or_else(|_| URL_SAFE.decode(trimmed))
-        .map_err(|_| "Pair Secret 不是合法的 base64url 文本".to_string())?;
+        .map_err(|_| "联机密钥不是合法的 base64url 文本".to_string())?;
 
     let length = bytes.len();
 
     bytes
         .try_into()
-        .map_err(|_| format!("Pair Secret 应为 {PAIR_SECRET_BYTES} 字节，实际 {length} 字节"))
+        .map_err(|_| format!("联机密钥应为 {PAIR_SECRET_BYTES} 字节，实际 {length} 字节"))
 }
 
 /// R17 的核对指纹：`sha256(原始 secret 字节)` 的 hex 前 16 位，每两位之间加一个空格。
@@ -324,6 +343,41 @@ mod tests {
         assert_eq!(
             URL_SAFE_NO_PAD.encode(derive_root_key(&raw)),
             "am2bbPWK0R-fwuEky_8ZcFXCysV2gSD_UV6ONiWMsQk"
+        );
+    }
+
+    /// 多会话（§18）：Room ID 是**固定向量**，以后不允许无意改变——两个人正是靠它
+    /// 落进同一个双人会话，改了就等于把所有已配对的用户拆开。
+    #[test]
+    fn room_id_matches_the_fixed_vector() {
+        let raw = secret([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+
+        assert_eq!(
+            derive_room_id(&raw),
+            "r4iuM8zciDge4c6arhFls-s26ixDiKORe-uxFj6U97M"
+        );
+        assert_eq!(derive_room_id(&raw).len(), ROOM_ID_LENGTH);
+    }
+
+    #[test]
+    fn the_room_id_follows_the_secret() {
+        let first = secret([1u8; PAIR_SECRET_BYTES]);
+        let again = secret([1u8; PAIR_SECRET_BYTES]);
+        let other = secret([2u8; PAIR_SECRET_BYTES]);
+
+        // 同一个 secret 派生同一个 Room（双方填同一个值才会进同一个会话）
+        assert_eq!(derive_room_id(&first), derive_room_id(&again));
+        // 不同 secret 落进不同 Room
+        assert_ne!(derive_room_id(&first), derive_room_id(&other));
+        // 三路输出彼此独立：Room ID 不能等于 token / 根密钥的文本形态
+        assert_ne!(derive_room_id(&first), derive_auth_token(&first));
+        assert_ne!(
+            derive_room_id(&first),
+            URL_SAFE_NO_PAD.encode(derive_root_key(&first))
         );
     }
 

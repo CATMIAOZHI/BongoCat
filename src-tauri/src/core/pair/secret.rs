@@ -14,7 +14,7 @@ fn entry() -> Result<keyring::Entry, String> {
 pub fn set_secret(secret: &str) -> Result<(), String> {
     entry()?
         .set_password(secret.trim())
-        .map_err(|err| format!("保存 Pair Secret 失败: {err}"))
+        .map_err(|err| format!("保存联机密钥失败: {err}"))
 }
 
 pub fn has_secret() -> Result<bool, String> {
@@ -25,7 +25,7 @@ pub fn load_secret() -> Result<Option<String>, String> {
     match entry()?.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(format!("读取 Pair Secret 失败: {err}")),
+        Err(err) => Err(format!("读取联机密钥失败: {err}")),
     }
 }
 
@@ -33,6 +33,6 @@ pub fn delete_secret() -> Result<(), String> {
     match entry()?.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
-        Err(err) => Err(format!("删除 Pair Secret 失败: {err}")),
+        Err(err) => Err(format!("删除联机密钥失败: {err}")),
     }
 }

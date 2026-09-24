@@ -24,6 +24,7 @@ mod e2e;
 
 use std::sync::Arc;
 
+use rand::Rng as _;
 use serde_json::json;
 use tauri::{AppHandle, Manager as _, Runtime, State, command};
 
@@ -115,6 +116,24 @@ pub async fn pair_set_secret(secret: String) -> Result<String, String> {
 #[command]
 pub async fn pair_has_secret() -> Result<bool, String> {
     secret::has_secret()
+}
+
+/// 生成一个新的联机密钥（§22）。
+///
+/// 用系统的 CSPRNG 取 32 字节再编成 base64url，**不用** `Math.random`、时间戳或 UUID：
+/// 这个值就是双方的 E2EE 密钥材料，可预测等于没有加密。生成结果只返回给这一次调用
+/// （用户看得见、能复制），要留下就自己点「保存」——它不会被偷偷写进凭据库。
+#[command]
+pub async fn pair_generate_secret() -> Result<String, String> {
+    let mut bytes = [0u8; crypto::PAIR_SECRET_BYTES];
+
+    rand::rng().fill_bytes(&mut bytes);
+
+    // 回显的形态与 `decode_pair_secret` 接受的一致（base64url 无填充）
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        bytes,
+    ))
 }
 
 /// 重新读出已保存 secret 的指纹（R17）。

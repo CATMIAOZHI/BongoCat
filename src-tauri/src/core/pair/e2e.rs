@@ -5,10 +5,14 @@
 //!
 //! ```powershell
 //! $env:BONGO_PAIR_E2E_RELAY = "http://127.0.0.1:8787"
-//! $env:BONGO_PAIR_E2E_SECRET = "<generate-pair.mjs 输出的 Pair Secret>"
+//! $env:BONGO_PAIR_E2E_SECRET = "<联机密钥（两端填同一个值）>"
 //! $env:BONGO_PAIR_HEARTBEAT_SECS = "2"
 //! cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored --nocapture
 //! ```
+//!
+//! 除了 `two_rooms_share_one_relay_without_crossing`（它需要多会话版本的自建中继，
+//! 即 `PAIR_MAX_SESSIONS >= 2`，并且要求本机能打通 P2P——它要等四条 DataChannel 各自
+//! 立起来）之外，其余用例在 Cloudflare 版与自建版上都该通过。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,8 +110,11 @@ fn e2e_config() -> Option<(String, String)> {
     Some((relay, secret))
 }
 
-/// 所有端到端用例共用同一个 Durable Object（一个部署实例永远只有一对用户），
-/// 所以必须串行执行：并行时第二个用例的 deviceId 会被当成第三人并以 4003 拒绝。
+/// 端到端用例必须串行执行。
+///
+/// 它们共用同一个会话（同一个 `BONGO_PAIR_E2E_SECRET`），并行时第二个用例的 deviceId
+/// 会被当成同一会话里的第三人并以 4003 拒绝。Cloudflare 版一个部署永远只有一对用户，
+/// 所以那边更是必须串行。
 fn e2e_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
 
@@ -317,6 +324,223 @@ async fn two_clients_exchange_encrypted_presence() {
 
     manager_a.disconnect();
     manager_b.disconnect();
+}
+
+/// §32：一套服务器上的两组会话互不可见。
+///
+/// 四个 `PairManager`：A1/A2 用 `BONGO_PAIR_E2E_SECRET`，B1/B2 用另一个固定密钥
+/// （`0xAB` × 32 的 base64url，与前者不同即可——用例不需要第二个环境变量）。
+/// 断言两件事：自己那组照常收发；**另一组一条都收不到**（负向断言）。
+///
+/// 需要**多会话版本**的中继（`PAIR_MAX_SESSIONS >= 2`）**且本机能打通 P2P**：
+/// 旧版一个部署只服务一对用户，第二组会被当成第三台设备拒掉；而
+/// 后半段要等四条 DataChannel 各自立起来（§32），打不通的机器上会以「两组的
+/// DataChannel 没有各自打通」失败——那是环境问题，不是串房回归。
+#[tokio::test]
+#[ignore = "需要多会话版本的 relay 且本机 P2P 可打通，见文件头说明"]
+async fn two_rooms_share_one_relay_without_crossing() {
+    /// `0xAB` × 32 的 base64url 无填充：与 `BONGO_PAIR_E2E_SECRET` 不同，
+    /// 所以派生出的 `ROOM_ID` 与 `AUTH_TOKEN` 都不同
+    const SECRET_B: &str = "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s";
+
+    let Some((relay, secret_a)) = e2e_config() else {
+        eprintln!("跳过：未设置 BONGO_PAIR_E2E_RELAY / BONGO_PAIR_E2E_SECRET");
+
+        return;
+    };
+
+    let _guard = e2e_lock();
+
+    // 两组各两个人，四个独立的 manager 与 sink
+    let mut rooms = Vec::new();
+
+    for (device_id, secret) in [
+        ("e2e-room-a1", secret_a.as_str()),
+        ("e2e-room-a2", secret_a.as_str()),
+        ("e2e-room-b1", SECRET_B),
+        ("e2e-room-b2", SECRET_B),
+    ] {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = Arc::new(PairManager::new(
+            device_id.into(),
+            sink.clone(),
+            memory_history(),
+            memory_store(),
+        ));
+
+        manager.start(&relay, Some(secret)).unwrap();
+
+        rooms.push((device_id, manager, sink));
+    }
+
+    // 四个都连上、而且各自看到自己那组的对端在线：两组会话都在同一个中继上活着
+    let both_rooms_up = wait_for(
+        || {
+            rooms
+                .iter()
+                .all(|(_, _, sink)| sink.last_state() == Some(PairConnectionState::Connected))
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert!(
+        both_rooms_up,
+        "两组会话没有同时进入 Connected：{:?}",
+        rooms
+            .iter()
+            .map(|(device_id, _, sink)| (*device_id, sink.last_state(), sink.errors()))
+            .collect::<Vec<_>>()
+    );
+
+    let send_presence = |label: &str, manager: &Arc<PairManager>| {
+        manager
+            .send(
+                FrameKind::Presence,
+                message_type::PRESENCE,
+                serde_json::to_value(PresencePayload {
+                    state: PresenceState::Away,
+                    message: Some(label.into()),
+                    display_name: Some(label.into()),
+                })
+                .unwrap(),
+            )
+            .unwrap()
+    };
+
+    // A 组先说话：只有同组的 A2 该收到
+    send_presence("A", &rooms[0].1);
+
+    let arrived = wait_for(
+        || !rooms[1].2.presence_events().is_empty(),
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(
+        arrived,
+        "同组的 A2 没收到 A1 的 presence：errors={:?}",
+        rooms[1].2.errors()
+    );
+
+    assert_eq!(rooms[1].2.presence_events()[0]["message"], "A");
+
+    // B 组再说一句：同样只有同组的 B2 该收到
+    send_presence("B", &rooms[2].1);
+
+    let arrived = wait_for(
+        || !rooms[3].2.presence_events().is_empty(),
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(
+        arrived,
+        "同组的 B2 没收到 B1 的 presence：errors={:?}",
+        rooms[3].2.errors()
+    );
+
+    assert_eq!(rooms[3].2.presence_events()[0]["message"], "B");
+
+    // §32 的后半段：两组各自的 DataChannel。信令走的是同一条中继，如果 ICE 串了房，
+    // 这两条腿根本立不起来（或立到别人的设备上），所以「四条腿都 connected」本身
+    // 就是「信令没有串房」的证据。
+    let both_channels_up = wait_for(
+        || {
+            rooms
+                .iter()
+                .all(|(_, _, sink)| last_p2p(sink).as_deref() == Some("connected"))
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    assert!(
+        both_channels_up,
+        "两组的 DataChannel 没有各自打通：{:?}",
+        rooms
+            .iter()
+            .map(|(device_id, _, sink)| (*device_id, last_p2p(sink), sink.errors()))
+            .collect::<Vec<_>>()
+    );
+
+    // 走 DC 的桌宠快照同样只在组内可见（A1 发、A2 收，B 组一条都不该有）
+    rooms[0]
+        .1
+        .send_replaceable(
+            FrameKind::PetState,
+            message_type::PET_STATE,
+            serde_json::to_value(PetSnapshot::default()).unwrap(),
+        )
+        .unwrap();
+
+    let snapshot = wait_for(
+        || !rooms[1].2.status_events(EVENT_PET_STATE).is_empty(),
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(
+        snapshot,
+        "同组的 A2 没收到 A1 的桌宠快照：errors={:?}",
+        rooms[1].2.errors()
+    );
+
+    // 所有「该发的」都发完了，再等一小会儿：串房是「本来该到、只是晚了几百微秒」的
+    // 形态，让迟到的帧有机会到达，后面的负向断言才不是抢在它前面跑。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 负向断言之一：事件。每一帧都由**本会话的密钥**封着，所以串房投递到另一边时
+    // 解不开——它进不了 presence / pet-state 事件，只会变成一条 error。所以事件计数
+    // 必须和「错误计数」一起断言，否则「A 房的帧塞给 B 房」会被这组断言漏掉。
+    let cross_room_errors = |device_id: &str, sink: &RecordingSink| {
+        let errors: Vec<String> = sink
+            .errors()
+            .into_iter()
+            .filter(|error| error.contains("解密失败") || error.contains("未知的帧类型"))
+            .collect();
+
+        assert!(
+            errors.is_empty(),
+            "{device_id} 收到了别的会话的帧（解不开/帧类型不认识）：{errors:?}"
+        );
+    };
+
+    for (device_id, sink) in rooms.iter().map(|(device_id, _, sink)| (*device_id, sink)) {
+        cross_room_errors(device_id, sink);
+    }
+
+    for (device_id, sink) in [(&rooms[0].0, &rooms[0].2), (&rooms[1].0, &rooms[1].2)] {
+        let seen = sink.presence_events();
+
+        assert_eq!(
+            seen.len(),
+            usize::from(*device_id == "e2e-room-a2"),
+            "{device_id} 收到了不该收到的 presence：{seen:?}"
+        );
+    }
+
+    assert!(
+        rooms[2].2.status_events(EVENT_PET_STATE).is_empty()
+            && rooms[3].2.status_events(EVENT_PET_STATE).is_empty(),
+        "B 组收到了 A 组的桌宠快照：B1={:?} B2={:?}",
+        rooms[2].2.status_events(EVENT_PET_STATE),
+        rooms[3].2.status_events(EVENT_PET_STATE)
+    );
+
+    for (device_id, sink) in [(&rooms[2].0, &rooms[2].2), (&rooms[3].0, &rooms[3].2)] {
+        let seen = sink.presence_events();
+
+        assert_eq!(
+            seen.len(),
+            usize::from(*device_id == "e2e-room-b2"),
+            "{device_id} 收到了不该收到的 presence：{seen:?}"
+        );
+    }
+
+    for (_, manager, _) in rooms {
+        manager.disconnect();
+    }
 }
 
 /// 两个客户端通过真实中继互发文字消息（§31 / §32）。
@@ -791,6 +1015,7 @@ async fn stays_connected_across_heartbeats() {
 
     let secret = crypto::decode_pair_secret(&secret_text).unwrap();
     let auth_token = crypto::derive_auth_token(&secret);
+    let room_id = crypto::derive_room_id(&secret);
 
     let sink = Arc::new(RecordingSink::default());
     let manager = Arc::new(PairManager::new(
@@ -813,7 +1038,7 @@ async fn stays_connected_across_heartbeats() {
     );
 
     // 用第二个连接观察心跳：客户端每心跳发一次 WS ping，中继应当回 pong
-    let mut observer = client::connect(&relay, &auth_token, "e2e-heartbeat-peer")
+    let mut observer = client::connect(&relay, &room_id, &auth_token, "e2e-heartbeat-peer")
         .await
         .unwrap();
     let _ = client::send_message(&mut observer, tungstenite_ping()).await;
@@ -1037,7 +1262,8 @@ async fn two_clients_open_a_p2p_channel_through_the_relay() {
     // 4002 `REPLACED`，这是本机能真实走到的掉线路径（4002 不是 fatal，所以进重连）。
     let secret = crypto::decode_pair_secret(&secret_text).unwrap();
     let auth_token = crypto::derive_auth_token(&secret);
-    let replacement = client::connect(&relay, &auth_token, "e2e-p2p-a")
+    let room_id = crypto::derive_room_id(&secret);
+    let replacement = client::connect(&relay, &room_id, &auth_token, "e2e-p2p-a")
         .await
         .unwrap();
 

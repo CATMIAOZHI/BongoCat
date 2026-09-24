@@ -143,6 +143,10 @@ pub struct PairStatus {
     /// [`pet_state_hz`]：P2P 下是 60，自建中继广告额度够时是 60，其余（含 CF 缺省）是 3。
     /// 前端只消费这个数字，不再自己判断该用哪个上限。
     pub pet_state_hz: f64,
+    /// 这次连接用的地址是不是明文的（`http://` / `ws://` / 裸 IP / `localhost`）。§23：
+    /// 只用来在界面上给一条非阻塞提醒——握手与信令没有 TLS 保护——**绝不阻止连接**。
+    /// 它只在 `start()` 里按**当次**地址算，界面对应地还要比对 `relay_url` 才显示。
+    pub plaintext: bool,
 }
 
 /// P2P 这条腿的状态
@@ -187,6 +191,8 @@ struct DeviceRecord {
 #[derive(Clone)]
 struct SessionConfig {
     relay_url: String,
+    /// 多会话分组用（§20）：从 Pair Secret 派生，不额外持久化第二份
+    room_id: String,
     auth_token: String,
     root_key: [u8; 32],
     device_id: String,
@@ -358,6 +364,7 @@ impl PairManager {
                 last_error: None,
                 p2p: P2pState::Off,
                 pet_state_hz: DEFAULT_PET_STATE_HZ,
+                plaintext: false,
             }),
             sender: Mutex::new(None),
             pending: Mutex::new(PendingReplaceable::default()),
@@ -439,17 +446,18 @@ impl PairManager {
         let trimmed = relay_url.trim();
 
         if trimmed.is_empty() {
-            return Err("请先填写 Relay URL".into());
+            return Err("请先填写服务器地址".into());
         }
 
         let secret_text = match secret_text {
             Some(secret) => secret.to_string(),
-            None => secret::load_secret()?.ok_or_else(|| "还没有配置 Pair Secret".to_string())?,
+            None => secret::load_secret()?.ok_or_else(|| "还没有配置联机密钥".to_string())?,
         };
         let secret_bytes = crypto::decode_pair_secret(&secret_text)?;
 
         let config = SessionConfig {
             relay_url: trimmed.to_string(),
+            room_id: crypto::derive_room_id(&secret_bytes),
             auth_token: crypto::derive_auth_token(&secret_bytes),
             root_key: crypto::derive_root_key(&secret_bytes),
             device_id: self.device_id(),
@@ -467,6 +475,8 @@ impl PairManager {
         self.publish(generation, |status| {
             status.state = PairConnectionState::Connecting;
             status.relay_url = Some(config.relay_url.clone());
+            // §23：地址是不是明文只看这一次填的值，连接成不成都不影响这条提醒
+            status.plaintext = client::is_plaintext_endpoint(&config.relay_url);
             status.last_error = None;
             // 新会话还没起腿：上一轮的 `Connected` 必须立刻消失，否则「立即连接」
             // 之后的十几秒里偏好页会显示「正在连接」+「已直连」
@@ -496,6 +506,7 @@ impl PairManager {
             // 会话没了，P2P 那条腿也跟着没了：不复位的话 UI 会一直显示「已直连」
             status.p2p = P2pState::Off;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
+            status.plaintext = false;
         });
     }
 
@@ -918,7 +929,8 @@ impl SessionState {
     /// 放进一次传输会话。超过上限就拒绝，避免对端用一堆 offer 撑爆内存与磁盘。
     fn open_transfer(&mut self, session: TransferSession) -> Result<(), String> {
         if self.transfers.contains_key(&session.id) {
-            return Err("重复的 transferId".to_string());
+            // §1：这条会经 emit_error 直接显示在设置页，别把内部标识 `transferId` 丢给用户
+            return Err("重复的传输任务".to_string());
         }
 
         if self.transfers.len() >= MAX_ACTIVE_TRANSFERS {
@@ -974,7 +986,7 @@ impl SessionState {
         // 出站同样要挡住超大帧：中继会对 >1 MiB 的帧 close 1009，而失败回滚会把
         // 这一帧放回队头，形成「重连 → 再发 → 再被关」的死循环
         if frame.len() > MAX_BINARY_FRAME_SIZE {
-            return Err("待发送的帧超过中继允许的大小".to_string());
+            return Err("待发送的内容超过服务器允许的大小".to_string());
         }
 
         Ok(frame)
@@ -1207,7 +1219,12 @@ async fn run_session(
 
         let attempt = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            client::connect(&config.relay_url, &config.auth_token, &config.device_id),
+            client::connect(
+                &config.relay_url,
+                &config.room_id,
+                &config.auth_token,
+                &config.device_id,
+            ),
         )
         .await;
 
@@ -1237,7 +1254,7 @@ async fn run_session(
             }
             Ok(Err(failure)) => failure,
             Err(_) => PairFailure {
-                message: "连接中继超时".to_string(),
+                message: "连接服务器超时".to_string(),
                 fatal: false,
             },
         };
@@ -1346,7 +1363,7 @@ where
             Ok(None) => return Err(describe_close(None)),
             Err(_) => {
                 return Err(PairFailure {
-                    message: "等待中继握手超时".to_string(),
+                    message: "等待服务器握手超时".to_string(),
                     fatal: false,
                 });
             }
@@ -2130,16 +2147,18 @@ fn publish_route(
 fn describe_close(code: Option<u16>) -> PairFailure {
     let message = match code {
         Some(4002) => "这条连接被同一台设备的新连接顶替".to_string(),
-        Some(4003) => "配对已满：对端已经在另一个位置连上了".to_string(),
+        // §10：同一个联机密钥最多两台设备，第三台在这里被挡下
+        Some(4003) => "该联机会话已有两台设备在线".to_string(),
         Some(4004) => "旧连接因长时间没有活动被顶替".to_string(),
-        Some(1008) => "中继判定帧格式或发送频率异常".to_string(),
-        Some(1009) => "帧超过中继允许的大小".to_string(),
-        Some(1011) => "中继内部错误".to_string(),
-        Some(code) => format!("中继关闭了连接（{code}）"),
-        None => "中继关闭了连接".to_string(),
+        Some(1008) => "服务器认为数据格式或发送频率异常".to_string(),
+        Some(1009) => "一帧数据超过服务器允许的大小".to_string(),
+        Some(1011) => "服务器内部错误".to_string(),
+        Some(code) => format!("服务器关闭了连接（{code}）"),
+        None => "服务器关闭了连接".to_string(),
     };
 
-    // 只有「配额位已被占满」这一类重试也不会好：要等另一台设备断开或由用户处理
+    // 只有 `4003` 算 fatal：同一个联机密钥已经有两台设备在线，重连还是被同一对占着，
+    // 需要用户处理（换密钥或等对方断开）。服务器**容量**满走的是 HTTP 503，那是可重试的。
     PairFailure {
         message,
         fatal: code == Some(4003),
@@ -3534,7 +3553,7 @@ fn handle_server_frame(
         } => {
             if protocol != PROTOCOL_VERSION {
                 return Err(PairFailure {
-                    message: format!("中继协议版本不匹配: {protocol}"),
+                    message: format!("服务器协议版本不匹配：{protocol}"),
                     fatal: true,
                 });
             }
@@ -3559,7 +3578,7 @@ fn handle_server_frame(
             Ok(None)
         }
         ServerFrame::Error { code, message } => {
-            manager.emit_error(generation, format!("中继错误 {code}: {message}"));
+            manager.emit_error(generation, format!("服务器错误 {code}：{message}"));
 
             Ok(None)
         }
@@ -3764,7 +3783,7 @@ mod tests {
 
         let error = state.queue(FrameKind::Chat, &envelope, false).unwrap_err();
 
-        assert!(error.contains("中继允许的大小"), "实际错误: {error}");
+        assert!(error.contains("服务器允许的大小"), "实际错误: {error}");
     }
 
     #[test]
@@ -5030,6 +5049,42 @@ mod tests {
         assert_eq!(sink.payloads(EVENT_ERROR).len(), 2);
     }
 
+    /// §31 点名的第三条文案：`4003`（同密钥第三台设备）必须翻译成一句人话，
+    /// 而且只有它是 fatal —— 另外几种关闭都是可以靠重连自愈的。
+    #[test]
+    fn close_codes_become_readable_messages() {
+        let full = describe_close(Some(4003));
+
+        assert_eq!(full.message, "该联机会话已有两台设备在线");
+        assert!(full.fatal, "两台设备在线时要等对方断开，重试只会刷日志");
+
+        let replaced = describe_close(Some(4002));
+
+        assert_eq!(replaced.message, "这条连接被同一台设备的新连接顶替");
+        assert!(!replaced.fatal);
+
+        assert_eq!(
+            describe_close(Some(4004)).message,
+            "旧连接因长时间没有活动被顶替"
+        );
+        assert_eq!(
+            describe_close(Some(1008)).message,
+            "服务器认为数据格式或发送频率异常"
+        );
+        assert_eq!(
+            describe_close(Some(1009)).message,
+            "一帧数据超过服务器允许的大小"
+        );
+        assert_eq!(describe_close(Some(1011)).message, "服务器内部错误");
+        // 没见过的码与「没给码」也要给出可读文案，而不是空字符串
+        assert_eq!(
+            describe_close(Some(4999)).message,
+            "服务器关闭了连接（4999）"
+        );
+        assert_eq!(describe_close(None).message, "服务器关闭了连接");
+        assert!(!describe_close(Some(4999)).fatal);
+    }
+
     #[test]
     fn fatal_failure_stops_the_session_and_shows_the_error_state() {
         let (manager, sink) = test_manager();
@@ -5037,14 +5092,14 @@ mod tests {
 
         *PairManager::lock(&manager.sender) = Some(sender);
 
-        manager.fail_hard(0, "鉴权失败：Pair Secret 与部署时的值不一致".to_string());
+        manager.fail_hard(0, "鉴权失败：联机密钥与服务器不一致".to_string());
 
         let status = manager.status();
 
         assert_eq!(status.state, PairConnectionState::Error);
         assert_eq!(
             status.last_error.as_deref(),
-            Some("鉴权失败：Pair Secret 与部署时的值不一致")
+            Some("鉴权失败：联机密钥与服务器不一致")
         );
         assert_eq!(sink.payloads(EVENT_ERROR).len(), 1);
         // 旧任务的 sender 已经被清掉：后续发送必须报错，而不是静默成功
@@ -6430,12 +6485,12 @@ mod tests {
 
         assert!(wait_until(written).await, "假传输上没有写出任何应用帧");
 
-        // 传输结束 → 会话按「中继关闭了连接」收尾（而不是被用户停掉）
+        // 传输结束 → 会话按「服务器关闭了连接」收尾（而不是被用户停掉）
         inbound_tx.send(Message::Close(None)).unwrap();
 
         match driver.await.unwrap() {
             Outcome::Lost(failure) => {
-                assert_eq!(failure.message, "中继关闭了连接");
+                assert_eq!(failure.message, "服务器关闭了连接");
                 assert!(!failure.fatal);
             }
             Outcome::Stopped => panic!("不该是被用户停掉"),
