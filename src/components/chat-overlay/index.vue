@@ -232,7 +232,7 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 </script>
 
 <template>
-  <div class="size-full flex flex-col justify-end gap-[2%]">
+  <div class="size-full flex flex-col justify-end gap-[2%] text-[#fff]">
     <div class="min-h-0 flex flex-col justify-end gap-[1.5%] overflow-hidden">
       <div
         v-for="message in bubbles"

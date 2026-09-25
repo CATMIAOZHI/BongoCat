@@ -589,13 +589,13 @@ onMounted(async () => {
 
       <button
         v-if="!atNewest"
-        class="i-lucide:chevron-down shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] hover:text-[#fff]"
+        class="i-lucide:chevron-down relative shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
         :title="$t('pages.chat.hints.backToNewest')"
         @click="backToNewest"
       />
 
       <button
-        class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] hover:text-[#fff]"
+        class="i-lucide:x relative shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
         :title="$t('pages.chat.hints.hide')"
         @click="handleHide"
       />
@@ -815,7 +815,7 @@ onMounted(async () => {
           <div class="mt-1 flex items-center justify-end gap-1 text-[9px] color-[#ffffff73]">
             <button
               v-if="item.text"
-              class="shrink-0 cursor-pointer text-[10px] opacity-0 transition hover:text-[#fff] group-hover:opacity-100"
+              class="relative shrink-0 cursor-pointer text-[10px] opacity-0 transition before:absolute hover:text-[#fff] group-hover:opacity-100 before:content-empty before:-inset-[0.4em]"
               :class="copiedId === item.id ? 'i-lucide:check' : 'i-lucide:copy'"
               :title="$t('pages.chat.hints.copy')"
               @click="handleCopy(item)"
@@ -841,7 +841,7 @@ onMounted(async () => {
       <!-- R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款 -->
       <div class="flex items-end gap-1.5 bg-[#ffffff14] px-2 py-1.5 rounded-xl">
         <button
-          class="i-lucide:paperclip mb-1 shrink-0 cursor-pointer text-[13px] color-[#ffffff8c] hover:text-[#fff]"
+          class="i-lucide:paperclip relative mb-1 shrink-0 cursor-pointer text-[13px] color-[#ffffff8c] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
           :title="$t('pages.chat.hints.pickAttachment')"
           @click="pickAttachment"
         />
@@ -937,7 +937,7 @@ onMounted(async () => {
         </span>
 
         <button
-          class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-[#ffffff99] hover:text-[#fff]"
+          class="i-lucide:x relative shrink-0 cursor-pointer text-[14px] color-[#ffffff99] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
           :title="$t('pages.chat.hints.close')"
           @click="closePreview"
         />

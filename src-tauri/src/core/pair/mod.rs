@@ -114,7 +114,7 @@ pub async fn pair_set_secret(secret: String) -> Result<String, String> {
 
     secret::set_secret(&canonical)?;
 
-    // 只回显指纹（R17），不回显 secret 本身：双方可以靠它核对填的是不是同一个值
+    // 回显指纹（R17）：双方可以靠它核对填的是不是同一个值。明文另由 `pair_get_secret` 读回（R45）
     Ok(crypto::secret_fingerprint(&bytes))
 }
 
@@ -161,6 +161,12 @@ pub async fn pair_delete_secret() -> Result<(), String> {
     secret::delete_secret()
 }
 
+/// 读回已保存的配对密码明文（R45：设置页一直显示它，和服务器地址一样）。没存过时是 `None`。
+#[command]
+pub async fn pair_get_secret() -> Result<Option<String>, String> {
+    secret::load_secret()
+}
+
 /// 保存「服务器密码」（R36）。
 ///
 /// 它**不是**密钥材料：不参与 E2EE，也不参与「谁是同一对」的判断，只是「能不能用这台
@@ -180,6 +186,12 @@ pub async fn pair_set_server_password(password: String) -> Result<(), String> {
 #[command]
 pub async fn pair_has_server_password() -> Result<bool, String> {
     secret::has_server_password()
+}
+
+/// 读回已保存的服务器密码明文（R45）。没存过时是 `None`。
+#[command]
+pub async fn pair_get_server_password() -> Result<Option<String>, String> {
+    secret::load_server_password()
 }
 
 #[command]

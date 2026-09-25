@@ -18,4 +18,23 @@ html {
   button {
     outline: none !important;
   }
+
+  /*
+   * 聊天窗口与猫咪窗口的聊天浮层里用的是原生 <button> / <textarea>（那两个窗口没有 antd
+   * 组件），antd 的 reset.css 不清它们的系统默认样式：按钮会是白底带边框，输入框是黑字。
+   * 这里只用元素选择器，任何 class（UnoCSS 工具类、antd 的 .ant-btn）都能盖过它。
+   */
+  button {
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    color: inherit;
+    appearance: none;
+  }
+
+  textarea {
+    border: 0;
+    background-color: transparent;
+    color: inherit;
+  }
 }

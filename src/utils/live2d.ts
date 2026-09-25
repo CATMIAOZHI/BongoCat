@@ -24,13 +24,20 @@ class Live2d {
   private initApp() {
     if (this.app) return
 
-    const view = document.getElementById('live2dCanvas') as HTMLCanvasElement
+    const view = document.getElementById('live2dCanvas') as HTMLCanvasElement | null
 
     this.app = new Application()
 
+    /*
+     * 画布跟着**它所在的那块区域**走，而不是整个窗口。
+     *
+     * 猫咪窗口开着双人联机时，顶上有一条聊天浮层（R39），猫只占下面那一块；按窗口大小
+     * 摆猫会把猫整体往下推一个浮层的高度、底部被裁掉。对方猫咪窗口与单机时这块区域就是
+     * 整个窗口，行为不变。
+     */
     return this.app.init({
-      view,
-      resizeTo: window,
+      view: view ?? void 0,
+      resizeTo: view?.parentElement ?? window,
       backgroundAlpha: 0,
       autoDensity: true,
       resolution: devicePixelRatio,
@@ -96,14 +103,17 @@ class Live2d {
     if (!this.model) return
 
     const { width, height } = modelSize
+    const area = this.app?.canvas.parentElement
+    const areaWidth = area?.clientWidth || innerWidth
+    const areaHeight = area?.clientHeight || innerHeight
 
-    const scaleX = innerWidth / width
-    const scaleY = innerHeight / height
+    const scaleX = areaWidth / width
+    const scaleY = areaHeight / height
     const scale = Math.min(scaleX, scaleY)
 
     this.model.scale.set(scale)
-    this.model.x = innerWidth / 2
-    this.model.y = innerHeight / 2
+    this.model.x = areaWidth / 2
+    this.model.y = areaHeight / 2
     this.model.anchor.set(0.5)
   }
 

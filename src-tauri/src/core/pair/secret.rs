@@ -1,8 +1,10 @@
 //! 联机功能的两个凭据在本地的保存：配对密码与服务器密码（R36）。
 //!
 //! 只存进系统凭据库（Windows Credential Manager / macOS Keychain / Linux Secret
-//! Service），绝不写进 JSON 设置文件、Pinia、localStorage 或日志。前端只能写入、
-//! 查询是否存在、删除，不能读回明文。
+//! Service），绝不写进 JSON 设置文件、Pinia、localStorage 或日志。
+//!
+//! R45：前端可以读回明文，让设置页像服务器地址一样一直显示这两个值（用户要求，
+//! 自用场景下「能看见、能复制」比「保存后再也看不到」更重要）。
 
 const SERVICE: &str = "com.ayangweb.BongoCat.pair";
 /// 两个人的共享凭据（决定「谁是同一对」，也是 E2EE 密钥材料）

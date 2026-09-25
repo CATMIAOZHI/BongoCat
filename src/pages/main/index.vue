@@ -198,7 +198,7 @@ const debouncedResize = useDebounceFn(async () => {
      * R43：窗口尺寸变了，模型必须重新贴合一次。
      *
      * R39 把这块改成「自己算尺寸」时漏掉了这一步——`useModel().handleResize()` 里那句
-     * `live2d.resizeModel()` 是 pixi 的 `resizeTo: window` 之外唯一按新窗口重算缩放与
+     * `live2d.resizeModel()` 是 pixi 的 `resizeTo`（R45 起是画布所在的那块区域）之外唯一按新尺寸重算缩放与
      * 居中的地方（pixi 只改画布尺寸，不会动模型），少了它之后拖窗口猫就不再重绘：
      * 猫停在旧缩放上、背景与按键贴图相对猫错位。
      */

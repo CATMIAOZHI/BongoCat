@@ -18,7 +18,9 @@ import {
   pairDeleteServerPassword,
   pairDisconnect,
   pairGenerateSecret,
+  pairGetSecret,
   pairGetSecretFingerprint,
+  pairGetServerPassword,
   pairHasSecret,
   pairHasServerPassword,
   pairHistoryExport,
@@ -40,6 +42,46 @@ const modelStore = useModelStore()
 const { t } = useI18n()
 const secretInput = ref('')
 const serverPasswordInput = ref('')
+
+/**
+ * R45：两个密码和服务器地址一样一直明文显示在框里（用户要求）。
+ *
+ * 这两个是凭据库里**已保存**的值；框里是草稿，和它不一样时「保存」才可点，并提示还没生效。
+ */
+const savedSecret = ref('')
+const savedServerPassword = ref('')
+const secretDirty = computed(() => secretInput.value.trim() !== savedSecret.value)
+const serverPasswordDirty = computed(() => serverPasswordInput.value.trim() !== savedServerPassword.value)
+
+/**
+ * 从凭据库读回两个值，填进框里（打开页面时，以及保存之后拿 Rust 规范化过的那串）。
+ *
+ * `written` = 刚刚写进去的值：保存已经成功，只是读回失败时就把它当成已保存值，
+ * 别把一次成功的保存报成失败、也别让框里挂着「改过了，点保存才会生效」。
+ */
+async function loadSavedSecret(written?: string) {
+  try {
+    savedSecret.value = (await pairGetSecret()) ?? ''
+  } catch (reason) {
+    if (written === void 0) throw reason
+
+    savedSecret.value = written
+  }
+
+  secretInput.value = savedSecret.value
+}
+
+async function loadSavedServerPassword(written?: string) {
+  try {
+    savedServerPassword.value = (await pairGetServerPassword()) ?? ''
+  } catch (reason) {
+    if (written === void 0) throw reason
+
+    savedServerPassword.value = written
+  }
+
+  serverPasswordInput.value = savedServerPassword.value
+}
 
 /**
  * 服务器地址在输入框里是**草稿**（R40）。
@@ -288,6 +330,15 @@ onMounted(async () => {
       message.error(String(reason))
     })
 
+  // R45：把已保存的两个值填回框里（读失败时框留空，「已配置」标记照旧由上面那次判断给）
+  await loadSavedSecret().catch((reason) => {
+    message.error(String(reason))
+  })
+
+  await loadSavedServerPassword().catch((reason) => {
+    message.error(String(reason))
+  })
+
   // 服务器密码同理：它决定「已配置」标记与删除入口，与配对密码各存一个条目
   await pairHasServerPassword()
     .then((hasServerPassword) => {
@@ -404,16 +455,16 @@ async function handleSaveSecret() {
   const secret = secretInput.value.trim()
 
   // 连按回车会重入：按钮有 loading 挡着，键盘没有，两次「断开 → 重连」会交错
-  if (!secret || saving.value) return
+  if (!secret || !secretDirty.value || saving.value) return
 
   saving.value = true
 
   try {
-    // Rust 只回显指纹，不回显 secret 本身（R10 / R17）
     pairStore.secretFingerprint = await pairSetSecret(secret)
     pairStore.hasSecret = true
     secretUnknown.value = false
-    secretInput.value = ''
+    // Rust 存的是规范化后的那串（base64url 无填充），读回来显示，框里和凭据库保持一致
+    await loadSavedSecret(secret)
 
     message.success(t('pages.preference.pair.hints.secretSaved'))
 
@@ -428,8 +479,7 @@ async function handleSaveSecret() {
 /**
  * §22：密钥由 Rust 用系统 CSPRNG 生成，前端把它填进输入框（要留下得自己点保存）。
  *
- * 生成后**顺手复制一次**：保存会把输入框清空（明文不留在界面上），不先复制的话
- * 「生成 → 保存 → 再复制」就永远走不通了。
+ * 生成后顺手复制一次，省得再点「复制」。
  */
 async function handleGenerateSecret() {
   generating.value = true
@@ -470,8 +520,7 @@ async function handleCopySecret() {
 /**
  * 删除配对密码。
  *
- * 它是**不可逆**的：凭据库里的明文只能写不能读，删掉之后除了让对方重发一次没有别的
- * 办法拿回来，所以这里先确认一次。
+ * 它是**不可逆**的：删掉之后除了让对方重发一次没有别的办法拿回来，所以这里先确认一次。
  */
 function handleDeleteSecret() {
   confirmDeleteCredential(
@@ -483,6 +532,8 @@ function handleDeleteSecret() {
 
       pairStore.hasSecret = false
       pairStore.secretFingerprint = ''
+      savedSecret.value = ''
+      secretInput.value = ''
     },
   )
 }
@@ -490,20 +541,20 @@ function handleDeleteSecret() {
 /**
  * 保存服务器密码（R36）。
  *
- * 与配对密码一样：它只进系统凭据库，保存成功后清空输入框（明文不留在界面上），
- * 而且**换了要重连**——中继会按新值重新判一次门槛。
+ * 与配对密码一样只进系统凭据库，框里一直显示它（R45），而且**换了要重连**——
+ * 中继会按新值重新判一次门槛。
  */
 async function handleSaveServerPassword() {
   const password = serverPasswordInput.value.trim()
 
-  if (!password || savingServerPassword.value) return
+  if (!password || !serverPasswordDirty.value || savingServerPassword.value) return
 
   savingServerPassword.value = true
 
   try {
     await pairSetServerPassword(password)
     pairStore.hasServerPassword = true
-    serverPasswordInput.value = ''
+    await loadSavedServerPassword(password)
 
     message.success(t('pages.preference.pair.hints.serverPasswordSaved'))
 
@@ -515,7 +566,7 @@ async function handleSaveServerPassword() {
   }
 }
 
-/** 复制服务器密码：保存后输入框会清空，所以要发出去就先点这里 */
+/** 复制框里显示的服务器密码 */
 async function handleCopyServerPassword() {
   try {
     await writeText(serverPasswordInput.value.trim())
@@ -541,7 +592,7 @@ async function handleCopyRelayUrl() {
 }
 
 /**
- * 删除服务器密码：和配对密码一样只写不读，删掉就得再去找部署服务器的人要一次。
+ * 删除服务器密码：删掉就得再去找部署服务器的人要一次。
  */
 function handleDeleteServerPassword() {
   confirmDeleteCredential(
@@ -552,6 +603,8 @@ function handleDeleteServerPassword() {
       await pairDeleteServerPassword()
 
       pairStore.hasServerPassword = false
+      savedServerPassword.value = ''
+      serverPasswordInput.value = ''
     },
   )
 }
@@ -559,8 +612,7 @@ function handleDeleteServerPassword() {
 /**
  * 删掉一个凭据前的确认 + 删除后的一句反馈。
  *
- * 两个「删除」按钮都是不可逆的（凭据库里的明文只写不读），此前点一下就没了、
- * 连提示都没有（只读审计的 P2-4）。
+ * 两个「删除」按钮都是不可逆的，此前点一下就没了、连提示都没有（只读审计的 P2-4）。
  */
 function confirmDeleteCredential(name: string, body: string, remove: () => Promise<void>) {
   Modal.confirm({
@@ -619,8 +671,9 @@ async function handleConnect() {
     // 不这样做会出现自相矛盾的状态：界面显示「已连接」、输入框里明晃晃留着密码，
     // 但凭据库是空/旧的——重启后自动连接报「还没有配置配对密码」，用户会以为填错了
     // （只读审计的 P1-1）。
-    if (secret) {
-      // Rust 只回显指纹，不回显 secret 本身（R10 / R17）
+    //
+    // R45：框里一直显示已保存的值，所以只有**改过**的才落盘，没改就不重复写、也不说「已记住」。
+    if (secret && secretDirty.value) {
       const fingerprint = await pairSetSecret(secret)
 
       // 指纹和原来那串一样，就是用户不放心又把同一串粘了一遍：别说「替换」。
@@ -631,22 +684,27 @@ async function handleConnect() {
       pairStore.secretFingerprint = fingerprint
       pairStore.hasSecret = true
       secretUnknown.value = false
-      secretInput.value = ''
+      await loadSavedSecret(secret)
       remembered = true
+    } else if (!secret) {
+      // 框被清空了：连的还是已保存的那串，把它显示回框里（和地址一栏同一处理）
+      secretInput.value = savedSecret.value
     }
 
-    if (serverPassword) {
+    if (serverPassword && serverPasswordDirty.value) {
       await pairSetServerPassword(serverPassword)
       pairStore.hasServerPassword = true
-      serverPasswordInput.value = ''
+      await loadSavedServerPassword(serverPassword)
       remembered = true
+    } else if (!serverPassword) {
+      serverPasswordInput.value = savedServerPassword.value
     }
 
-    // 先把「记住了」说出来再连接：连接失败时用户会看到两个空输入框 + 一条红字，容易
-    // 读成「白填了」。落盘确实已经成功，这句话和后面那条错误不矛盾。
+    // 先把「记住了」说出来再连接：连接失败时只看到一条红字，容易读成「白填了」。
+    // 落盘确实已经成功，这句话和后面那条错误不矛盾。
     if (remembered) {
-      // 本来存过一串、现在填的是**不一样**的，就是替换——凭据库里的旧值读不回来，
-      // 这件事得明说，否则用户不知道老的那串已经没了
+      // 本来存过一串、现在填的是**不一样**的，就是替换——这件事得明说，
+      // 否则用户不知道老的那串已经没了
       message.success(
         replacedSecret
           ? t('pages.preference.pair.hints.valuesReplaced')
@@ -781,7 +839,7 @@ const canPreviewSound = computed(
         />
 
         <Button
-          :disabled="!serverPasswordInput.trim()"
+          :disabled="!serverPasswordInput.trim() || !serverPasswordDirty"
           :loading="savingServerPassword"
           type="primary"
           @click="handleSaveServerPassword"
@@ -813,6 +871,15 @@ const canPreviewSound = computed(
           {{ $t('pages.preference.pair.buttons.delete') }}
         </Button>
       </Flex>
+
+      <!-- R45：框里改过、还没保存：和地址一栏一样说清楚还没生效 -->
+      <Alert
+        v-if="serverPasswordDirty && serverPasswordInput.trim()"
+        class="w-full"
+        :message="$t('pages.preference.pair.hints.credentialUnsaved')"
+        show-icon
+        type="info"
+      />
     </ProListItem>
 
     <ProListItem
@@ -848,7 +915,7 @@ const canPreviewSound = computed(
         </Button>
 
         <Button
-          :disabled="!secretInput.trim()"
+          :disabled="!secretInput.trim() || !secretDirty"
           :loading="saving"
           type="primary"
           @click="handleSaveSecret"
@@ -872,6 +939,14 @@ const canPreviewSound = computed(
           {{ $t('pages.preference.pair.buttons.delete') }}
         </Button>
       </Flex>
+
+      <Alert
+        v-if="secretDirty && secretInput.trim()"
+        class="w-full"
+        :message="$t('pages.preference.pair.hints.credentialUnsaved')"
+        show-icon
+        type="info"
+      />
 
       <Flex
         v-if="pairStore.secretFingerprint"

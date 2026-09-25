@@ -47,7 +47,7 @@ export function pairGetDeviceId() {
   return invoke<string>(INVOKE_KEY.PAIR_GET_DEVICE_ID)
 }
 
-/** 保存 Pair Secret，返回 R17 的核对指纹（明文永不回显） */
+/** 保存 Pair Secret，返回 R17 的核对指纹 */
 export function pairSetSecret(secret: string) {
   return invoke<string>(INVOKE_KEY.PAIR_SET_SECRET, { secret })
 }
@@ -70,10 +70,15 @@ export function pairDeleteSecret() {
   return invoke<void>(INVOKE_KEY.PAIR_DELETE_SECRET)
 }
 
+/** R45：读回已保存的配对密码明文（设置页一直显示它）；没存过时是 `null` */
+export function pairGetSecret() {
+  return invoke<string | null>(INVOKE_KEY.PAIR_GET_SECRET)
+}
+
 /**
  * 保存「服务器密码」（R36）：部署服务器的人在 `.env` 里设的那个值。
  *
- * 它只存在系统凭据库里（与配对密码分开两个条目），前端拿不回明文。
+ * 它只存在系统凭据库里（与配对密码分开两个条目）。
  */
 export function pairSetServerPassword(password: string) {
   return invoke<void>(INVOKE_KEY.PAIR_SET_SERVER_PASSWORD, { password })
@@ -85,6 +90,11 @@ export function pairHasServerPassword() {
 
 export function pairDeleteServerPassword() {
   return invoke<void>(INVOKE_KEY.PAIR_DELETE_SERVER_PASSWORD)
+}
+
+/** R45：读回已保存的服务器密码明文；没存过时是 `null` */
+export function pairGetServerPassword() {
+  return invoke<string | null>(INVOKE_KEY.PAIR_GET_SERVER_PASSWORD)
 }
 
 /**
