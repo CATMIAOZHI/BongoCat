@@ -21,7 +21,7 @@ import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
 import { useModelStore } from '@/stores/model'
-import { usePairStore } from '@/stores/pair'
+import { pairStateKey, usePairStore } from '@/stores/pair'
 import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
@@ -112,6 +112,12 @@ function remoteModel() {
 }
 
 const isOnline = () => pairStore.runtime.peerOnline
+
+/**
+ * R44：联机状态对应的 i18n key（按连接状态细分，不再把所有情况都说成「对方离线」）。
+ * 正常时是空串，模板用 `$t(stateNote)` 取文案。
+ */
+const stateNote = computed(() => pairStateKey(pairStore.runtime.connection, pairStore.settings.enabled))
 
 const remoteStats = computed(() => {
   const stats = pairStore.runtime.remoteStats
@@ -523,7 +529,7 @@ function handleMouseDown() {
       v-if="pairStore.runtime.remotePresence === 'away' && isOnline()"
       class="absolute inset-x-0 top-0 flex justify-center pt-2"
     >
-      <div class="max-w-full break-all bg-black/55 px-2.5 py-1 text-[11px] text-white rounded-lg">
+      <div class="max-w-full break-all rounded-[0.5rem] bg-black/55 px-2.5 py-1 text-[11px] text-[#fff]">
         {{ pairStore.runtime.remotePresenceMessage || $t('pages.remoteCat.hints.away') }}
       </div>
     </div>
@@ -532,7 +538,7 @@ function handleMouseDown() {
       v-else-if="notice"
       class="absolute inset-x-0 top-0 flex justify-center pt-2"
     >
-      <div class="bg-black/50 px-2.5 py-1 text-[11px] text-white rounded-lg">
+      <div class="rounded-[0.5rem] bg-black/50 px-2.5 py-1 text-[11px] text-[#fff]">
         {{ $t('pages.remoteCat.hints.peerBack') }}
       </div>
     </div>
@@ -541,7 +547,7 @@ function handleMouseDown() {
       v-if="pairStore.settings.remoteCat.showStats && isOnline() && remoteStats"
       class="absolute inset-x-0 bottom-0 flex justify-center pb-1.5"
     >
-      <div class="bg-black/45 px-2 py-0.5 text-[10px] color-white/85 rounded-md">
+      <div class="bg-black/45 px-2 py-0.5 text-[10px] color-[#ffffffd9] rounded-md">
         {{ $t('pages.remoteCat.hints.today', {
           keyboard: remoteStats.todayKeyboard,
           mouse: remoteStats.todayMouse,
@@ -558,33 +564,28 @@ function handleMouseDown() {
       v-if="isOnline() && pairStore.runtime.peerName"
       class="absolute inset-x-0 bottom-0 flex justify-center pb-0.5"
     >
-      <span class="text-[9px] color-white/50">{{ pairStore.runtime.peerName }}</span>
+      <span class="text-[9px] color-[#ffffff80]">{{ pairStore.runtime.peerName }}</span>
     </div>
 
     <div
       v-show="resizing || !modelReady"
       class="absolute size-full flex items-center justify-center bg-black"
     >
-      <span class="text-center text-[10vw] text-white">
+      <span class="text-center text-[10vw] text-[#fff]">
         {{ resizing ? $t('pages.main.hints.redrawing') : $t('pages.main.hints.switching') }}
       </span>
     </div>
 
+    <!--
+      R44：以前只分「联机没打开」和「对方离线」，于是「没连上服务器 / 正在连 / 连不上」都写成
+      「对方离线」——用户会一直等对方，而真实原因可能是自己地址填错或服务器没开。
+    -->
     <div
-      v-if="!pairStore.settings.enabled"
+      v-if="stateNote"
       class="absolute inset-x-0 top-0 flex justify-center pt-2"
     >
-      <div class="bg-black/55 px-2 py-1 text-[11px] text-white rounded-lg">
-        {{ $t('pages.remoteCat.hints.disabled') }}
-      </div>
-    </div>
-
-    <div
-      v-else-if="!isOnline()"
-      class="absolute inset-x-0 top-0 flex justify-center pt-2"
-    >
-      <div class="bg-black/55 px-2 py-1 text-[11px] text-white rounded-lg">
-        {{ $t('pages.remoteCat.hints.offline') }}
+      <div class="max-w-full break-all rounded-[0.5rem] bg-black/55 px-2 py-1 text-[11px] text-[#fff]">
+        {{ $t(stateNote) }}
       </div>
     </div>
   </div>

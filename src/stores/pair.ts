@@ -45,6 +45,57 @@ export function pairStatusKey(connection: PairConnectionState): PairStatusKey {
   }
 }
 
+/**
+ * 叶子窗口（猫咪上的浮层 / 聊天窗口 / 对方猫）要说的一句人话。
+ *
+ * R44 之前这几处只分「联机没打开」和「对方离线」两支，于是「没连上服务器」「正在连」
+ * 「连不上」和「连上了但对方没上线」在界面上一模一样——而设置页的「对方离线」指的是
+ * 最后那一种。用户在最常看的窗口里看到「对方离线」，真实原因可能是自己地址填错、
+ * 服务器没开，却被引向「等对方」这个错误的动作。这里按连接状态细分。
+ *
+ * 返回 i18n key（`pages.pairState.*`）；状态正常（已连上）时返回空串。
+ */
+export function pairStateKey(connection: PairConnectionState, enabled: boolean): string {
+  if (!enabled) return 'pages.pairState.disabled'
+
+  const key = pairStatusKey(connection)
+
+  return key === 'connected' ? '' : `pages.pairState.${key}`
+}
+
+/**
+ * 猫咪窗口上「待确认的语音为什么发不出去」（R41 / R44）；能发时是空串。
+ *
+ * R44 之前这里只看连接状态，于是 **`connected` 被当成「在等对方」**——可 `connected`
+ * 只说明自己连上了服务器（Rust 侧「连上但对方没上线」是另一个状态 `connected-peer-offline`），
+ * 对方在不在线由 `peerOnline` 单独给。结果「录好了、对方也在线」这个正常状态被判成
+ * 「对方不在线」，用户就会一直等一个已经在线的人。
+ *
+ * 所以第一句必须按「能不能发」判（`enabled && peerOnline`），`connection` 只用来区分
+ * 「在等对方」和「自己这边还没连上」。放进 store 是为了能被单测钉住（见 `pair.spec.ts`）。
+ */
+export function recordingBlockReasonKey(input: {
+  enabled: boolean
+  connection: PairConnectionState
+  peerOnline: boolean
+  sending: boolean
+}): string {
+  // 正在发送：界面上由「正在发送…」那一格接管。这里返回空串是兜住「发送途中对方掉线」
+  // 那一格（那时 `peerOnline` 已经翻成 false），免得函数自己给出「对方不在线」这种
+  // 和正在发生的事相反的话
+  if (input.sending) return ''
+
+  if (input.enabled && input.peerOnline) return ''
+
+  if (!input.enabled) return 'pages.main.hints.sendRecordingDisabled'
+
+  // 连上了服务器、对方没上线：这才是「等对方回来再发」
+  if (input.connection === 'peer-offline') return 'pages.main.hints.sendRecordingOffline'
+
+  // 正在连 / 还没连上 / 连不上：等对方解决不了，得看自己的地址与服务器
+  return 'pages.main.hints.sendRecordingNotConnected'
+}
+
 /** 输入统计（§24 / §25）。只统计次数，不记录任何按键内容。 */
 export interface PairStats {
   /** 计数对应的本地日期（yyyy-MM-dd）；跨过午夜先把今日计数归零 */

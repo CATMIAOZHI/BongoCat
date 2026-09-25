@@ -8,7 +8,7 @@ import { MESSAGE_TEXT_LIMIT, RECORDING_LIMIT_SECS } from '@/composables/usePair'
 import { usePairChat } from '@/composables/usePairChat'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
-import { usePairStore } from '@/stores/pair'
+import { pairStateKey, usePairStore } from '@/stores/pair'
 
 /**
  * 猫咪窗口上的聊天浮层（R39）。
@@ -59,7 +59,19 @@ const bubbleCount = computed(() => {
   return Math.min(20, Math.max(1, Number.isFinite(value) ? value : 5))
 })
 
-const bubbles = computed(() => messages.value.slice(-Math.min(bubbleCount.value, OVERLAY_BUBBLE_MAX)))
+/** 实际显示几条：设置值与浮层上限里更小的那个 */
+const shownCount = computed(() => Math.min(bubbleCount.value, OVERLAY_BUBBLE_MAX))
+
+const bubbles = computed(() => messages.value.slice(-shownCount.value))
+
+/**
+ * 超出的那几条去哪了：浮层是窄条，只说最新几条，剩下的在聊天窗口里。
+ *
+ * 不写这句时，浮层看着就是「全部聊天记录」，用户不会想到要去开聊天窗口。
+ */
+const moreNote = computed(() => {
+  return messages.value.length > shownCount.value ? t('pages.chat.hints.moreInChat') : ''
+})
 
 const draftBytes = computed(() => new TextEncoder().encode(draft.value).length)
 const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
@@ -67,7 +79,23 @@ const canSend = computed(() => {
   return online.value && !sending.value && !tooLong.value && draft.value.trim().length > 0
 })
 
-/** 输入框里的提示行：录音中 > 待发送的录音 > 没连线 > 发送失败 */
+/**
+ * 「现在发不出去」的原因（联机状态那句人话）。
+ *
+ * 录音 / 待确认期间不显示：那两件事有自己的一条提示，挤在一起看不清。
+ */
+const pairState = computed(() => {
+  const key = pairStateKey(pairStore.runtime.connection, pairStore.settings.enabled)
+
+  return key ? t(key) : ''
+})
+
+/**
+ * 输入框里的 placeholder：只说**这一会儿正在发生什么**（录音 / 录好待确认）。
+ *
+ * 联机状态与发送失败不写在这儿：它们在下一条状态行上（`blockNote`）——placeholder 一有字
+ * 就被挡住，而且两处都写会同屏说两遍。
+ */
 const hint = computed(() => {
   if (props.recording) {
     return t('pages.main.hints.recording', { seconds: props.recordingSeconds, limit: RECORDING_LIMIT_SECS })
@@ -76,11 +104,28 @@ const hint = computed(() => {
   // R41：录完先不发送，提示去下面那条「试听 / 发送 / 取消」上确认
   if (props.pending) return t('pages.chat.hints.voiceReady')
 
-  if (!pairStore.settings.enabled) return t('pages.chat.hints.disabled')
-  if (!pairStore.runtime.peerOnline) return t('pages.chat.hints.offline')
-
-  return sendError.value
+  return ''
 })
+
+/**
+ * 输入条下面那一行：只在真的发不出去（或上一次发失败了）时出现。
+ *
+ * 以前这些都写在 placeholder 上，可发送失败时草稿**不会被清空**，placeholder 被自己
+ * 的字挡住——用户只看到发送键变灰、点了没反应，没有任何原因可看。
+ */
+const blockNote = computed(() => {
+  if (props.recording || props.pending) return ''
+
+  return pairState.value || sendError.value
+})
+
+/**
+ * 输入条下面那一行只写一句：能说的原因（发不出去 / 上次失败）优先，其次是「还有更多消息」。
+ *
+ * 浮层本来就是窄条，三行字会把气泡挤出上沿（气泡上限 3 条就是按这个高度定的），
+ * 所以两件事共用一个位置，不叠两行。
+ */
+const statusNote = computed(() => blockNote.value || moreNote.value)
 
 /** 附件消息在气泡里只显示一个短标签，正文仍然是 `text` */
 function bubbleText(message: ChatMessage) {
@@ -89,6 +134,28 @@ function bubbleText(message: ChatMessage) {
   if (message.kind === 'voice') return t('pages.main.hints.bubbleVoice')
 
   return t('pages.main.hints.bubbleFile')
+}
+
+/**
+ * 附件消息（图片 / 语音 / 文件）：浮层里只显示一个 `[语音]` 这样的小标签。
+ *
+ * 播放语音、看图、另存附件都在独立聊天窗口里，而那个窗口默认是关着的；浮层上又没说
+ * 它在哪。所以附件气泡做成可点：点一下把聊天窗口打开，用户就能在那里处理（R44）。
+ */
+function attachmentMessage(message: ChatMessage) {
+  return Boolean(message.attachmentId) && !message.text
+}
+
+function openChatWindow() {
+  pairStore.settings.chat.visible = true
+}
+
+/**
+ * 猫咪窗口的根节点在 mousedown 时会 `startDragging()`；拖动一起，那条气泡上的 click 就
+ * 收不到了。所以可点的附件气泡要把这一下拦下来（和下面那条输入条同一处理）。
+ */
+function handleBubbleMouseDown(event: MouseEvent, message: ChatMessage) {
+  if (attachmentMessage(message)) event.stopPropagation()
 }
 
 async function handleSend() {
@@ -110,7 +177,13 @@ async function handleSend() {
   }
 }
 
-/** Enter 发送、Shift+Enter 换行、Esc 退出输入（与聊天窗口同一套键位） */
+/**
+ * Enter 发送、Shift+Enter 换行、Esc 退出输入（与聊天窗口同一套键位）。
+ *
+ * 中文/日文输入法里「确认候选词」也是 Enter，此时 `event.isComposing` 为真，绝不能当成
+ * 发送；所以这里自己 `preventDefault`，而不是用 `.prevent` 修饰符。个别 Chromium 版本在
+ * 「结束合成的那一次 Enter」上给的是 `isComposing === false` + `keyCode === 229`，再补一条兜底。
+ */
 function handleKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
     event.preventDefault()
@@ -120,6 +193,7 @@ function handleKeydown(event: KeyboardEvent) {
   }
 
   if (event.key !== 'Enter' || event.shiftKey) return
+  if (event.isComposing || event.keyCode === 229) return
 
   event.preventDefault()
 
@@ -164,9 +238,15 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
         v-for="message in bubbles"
         :key="message.id"
         class="max-w-[86%] break-all rounded-[2vw] px-[3%] py-[1.2%] text-[3.4vw] leading-[1.35]"
-        :class="message.direction === 'outgoing'
-          ? 'self-end bg-[#1677ff] rounded-br-[0.5vw]'
-          : 'self-start bg-black/55 rounded-bl-[0.5vw]'"
+        :class="[
+          message.direction === 'outgoing'
+            ? 'self-end bg-[#1677ff] rounded-br-[0.5vw]'
+            : 'self-start bg-black/55 rounded-bl-[0.5vw]',
+          attachmentMessage(message) ? 'cursor-pointer' : '',
+        ]"
+        :title="attachmentMessage(message) ? $t('pages.main.hints.openInChat') : ''"
+        @click="attachmentMessage(message) && openChatWindow()"
+        @mousedown="handleBubbleMouseDown($event, message)"
       >
         {{ bubbleText(message) }}
       </div>
@@ -180,7 +260,7 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
         class="shrink-0 cursor-pointer text-[4.5vw] transition"
         :class="props.recording
           ? 'i-lucide:mic animate-pulse color-[#ff7875]'
-          : 'i-lucide:mic color-white/70 hover:color-white'"
+          : 'i-lucide:mic color-[#ffffffb2] hover:text-[#fff]'"
         :title="props.pending && !props.recording
           ? $t('pages.main.hints.reRecord')
           : $t('pages.main.hints.voice')"
@@ -190,7 +270,7 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
       <textarea
         ref="input"
         v-model="draft"
-        class="min-w-0 flex-1 resize-none text-[3.4vw] leading-[1.4] outline-none bg-transparent placeholder:color-white/40"
+        class="min-w-0 flex-1 resize-none text-[3.4vw] leading-[1.4] outline-none bg-transparent placeholder:color-[#ffffff66]"
         :placeholder="hint || $t('pages.chat.placeholders.input')"
         rows="1"
         @keydown="handleKeydown"
@@ -198,12 +278,21 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 
       <span
         class="size-[7vw] flex shrink-0 items-center justify-center transition rounded-full"
-        :class="canSend ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-white/20'"
+        :class="canSend ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-[#ffffff33]'"
         :title="$t('pages.main.hints.send')"
         @click="handleSend"
       >
-        <span class="i-lucide:arrow-up text-[4vw] color-white" />
+        <span class="i-lucide:arrow-up text-[4vw] text-[#fff]" />
       </span>
     </div>
+
+    <!-- 发不出去的原因 / 上一次发送失败 / 更早的消息在哪：写在框外，框里一有字 placeholder 就看不见了 -->
+    <p
+      v-if="statusNote"
+      class="truncate px-[3%] text-[2.8vw] color-[#ffffff99]"
+      :title="statusNote"
+    >
+      {{ statusNote }}
+    </p>
   </div>
 </template>

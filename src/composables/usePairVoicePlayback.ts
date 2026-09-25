@@ -6,13 +6,20 @@ import { ref } from 'vue'
  * 全窗口共用一个播放器：切到另一条时上一条自动停，和猫咪窗口里「试听录音」用的是同一套
  * 做法（`new Audio()` + asset protocol 播本机文件，不走网络）。
  *
- * 时长不存在消息里（`AttachmentRecord` 没有这个字段），所以从音频元数据里读；读到之前
- * 显示 `--:--`。状态是模块级的：这个窗口只有一份播放器，多个气泡共用它。
+ * 时长不存在消息里（`AttachmentRecord` 没有这个字段），所以从音频元数据里读，读到的值按
+ * 消息 id 缓存（`durations`）；正在播的那条读到之前显示 `--:--`。
+ * 状态是模块级的：这个窗口只有一份播放器，多个气泡共用它。
  */
 const activeId = ref('')
 const playing = ref(false)
 const current = ref(0)
-const duration = ref(0)
+/**
+ * 每条语音读到的总时长（消息 id → 秒）。
+ *
+ * 按 id 存着而不是只留「当前这条」：切到另一条播放时，上一条的时长不该跟着消失。
+ * 消息 id 不复用，所以这个缓存不需要在切歌时清。
+ */
+const durations = ref<Record<string, number>>({})
 /** 播失败的是**哪一条**（只记住 id，不然一条失败会让所有语音气泡都显示「读不出来」） */
 const failedId = ref('')
 
@@ -38,7 +45,6 @@ export function stopVoicePlayback() {
   activeId.value = ''
   playing.value = false
   current.value = 0
-  duration.value = 0
   failedId.value = ''
 }
 
@@ -67,7 +73,6 @@ export async function toggleVoicePlayback(messageId: string, src: string) {
 
   activeId.value = messageId
   current.value = 0
-  duration.value = 0
   failedId.value = ''
 
   const element = new Audio(src)
@@ -77,7 +82,9 @@ export async function toggleVoicePlayback(messageId: string, src: string) {
   }
 
   element.onloadedmetadata = () => {
-    duration.value = Number.isFinite(element.duration) ? element.duration : 0
+    if (!Number.isFinite(element.duration) || element.duration <= 0) return
+
+    durations.value = { ...durations.value, [messageId]: element.duration }
   }
 
   element.onended = () => {
@@ -122,19 +129,23 @@ export function usePairVoicePlayback() {
     isActive: (messageId: string) => activeId.value === messageId,
     isPlaying: (messageId: string) => activeId.value === messageId && playing.value,
     percentOf: (messageId: string) => {
-      if (activeId.value !== messageId || !duration.value) return 0
+      const total = durations.value[messageId] ?? 0
 
-      return Math.min(100, Math.max(0, (current.value / duration.value) * 100))
+      if (activeId.value !== messageId || !total) return 0
+
+      return Math.min(100, Math.max(0, (current.value / total) * 100))
     },
     /**
      * 正在播的那一条显示已播时长（没播过就显示总时长）。
      *
-     * **其它条不显示时间**：每条都挂一个 `--:--` 会让人以为全都坏了。
+     * 其它条只在**播放过、读到过时长**时显示总时长：每条都挂一个 `--:--` 会让人以为全都坏了。
      */
     labelOf: (messageId: string) => {
-      if (activeId.value !== messageId) return ''
+      const total = durations.value[messageId] ?? 0
 
-      return clock(playing.value || current.value ? current.value : duration.value)
+      if (activeId.value !== messageId) return total ? clock(total) : ''
+
+      return clock(playing.value || current.value ? current.value : total)
     },
     stop: stopVoicePlayback,
     toggle: toggleVoicePlayback,

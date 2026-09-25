@@ -8,26 +8,39 @@
         "cancelRecording": "Discard this recording",
         "recordingTooShort": "Too short, nothing was recorded",
         "recordingReady": "{seconds}s recorded — waiting for you",
+        "recordingDiscarded": "The previous take was discarded before you sent it",
+        "peerConnected": "Connected to your partner",
         "playRecording": "Play this recording",
+        "pauseRecording": "Stop playing",
         "sendRecording": "Send this recording",
+        "sendingRecording": "Sending…",
+        "sendRecordingDisabled": "Two-player mode is off — nothing can be sent",
+        "sendRecordingNotConnected": "Not connected to the server yet — nothing can be sent",
         "sendRecordingOffline": "Your partner is offline — send it once they are back",
         "reRecord": "Record a new one (the current one is dropped)",
         "voicePlaybackFailed": "Cannot play this recording back",
+        "voiceSendFailed": "Sending failed: {reason}. This recording has been deleted — record a new one.",
+        "openInChat": "Open it in the chat window",
         "send": "Send",
-        "voice": "Voice",
+        "voice": "Click once to record, click again to stop",
         "bubbleImage": "[Image]",
         "bubbleVoice": "[Voice]",
         "bubbleFile": "[File]"
       }
     },
+    "pairState": {
+      "disabled": "Two-player mode is off",
+      "connecting": "Connecting to the server…",
+      "disconnected": "Not connected to the server yet",
+      "error": "Cannot reach the server",
+      "peerOffline": "Your partner is offline"
+    },
     "remoteCat": {
       "hints": {
         "away": "Your partner stepped away",
         "peerBack": "Your partner is back",
-        "offline": "Your partner is offline",
-        "disabled": "Duo mode is not enabled yet",
-        "today": "Today {keyboard} / {mouse}",
-        "total": "Total {keyboard} / {mouse}"
+        "today": "Today: {keyboard} keys / {mouse} clicks",
+        "total": "Total: {keyboard} keys / {mouse} clicks"
       }
     },
     "chat": {
@@ -36,26 +49,26 @@
       },
       "hints": {
         "loading": "Loading chat history...",
-        "empty": "No messages yet — use the shortcut to start typing",
-        "disabled": "Duo mode is not enabled yet",
-        "offline": "Your partner is offline",
+        "empty": "No messages yet — click the line below or use the shortcut to type",
         "backToNewest": "Back to the newest message",
         "hide": "Hide the chat window",
         "copy": "Copy this message",
-        "inputHint": "Use the \"Chat Input\" shortcut to open the text box",
+        "inputHint": "Click here to type (or use the \"Chat Input\" shortcut)",
         "inputKeys": "Enter to send · Shift+Enter for a new line · Esc to close",
-        "passThrough": "Pass-through is on, clicks go to the desktop",
+        "passThrough": "Pass-through is on, clicks go to the desktop — press the \"Chat Input\" shortcut to type",
         "textLimit": "{bytes} / 8192 bytes",
         "attachment": "Attachment",
         "voice": "Voice message",
-        "voiceReady": "A recording is waiting — use Send / Discard below; the mic records a new one",
+        "voiceReady": "Recorded — use Send or Discard below",
+        "queued": "Saved for later ({state}) — it goes out once connected",
         "preview": "View this image",
         "close": "Close",
         "pickAttachment": "Send a file",
         "sendingAttachment": "Sending the attachment...",
         "imageCopied": "Image copied to the clipboard",
         "askPeerResend": "Ask your partner to send it again",
-        "attachmentBusy": "The previous one is still sending — try again in a moment"
+        "attachmentBusy": "The previous one is still sending — try again in a moment",
+        "moreInChat": "Earlier messages are in the chat window"
       },
       "placeholders": {
         "input": "Type a message..."
@@ -222,7 +235,7 @@
           "visibleRemoteCat": "Toggle the visibility of the remote cat window.",
           "visibleChat": "Toggle the visibility of the chat window.",
           "toggleChatInput": "Open the chat text box; press again or hit Esc to close it.",
-          "pushToTalk": "Hold to record, release to send. Up to 60 seconds; a quick tap sends nothing.",
+          "pushToTalk": "Hold to record; release and you get to confirm before it is sent. Up to 60 seconds; a quick tap sends nothing.",
           "toggleAway": "Switch between \"away\" and \"back\"."
         }
       },
@@ -276,11 +289,15 @@
           "presence": "I'm Away",
           "autoReturn": "Auto Return",
           "awayMessage": "Away Sign Text",
-          "sendSystemNotice": "Show Partner Status Notice"
+          "sendSystemNotice": "Show the \"your partner is back\" notice"
         },
         "hints": {
-          "enabled": "Turning this off disconnects immediately and stops all data sharing.",
-          "relayUrl": "The pairing server both sides use, for example cat.example.com. A self-hosted server without a certificate can be a plain IP, for example 123.123.123.123:8080. One of you deploys the server and sends out this address, the server password and the pairing key together.",
+          "enabled": "Once on, fill in the three values below and press Connect. Turning it off disconnects immediately and stops all data sharing.",
+          "connectSteps": "The order is: fill in the three values above → press Connect → then turn on \"Partner's Cat\" and \"Chat Window\" further down (both start off).",
+          "missingRelayUrl": "The server address is still missing: type it into \"Server Address\" (or ask your partner for it), then press Connect.",
+          "missingSecret": "The pairing key is still missing: it must match your partner's, and goes into \"Pairing Key\".",
+          "errorHowTo": "It is almost always one of these three: wrong address / wrong password / the server is not running.",
+          "relayUrl": "The pairing server both sides use, for example cat.example.com. A self-hosted server without a certificate can be a plain IP, for example 123.123.123.123:8080. If you deployed it yourself, this is the address the deployment printed.",
           "pairSecret": "The same pairing key on both sides puts you in the same two-person session. Ask your partner for theirs, or press Generate and send one over. After saving it is no longer shown here; it lives in the system credential vault only.",
           "retryAfterSave": "Updated. Press Connect to try again.",
           "serverPasswordSaved": "Server password saved",
@@ -288,9 +305,9 @@
           "relayUrlUnsaved": "The address was changed. Press Save to apply it.",
           "relayUrlEmpty": "The server address cannot be empty — an empty box has no effect. To change it, type a new address and press Save.",
           "relayUrlCopied": "Server address copied",
-          "serverPassword": "The password whoever deployed the server set on it. Both sides enter the same value; without it you cannot connect to that server (it keeps strangers from freeloading on it). The official Cloudflare relay does not need it. Saving clears this box (the plain text is not kept on screen), so press Copy before you save.",
+          "serverPassword": "Not needed with the official Cloudflare relay. Only for a self-hosted server: whoever deployed it set a password there, and both of you must enter the same value. Without it you cannot connect (it keeps strangers from freeloading). Saving clears this box (the plain text is not kept on screen), so press Copy before you save.",
           "valuesRemembered": "Saved the values you entered; they will be used again on next launch",
-          "valuesReplaced": "Saved the values you entered and replaced the pairing key that was stored before; the new one will be used on next launch",
+          "valuesReplaced": "Saved the values you entered and replaced the pairing key that was stored before. The old key no longer works, so your partner has to switch to this one too or you will not connect.",
           "deleteConfirmTitle": "Delete \"{name}\"?",
           "deleteSecretBody": "Once deleted this key cannot be read back — you will have to ask your partner to send it again.",
           "deleteServerPasswordBody": "Once deleted you will have to ask whoever deployed the server for it again.",
@@ -304,7 +321,7 @@
           "secretMissing": "Not set",
           "lastErrorNoAddress": "Never connected yet, so there is no address",
           "secretSaved": "Saved",
-          "fingerprint": "Verification fingerprint (must match on both sides):",
+          "fingerprint": "Both sides should show exactly the same fingerprint (read your partner's out loud to compare — never read the key itself):",
           "autoConnect": "Connect automatically when the app starts.",
           "remoteCat": "Show your partner's cat in a separate desktop window.",
           "remoteModel": "Leave empty to use the same model as your own cat. Only models installed locally can be chosen.",
@@ -316,7 +333,7 @@
           "notificationSound": "Play a short sound when a message from your partner arrives.",
           "notificationVolume": "Sound volume; 0 means muted.",
           "attachmentLimit": "Size limit for a single file. Each side uses its own limit, up to 1024 MB.",
-          "chatHistory": "Chat history is stored on this device only; export it to keep a copy.",
+          "chatHistory": "Chat history lives on your own computer only (the server keeps none); export it to keep a copy.",
           "historyLimit": "Used for the progress hint only — reaching the limit never deletes messages automatically.",
           "exportFormat": "JSON is best for backups, TXT / Markdown is easy to read.",
           "exportChat": "Export all locally stored chat messages into one file.",
@@ -337,7 +354,7 @@
           "stats": "Stats are stored locally; they are only sent when \"Share Input Stats\" is enabled.",
           "autoReturn": "Typing, clicking or moving the mouse noticeably ends the away state.",
           "awayMessage": "This text is shown above your cat for your partner while you are away.",
-          "sendSystemNotice": "Show a short notice on the remote cat window when your partner leaves or returns.",
+          "sendSystemNotice": "Flash \"your partner is back\" on the remote cat window when your partner stops being away.",
           "presence": "Your partner will see that you stepped away."
         },
         "placeholders": {
@@ -369,16 +386,16 @@
         "status": {
           "disabled": "Disabled",
           "disconnected": "Disconnected",
-          "connecting": "Connecting...",
+          "connecting": "Connecting…",
           "connected": "Connected",
-          "peerOffline": "Partner Offline",
+          "peerOffline": "Partner Not Online",
           "error": "Failed"
         },
         "p2p": {
           "label": "P2P Channel",
-          "hint": "When hole punching succeeds, pet state and input stats travel directly between the two computers instead of through the server. If it fails everything falls back to the server unchanged.",
-          "off": "Off",
-          "connecting": "Punching...",
+          "hint": "If a direct link works, pet state and input stats travel directly between the two computers instead of through the server. If it fails everything falls back to the server unchanged.",
+          "off": "Not established",
+          "connecting": "Setting up a direct link…",
           "connected": "Direct"
         }
       },

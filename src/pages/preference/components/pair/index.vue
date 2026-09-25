@@ -105,6 +105,32 @@ const lastErrorAddress = computed(() => {
     || normalizeRelayUrl(pairStore.settings.relay.url)
     || t('pages.preference.pair.hints.lastErrorNoAddress')
 })
+
+/**
+ * 凭据库里有没有配对密码，**这次没读出来**。
+ *
+ * 读失败时 `hasSecret` 会停在 false，界面据此说「还没有配置配对密码」并挡住
+ * 「立即连接」——可密码其实在，只是这次没读到。这个时候不替用户下结论，
+ * 让他点下去看 Rust 的真实报错。
+ */
+const secretUnknown = ref(false)
+
+/**
+ * 「立即连接」还缺什么（R44）。
+ *
+ * 以前只要打开了联机总开关就能点，缺地址或缺配对密码都要等 Rust 报错才知道——
+ * 那两个错误（「服务器地址不能为空」「还没有配置配对密码」）界面上本来就能看出来。
+ */
+const connectMissing = computed(() => {
+  const url = normalizeRelayUrl(relayUrlInput.value) || normalizeRelayUrl(pairStore.settings.relay.url)
+
+  if (!url) return 'pages.preference.pair.hints.missingRelayUrl'
+  if (!secretInput.value.trim() && !pairStore.hasSecret && !secretUnknown.value) {
+    return 'pages.preference.pair.hints.missingSecret'
+  }
+
+  return ''
+})
 const exportFormat = ref<ExportFormat>('json')
 const exporting = ref(false)
 const historyStats = ref<HistoryStats>({ epoch: 1, current: 0, total: 0 })
@@ -246,8 +272,11 @@ onMounted(async () => {
   await pairHasSecret()
     .then((hasSecret) => {
       pairStore.hasSecret = hasSecret
+      secretUnknown.value = false
     })
     .catch((reason) => {
+      // 读失败 ≠ 没配过：别让界面据此说「还没有配置配对密码」（见 `connectMissing`）
+      secretUnknown.value = true
       message.error(String(reason))
     })
 
@@ -383,6 +412,7 @@ async function handleSaveSecret() {
     // Rust 只回显指纹，不回显 secret 本身（R10 / R17）
     pairStore.secretFingerprint = await pairSetSecret(secret)
     pairStore.hasSecret = true
+    secretUnknown.value = false
     secretInput.value = ''
 
     message.success(t('pages.preference.pair.hints.secretSaved'))
@@ -570,8 +600,14 @@ async function handleConnect() {
     // 地址也是「输入框里填了就先落盘」：粘贴完直接点「立即连接」也能生效，
     // 不会出现界面上写着新地址、实际连的是旧地址这种自相矛盾的状态
     if (relayUrl) {
+      // 这里是**静默**落盘的：地址那一栏的「改过了，点保存才生效」会跟着消失，
+      // 而用户并没有点「保存」——不说一句，界面上就看不到任何变化（R44）
+      const changed = relayUrl !== normalizeRelayUrl(pairStore.settings.relay.url)
+
       relayUrlInput.value = relayUrl
       pairStore.settings.relay.url = relayUrl
+
+      if (changed) message.success(t('pages.preference.pair.hints.relayUrlSaved'))
     } else {
       // 框里是空的：连的还是已保存的那个地址，那就把它显示回框里，
       // 别让「空框 + 实际用了旧地址」同时成立（那也是这一版要消灭的错觉）
@@ -594,6 +630,7 @@ async function handleConnect() {
       replacedSecret = hadSecret && known !== '' && known !== fingerprint
       pairStore.secretFingerprint = fingerprint
       pairStore.hasSecret = true
+      secretUnknown.value = false
       secretInput.value = ''
       remembered = true
     }
@@ -745,18 +782,19 @@ const canPreviewSound = computed(
 
         <Button
           :disabled="!serverPasswordInput.trim()"
-          @click="handleCopyServerPassword"
-        >
-          {{ $t('pages.preference.pair.buttons.copy') }}
-        </Button>
-
-        <Button
-          :disabled="!serverPasswordInput.trim()"
           :loading="savingServerPassword"
           type="primary"
           @click="handleSaveServerPassword"
         >
           {{ $t('pages.preference.pair.buttons.save') }}
+        </Button>
+
+        <!-- R44：和地址那一行同序（先「保存」再「复制」），免得同一位置一个是保存一个是复制 -->
+        <Button
+          :disabled="!serverPasswordInput.trim()"
+          @click="handleCopyServerPassword"
+        >
+          {{ $t('pages.preference.pair.buttons.copy') }}
         </Button>
 
         <Tag
@@ -855,7 +893,18 @@ const canPreviewSound = computed(
       <Switch v-model:checked="pairStore.settings.relay.autoConnect" />
     </ProListItem>
 
-    <ProListItem :title="$t('pages.preference.pair.labels.status')">
+    <!--
+      R44：这一项里有 `w-full` 的子节点（下面的 Alert 与说明），必须用 `vertical`。
+
+      横向布局里，默认插槽的每个根节点都是同一行 flex 的子项；标题块是 `flex: 1 1 0%`，
+      一遇到不换行的 `w-full` 兄弟就会被压到 min-content（一个汉字一行的竖排字）。
+      这个文件里其它 12 处 `w-full` 都在 `vertical` 的项里，这里以前只有一个按钮组、不超宽，
+      加了 Alert 与说明之后才必须跟着改。
+    -->
+    <ProListItem
+      :title="$t('pages.preference.pair.labels.status')"
+      vertical
+    >
       <Flex
         align="center"
         gap="small"
@@ -866,7 +915,8 @@ const canPreviewSound = computed(
         />
 
         <Button
-          :disabled="!pairStore.settings.enabled"
+          :disabled="!pairStore.settings.enabled || Boolean(connectMissing)"
+          :loading="connecting"
           size="small"
           @click="handleConnect"
         >
@@ -881,6 +931,23 @@ const canPreviewSound = computed(
           {{ $t('pages.preference.pair.buttons.disconnect') }}
         </Button>
       </Flex>
+
+      <!-- 缺东西就别让人干点（点了只会等一句 Rust 的报错） -->
+      <Alert
+        v-if="pairStore.settings.enabled && connectMissing"
+        class="w-full"
+        :message="$t(connectMissing)"
+        show-icon
+        type="info"
+      />
+
+      <!--
+        R44：用户填完三个值之后不知道自己该点哪里。把顺序写死在状态行下面，
+        并且点明连上之后还要自己去打开对方猫与聊天窗口（它们的默认值是关的）。
+      -->
+      <span class="w-full break-all text-3 color-text-tertiary">
+        {{ $t('pages.preference.pair.hints.connectSteps') }}
+      </span>
     </ProListItem>
 
     <ProListItem
@@ -932,6 +999,14 @@ const canPreviewSound = computed(
           }}
         </span>
       </Flex>
+
+      <!--
+        R44：Rust 报出来的原文（「连接失败: io 错误」「连接任务已结束」这类）对不懂技术的人
+        等于没有信息。这里固定补一句人话：这件事多半就是那三种原因之一。
+      -->
+      <span class="mt-2 w-full break-all text-3 color-text-tertiary">
+        {{ $t('pages.preference.pair.hints.errorHowTo') }}
+      </span>
     </ProListItem>
   </ProList>
 

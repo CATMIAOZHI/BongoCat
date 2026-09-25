@@ -156,6 +156,8 @@ export function usePairVoiceRecorder() {
   const error = ref('')
   /** 轻点了一下，没留下来 */
   const skipped = ref(false)
+  /** 重录时把上一段待确认的录音丢掉了：要明说，别让它无声消失 */
+  const discarded = ref(false)
 
   /** 待确认录音的秒数：用 Rust 侧算出来的真实时长，不是界面上的滴答 */
   const pendingSeconds = computed(() => {
@@ -200,6 +202,7 @@ export function usePairVoiceRecorder() {
     clearNoticeTimer = setTimeout(() => {
       error.value = ''
       skipped.value = false
+      discarded.value = false
     }, 4000)
   }
 
@@ -230,6 +233,7 @@ export function usePairVoiceRecorder() {
         stopTicker()
         recording.value = false
         skipped.value = false
+        discarded.value = false
         error.value = message
 
         clearNoticeLater()
@@ -247,20 +251,36 @@ export function usePairVoiceRecorder() {
   function press() {
     if (recording.value) return
 
-    const mine = ++round
+    // 让还在路上的那一次松开作废（它会把旧结果写回 pending）
+    round += 1
     recording.value = true
     error.value = ''
     skipped.value = false
+    discarded.value = false
 
     startTicker()
 
-    // R41：上一条待确认的草稿要等**麦克风真的开了**才作废（Rust 侧同时也才删文件）；
-    // 打不开麦克风时它必须原样留着，否则用户上一段录音就白丢了
+    // R41 / R44：上一条待确认的草稿要等**麦克风真的开了**才作废（Rust 侧同时也才删文件）；
+    // 打不开麦克风时它必须原样留着，否则用户上一段录音就白丢了。
     void session.press().then((started) => {
-      if (!started || mine !== round) return
+      // 判定必须只看「start 成没成」，**不能再拿 round 比**：用户按下之后马上松开或取消时
+      // round 已经变了，可 Rust 那边草稿确实已经作废，界面留着它就成了一条点不开的死待确认
+      // （点试听报「读不出来」、点发送报「没有等待发送的录音」）。
+      if (!started) return
+
+      const dropped = pending.value !== null
 
       stopPlayback()
       pending.value = null
+
+      // 重录会丢掉上一段：明说一句，不然它就这么无声消失了
+      if (dropped) {
+        error.value = ''
+        skipped.value = false
+        discarded.value = true
+
+        clearNoticeLater()
+      }
     })
   }
 
@@ -283,6 +303,8 @@ export function usePairVoiceRecorder() {
     if (!draft || mine !== round) return
 
     pending.value = draft
+    // 新的一段已经录好了，「上一段已丢掉」那句就过期了
+    discarded.value = false
   }
 
   /**
@@ -298,6 +320,7 @@ export function usePairVoiceRecorder() {
     pending.value = null
     error.value = ''
     skipped.value = false
+    discarded.value = false
 
     if (recording.value) {
       recording.value = false
@@ -317,6 +340,9 @@ export function usePairVoiceRecorder() {
     const draft = pending.value
 
     if (!draft) return
+
+    // 正在发送时 Rust 侧可能已经把临时 wav 收走了：这时点试听只会冒一句「读不出来」
+    if (sending.value) return
 
     if (playing.value) {
       stopPlayback()
@@ -362,9 +388,17 @@ export function usePairVoiceRecorder() {
     stopPlayback()
 
     try {
-      await session.send()
+      const sent = await session.send()
 
       pending.value = null
+
+      // 失败时 Rust 侧已经把临时 wav 删了，这段录音就是没了——必须说清楚「要重录」，
+      // 否则用户看到「发送失败」会以为再点一次就能补发。
+      if (!sent) {
+        error.value = t('pages.main.hints.voiceSendFailed', { reason: error.value })
+
+        clearNoticeLater()
+      }
     } finally {
       sending.value = false
     }
@@ -386,6 +420,7 @@ export function usePairVoiceRecorder() {
     sending,
     error,
     skipped,
+    discarded,
     press,
     release,
     send,

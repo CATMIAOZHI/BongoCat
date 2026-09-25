@@ -27,7 +27,7 @@ import { hideWindow, setAlwaysOnTop, setTaskbarVisibility, showWindow } from '@/
 import { useCatStore } from '@/stores/cat'
 import { useGeneralStore } from '@/stores/general.ts'
 import { useModelStore } from '@/stores/model'
-import { usePairStore } from '@/stores/pair'
+import { recordingBlockReasonKey, usePairStore } from '@/stores/pair'
 import { useShortcutStore } from '@/stores/shortcut'
 import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
@@ -54,6 +54,7 @@ const {
   sending: recordingSending,
   error: recordingError,
   skipped: recordingSkipped,
+  discarded: recordingDiscarded,
   press: pressToTalk,
   release: releaseToTalk,
   send: sendRecording,
@@ -87,6 +88,34 @@ const showVoiceOverlay = computed(() => {
     || Boolean(recordingPending.value)
     || Boolean(recordingError.value)
     || recordingSkipped.value
+    || recordingDiscarded.value
+    || peerConnectedNotice.value
+})
+
+/**
+ * R44：连上对方给一句正面反馈。
+ *
+ * 以前「连上了」只在偏好页的一个小徽标里，猫咪窗口上没有任何迹象——用户填完三个值、
+ * 点完「立即连接」，看不到成功，只能去偏好页确认。这里只在**状态真的翻到在线**时提示。
+ */
+const peerConnectedNotice = ref(false)
+let peerNoticeTimer: ReturnType<typeof setTimeout> | undefined
+
+watch(() => pairStore.runtime.peerOnline, (online) => {
+  if (!online) return
+
+  peerConnectedNotice.value = true
+
+  if (peerNoticeTimer) clearTimeout(peerNoticeTimer)
+
+  peerNoticeTimer = setTimeout(() => {
+    peerConnectedNotice.value = false
+  }, 4000)
+})
+
+/** 窗口关掉时别留一个还在跑的计时器（`usePairVoice` 里的提示计时器同样是这么收的） */
+onUnmounted(() => {
+  if (peerNoticeTimer) clearTimeout(peerNoticeTimer)
 })
 
 /**
@@ -99,9 +128,25 @@ const canSendRecording = computed(() => {
   return pairStore.settings.enabled && pairStore.runtime.peerOnline && !recordingSending.value
 })
 
-/** 待确认的语音发不出去（没开联机 / 对方不在线）：胶囊上要**写出原因**，不能只把图标调暗 */
-const recordingOffline = computed(() => {
-  return !pairStore.settings.enabled || !pairStore.runtime.peerOnline
+/**
+ * 待确认的语音发不出去的原因（i18n key）；能发时是空串。
+ *
+ * R44：以前只分「联机没打开」和「对方不在线」，于是「正在连接服务器」「还没连上服务器」
+ * 「连不上服务器」三种情况也都写成「对方不在线，等对方回来再发」——用户会一直等对方，
+ * 而真实原因可能是自己地址填错或服务器没开。这里按连接状态细分。
+ *
+ * 判定本身在 store 里（`recordingBlockReasonKey`，有单测）：`connected` 这个状态只说明
+ * 自己连上了服务器，对方在不在线由 `peerOnline` 单独给（Rust 侧 `connected` 与
+ * `connected-peer-offline` 是两个状态）。只看连接状态的话，「录好了、对方也在线」
+ * 这个正常状态会被判成「对方不在线」。
+ */
+const recordingBlockReason = computed(() => {
+  return recordingBlockReasonKey({
+    enabled: pairStore.settings.enabled,
+    connection: pairStore.runtime.connection,
+    peerOnline: pairStore.runtime.peerOnline,
+    sending: recordingSending.value,
+  })
 })
 
 /** R41：离线时点「发送」直接不发起（理由同上，别把录音弄丢） */
@@ -371,17 +416,23 @@ function handleMouseMove(event: MouseEvent) {
     >
       <div
         v-if="recording && !overlayVisible"
-        class="pointer-events-auto flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+        class="pointer-events-auto max-w-full flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
         @mousedown.stop
       >
-        <span class="i-lucide:mic size-[1.1em] animate-pulse text-[#ff7875]" />
+        <span class="i-lucide:mic size-[1.1em] shrink-0 animate-pulse text-[#ff7875]" />
 
-        <span>
+        <span class="min-w-0 break-all text-center">
           {{ $t('pages.main.hints.recording', { seconds: recordingSeconds, limit: RECORDING_LIMIT_SECS }) }}
         </span>
 
+        <!--
+          图标保持 1.2em（视觉上不变），但用一层透明的 ::before 把可点范围扩到约 2.2em：
+          这个胶囊可以很窄，1.2em 在 300px 宽的窗口上只有 13px，而「取消」点了不可逆
+          （Rust 会把临时 wav 删掉）。不能改用 padding 放大——`i-lucide:*` 是用 CSS mask
+          画的（`mask-size: 100% 100%`），padding 会把那层 mask 一起放大，图形跟着变大。
+        -->
         <span
-          class="i-lucide:circle-x size-[1.2em] cursor-pointer hover:text-[#ff7875]"
+          class="i-lucide:circle-x relative size-[1.2em] shrink-0 cursor-pointer before:absolute hover:text-[#ff7875] before:content-empty before:-inset-[0.5em]"
           :title="$t('pages.main.hints.cancelRecording')"
           @click="cancelRecording"
         />
@@ -395,35 +446,39 @@ function handleMouseMove(event: MouseEvent) {
       -->
       <div
         v-if="recordingPending && !recording"
-        class="pointer-events-auto flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+        class="pointer-events-auto max-w-full flex items-center gap-1.5 bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
         @mousedown.stop
       >
         <span
-          class="size-[1.2em] cursor-pointer"
+          class="relative size-[1.2em] shrink-0 cursor-pointer before:absolute before:content-empty before:-inset-[0.5em]"
           :class="recordingPlaying ? 'i-lucide:pause' : 'i-lucide:play'"
-          :title="$t('pages.main.hints.playRecording')"
+          :title="recordingPlaying ? $t('pages.main.hints.pauseRecording') : $t('pages.main.hints.playRecording')"
           @click="playRecording"
         />
 
-        <span>
-          {{ recordingOffline
-            ? $t('pages.main.hints.sendRecordingOffline')
-            : $t('pages.main.hints.recordingReady', { seconds: recordingPendingSeconds }) }}
+        <span class="min-w-0 break-all text-center">
+          {{ recordingSending
+            ? $t('pages.main.hints.sendingRecording')
+            : recordingBlockReason
+              ? $t(recordingBlockReason)
+              : $t('pages.main.hints.recordingReady', { seconds: recordingPendingSeconds }) }}
         </span>
 
         <span
-          class="i-lucide:send size-[1.2em]"
+          class="i-lucide:send relative size-[1.2em] shrink-0 before:absolute before:content-empty before:-inset-[0.5em]"
           :class="canSendRecording
             ? 'cursor-pointer hover:text-[#4096ff]'
-            : 'color-white/35'"
-          :title="recordingOffline
-            ? $t('pages.main.hints.sendRecordingOffline')
-            : $t('pages.main.hints.sendRecording')"
+            : 'color-[#ffffff59]'"
+          :title="recordingSending
+            ? $t('pages.main.hints.sendingRecording')
+            : recordingBlockReason
+              ? $t(recordingBlockReason)
+              : $t('pages.main.hints.sendRecording')"
           @click="handleSendRecording"
         />
 
         <span
-          class="i-lucide:circle-x size-[1.2em] cursor-pointer hover:text-[#ff7875]"
+          class="i-lucide:circle-x relative size-[1.2em] shrink-0 cursor-pointer before:absolute hover:text-[#ff7875] before:content-empty before:-inset-[0.5em]"
           :title="$t('pages.main.hints.cancelRecording')"
           @click="cancelRecording"
         />
@@ -431,16 +486,32 @@ function handleMouseMove(event: MouseEvent) {
 
       <div
         v-if="recordingError"
-        class="bg-[#d4380d]/85 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+        class="max-w-full break-all bg-[#d4380d]/85 px-3 py-1 text-center text-[3.5vw] text-[#fff] rounded-full"
       >
         {{ recordingError }}
       </div>
 
       <div
         v-if="recordingSkipped"
-        class="bg-black/70 px-3 py-1 text-[3.5vw] text-[#fff] rounded-full"
+        class="max-w-full break-all bg-black/70 px-3 py-1 text-center text-[3.5vw] text-[#fff] rounded-full"
       >
         {{ $t('pages.main.hints.recordingTooShort') }}
+      </div>
+
+      <!-- R44：重录会丢掉上一段，明说一句，别让它无声消失 -->
+      <div
+        v-if="recordingDiscarded"
+        class="max-w-full break-all bg-black/70 px-3 py-1 text-center text-[3.5vw] text-[#fff] rounded-full"
+      >
+        {{ $t('pages.main.hints.recordingDiscarded') }}
+      </div>
+
+      <!-- R44：连上对方时的正面反馈（默认关掉对方猫时，这是猫咪窗口上唯一的「成功了」） -->
+      <div
+        v-if="peerConnectedNotice"
+        class="max-w-full break-all bg-black/70 px-3 py-1 text-center text-[3.5vw] text-[#fff] rounded-full"
+      >
+        {{ $t('pages.main.hints.peerConnected') }}
       </div>
     </div>
   </div>

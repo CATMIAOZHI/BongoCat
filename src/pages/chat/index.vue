@@ -37,7 +37,7 @@ import { usePairVoicePlayback } from '@/composables/usePairVoicePlayback'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
-import { usePairStore } from '@/stores/pair'
+import { pairStateKey, usePairStore } from '@/stores/pair'
 import { join } from '@/utils/path'
 
 /**
@@ -115,16 +115,26 @@ const sendReady = computed(() => {
   return Boolean(draft.value.trim()) && !tooLong.value && !sending.value
 })
 
-const peerTitle = computed(() => {
-  if (!pairStore.settings.enabled) return t('pages.chat.hints.disabled')
-  if (!pairStore.runtime.peerOnline) return t('pages.chat.hints.offline')
+/**
+ * 联机状态那句人话（标题栏与输入框下面都用它）。
+ *
+ * R44：以前只分「联机没打开」和「对方离线」，于是「没连上服务器 / 正在连 / 连不上」都长成
+ * 「对方离线」——用户会去等对方，而真实原因可能是自己地址填错或服务器没开。
+ */
+const pairState = computed(() => {
+  const key = pairStateKey(pairStore.runtime.connection, pairStore.settings.enabled)
 
-  return pairStore.runtime.peerName || t('pages.chat.labels.peer')
+  return key ? t(key) : ''
+})
+
+const peerTitle = computed(() => {
+  return pairState.value || pairStore.runtime.peerName || t('pages.chat.labels.peer')
 })
 
 /** 穿透开着时点不到窗口，提示一句，免得用户以为窗口坏了 */
 const footerHint = computed(() => {
   if (pairStore.settings.chat.passThrough && !inputMode.value) {
+    // 穿透开着时整窗点不到，唯一入口是快捷键——那句文案里也要把它说了（见 zh-CN / en-US）
     return t('pages.chat.hints.passThrough')
   }
 
@@ -560,9 +570,9 @@ onMounted(async () => {
     以前是 `bg-black/45`，桌面上任何东西都会透进来，字很难读。气泡上的半透明白都是叠在
     这一层实色上面的，所以不用逐个改。
   -->
-  <div class="relative size-screen flex flex-col overflow-hidden bg-[#191c22] text-white ring-1 ring-white/10 rounded-2xl">
+  <div class="relative size-screen flex flex-col overflow-hidden bg-[#191c22] text-[#fff] ring-1 ring-[#ffffff1a] rounded-2xl">
     <header
-      class="flex shrink-0 cursor-move items-center gap-2 border-b border-white/8 bg-white/5 px-2.5 py-2"
+      class="flex shrink-0 cursor-move items-center gap-2 border-b border-[#ffffff14] bg-[#ffffff0d] px-2.5 py-2"
       @mousedown="handleMouseDown"
     >
       <!-- 状态点：未启用 / 对方离线 / 在线。必须是没有点击事件的元素，否则会变成拖窗口 -->
@@ -570,22 +580,22 @@ onMounted(async () => {
         class="size-1.5 shrink-0 rounded-full"
         :class="!pairStore.settings.enabled
           ? 'bg-[#faad14]'
-          : (pairStore.runtime.peerOnline ? 'bg-[#52c41a]' : 'bg-white/30')"
+          : (pairStore.runtime.peerOnline ? 'bg-[#52c41a]' : 'bg-[#ffffff4c]')"
       />
 
-      <span class="min-w-0 flex-1 truncate text-[11px] color-white/80 font-medium">
+      <span class="min-w-0 flex-1 truncate text-[11px] color-[#ffffffcc] font-medium">
         {{ peerTitle }}
       </span>
 
       <button
         v-if="!atNewest"
-        class="i-lucide:chevron-down shrink-0 cursor-pointer text-[14px] color-white/55 hover:color-white"
+        class="i-lucide:chevron-down shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] hover:text-[#fff]"
         :title="$t('pages.chat.hints.backToNewest')"
         @click="backToNewest"
       />
 
       <button
-        class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-white/55 hover:color-white"
+        class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] hover:text-[#fff]"
         :title="$t('pages.chat.hints.hide')"
         @click="handleHide"
       />
@@ -593,19 +603,19 @@ onMounted(async () => {
 
     <p
       v-if="notice"
-      class="pointer-events-none absolute inset-x-3 top-9 z-50 break-all bg-black/75 px-2 py-1 text-center text-[9px] color-white/85 rounded-lg"
+      class="pointer-events-none absolute inset-x-3 top-9 z-50 break-all rounded-[0.5rem] bg-black/75 px-2 py-1 text-center text-[9px] color-[#ffffffd9]"
     >
       {{ notice }}
     </p>
 
     <div
       ref="list"
-      class="min-h-0 flex flex-1 flex-col gap-1 overflow-y-auto px-2 py-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-white/15 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:hover:bg-white/25"
+      class="min-h-0 flex flex-1 flex-col gap-1 overflow-y-auto px-2 py-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-[#ffffff26] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:hover:bg-[#ffffff40]"
       @wheel="handleWheel"
     >
       <div
         v-if="loading && !messages.length"
-        class="flex flex-1 flex-col items-center justify-center gap-2 color-white/40"
+        class="flex flex-1 flex-col items-center justify-center gap-2 color-[#ffffff66]"
       >
         <span class="i-lucide:message-circle animate-pulse text-[22px]" />
         <span class="text-[10px]">{{ $t('pages.chat.hints.loading') }}</span>
@@ -613,7 +623,7 @@ onMounted(async () => {
 
       <div
         v-else-if="!messages.length"
-        class="flex flex-1 flex-col items-center justify-center gap-2 color-white/35"
+        class="flex flex-1 flex-col items-center justify-center gap-2 color-[#ffffff59]"
       >
         <span class="i-lucide:message-circle text-[22px]" />
         <span class="text-[10px]">{{ $t('pages.chat.hints.empty') }}</span>
@@ -629,7 +639,7 @@ onMounted(async () => {
           class="max-w-[86%] break-words px-2.5 py-1.5 text-[12px] leading-[1.4] rounded-2xl shadow-sm"
           :class="item.direction === 'outgoing'
             ? 'bg-[#1677ff] rounded-br-md'
-            : 'bg-white/10 ring-1 ring-white/10 rounded-bl-md'"
+            : 'bg-[#ffffff1a] ring-1 ring-[#ffffff1a] rounded-bl-md'"
         >
           <template v-if="item.attachment">
             <button
@@ -654,7 +664,7 @@ onMounted(async () => {
               <div class="min-w-32 flex items-center gap-2">
                 <button
                   class="size-7 flex shrink-0 items-center justify-center transition rounded-full"
-                  :class="canPlayVoice(item) ? 'bg-white/15 hover:bg-white/25' : 'bg-white/10 opacity-40'"
+                  :class="canPlayVoice(item) ? 'cursor-pointer bg-[#ffffff26] hover:bg-[#ffffff40]' : 'bg-[#ffffff1a] opacity-40'"
                   :disabled="!canPlayVoice(item)"
                   :title="canPlayVoice(item)
                     ? (voicePlaying(item.id) ? $t('pages.chat.player.pause') : $t('pages.chat.player.play'))
@@ -662,20 +672,20 @@ onMounted(async () => {
                   @click="toggleVoiceOf(item)"
                 >
                   <span
-                    class="text-[13px] color-white"
+                    class="text-[13px] text-[#fff]"
                     :class="voicePlaying(item.id) ? 'i-lucide:pause' : 'i-lucide:play'"
                   />
                 </button>
 
                 <div class="min-w-0 flex-1">
-                  <div class="h-1 w-full overflow-hidden bg-white/20 rounded-full">
+                  <div class="h-1 w-full overflow-hidden bg-[#ffffff33] rounded-full">
                     <div
-                      class="h-full bg-white/90 transition-[width] duration-150"
+                      class="h-full bg-[#ffffffe6] transition-[width] duration-150"
                       :style="{ width: `${voicePercent(item.id)}%` }"
                     />
                   </div>
 
-                  <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-white/60">
+                  <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-[#ffffff99]">
                     <span class="truncate">
                       {{ voiceFailed(item.id)
                         ? $t('pages.chat.player.failed')
@@ -698,20 +708,20 @@ onMounted(async () => {
               </div>
             </template>
 
-            <div class="mt-1 flex items-center gap-1 text-[9px] color-white/60">
+            <div class="mt-1 flex items-center gap-1 text-[9px] color-[#ffffff99]">
               <span>{{ formatFileSize(item.attachment.size ?? 0) }}</span>
             </div>
 
             <!-- 传输进度（§38）：还没结束才显示 -->
             <template v-if="transferOf(item.id)">
-              <div class="mt-1 h-1 w-full overflow-hidden bg-white/20 rounded-full">
+              <div class="mt-1 h-1 w-full overflow-hidden bg-[#ffffff33] rounded-full">
                 <div
-                  class="h-full bg-white/80"
+                  class="h-full bg-[#ffffffcc]"
                   :style="{ width: `${transferOf(item.id)!.percent}%` }"
                 />
               </div>
 
-              <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-white/70">
+              <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-[#ffffffb2]">
                 <span>{{ $t(`pages.chat.transfer.${transferLabelKey(transferOf(item.id)!)}`) }}</span>
 
                 <span v-if="isTransferActive(transferOf(item.id)!.state)">
@@ -724,14 +734,14 @@ onMounted(async () => {
               <p
                 v-if="transferOf(item.id)!.message"
                 class="mt-0.5 break-all text-[9px]"
-                :class="transferOf(item.id)!.state === 'failed' ? 'color-red-3' : 'color-white/60'"
+                :class="transferOf(item.id)!.state === 'failed' ? 'text-[#ff7875]' : 'color-[#ffffff99]'"
               >
                 {{ transferOf(item.id)!.message }}
               </p>
 
               <p
                 v-if="item.status === 'failed' && item.direction === 'incoming'"
-                class="mt-0.5 text-[9px] color-white/60"
+                class="mt-0.5 text-[9px] color-[#ffffff99]"
               >
                 {{ $t('pages.chat.hints.askPeerResend') }}
               </p>
@@ -743,14 +753,14 @@ onMounted(async () => {
               class="mt-1 flex items-center gap-2"
             >
               <button
-                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
+                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleAccept(item)"
               >
                 {{ $t('pages.chat.buttons.accept') }}
               </button>
 
               <button
-                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
+                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleReject(item)"
               >
                 {{ $t('pages.chat.buttons.reject') }}
@@ -763,7 +773,7 @@ onMounted(async () => {
             >
               <button
                 v-if="item.kind !== 'image' && localPathOf(item.attachment)"
-                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
+                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleOpen(item)"
               >
                 {{ $t('pages.chat.buttons.open') }}
@@ -771,7 +781,7 @@ onMounted(async () => {
 
               <button
                 v-if="localPathOf(item.attachment)"
-                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
+                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleSaveAs(item)"
               >
                 {{ $t('pages.chat.buttons.saveAs') }}
@@ -779,7 +789,7 @@ onMounted(async () => {
 
               <button
                 v-if="canCancel(transferOf(item.id))"
-                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
+                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleCancel(item)"
               >
                 {{ $t('pages.chat.buttons.cancel') }}
@@ -787,7 +797,7 @@ onMounted(async () => {
 
               <button
                 v-if="item.status === 'failed' && item.direction === 'outgoing'"
-                class="cursor-pointer bg-white/12 px-1.5 py-0.5 text-[10px] rounded-md hover:bg-white/22"
+                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleRetry(item)"
               >
                 {{ $t('pages.chat.buttons.retry') }}
@@ -802,10 +812,10 @@ onMounted(async () => {
             {{ item.text }}
           </p>
 
-          <div class="mt-1 flex items-center justify-end gap-1 text-[9px] color-white/45">
+          <div class="mt-1 flex items-center justify-end gap-1 text-[9px] color-[#ffffff73]">
             <button
               v-if="item.text"
-              class="shrink-0 cursor-pointer text-[10px] opacity-0 transition group-hover:opacity-100 hover:color-white"
+              class="shrink-0 cursor-pointer text-[10px] opacity-0 transition hover:text-[#fff] group-hover:opacity-100"
               :class="copiedId === item.id ? 'i-lucide:check' : 'i-lucide:copy'"
               :title="$t('pages.chat.hints.copy')"
               @click="handleCopy(item)"
@@ -816,7 +826,7 @@ onMounted(async () => {
             <span
               v-if="item.direction === 'outgoing'"
               class="shrink-0 text-[10px]"
-              :class="[STATUS_ICON[item.status], item.status === 'failed' ? 'color-red-3' : 'color-white/70']"
+              :class="[STATUS_ICON[item.status], item.status === 'failed' ? 'text-[#ff7875]' : 'color-[#ffffffb2]']"
               :title="statusTitle(item.status)"
             />
           </div>
@@ -826,12 +836,12 @@ onMounted(async () => {
 
     <div
       v-if="inputMode"
-      class="shrink-0 border-t border-white/8 p-1.5"
+      class="shrink-0 border-t border-[#ffffff14] p-1.5"
     >
       <!-- R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款 -->
-      <div class="flex items-end gap-1.5 bg-white/8 px-2 py-1.5 rounded-xl">
+      <div class="flex items-end gap-1.5 bg-[#ffffff14] px-2 py-1.5 rounded-xl">
         <button
-          class="i-lucide:paperclip mb-1 shrink-0 cursor-pointer text-[13px] color-white/55 hover:color-white"
+          class="i-lucide:paperclip mb-1 shrink-0 cursor-pointer text-[13px] color-[#ffffff8c] hover:text-[#fff]"
           :title="$t('pages.chat.hints.pickAttachment')"
           @click="pickAttachment"
         />
@@ -839,7 +849,7 @@ onMounted(async () => {
         <textarea
           ref="input"
           v-model="draft"
-          class="max-h-24 min-h-9 w-full resize-none py-1 text-[12px] leading-[1.4] outline-none bg-transparent placeholder:color-white/35"
+          class="max-h-24 min-h-9 w-full resize-none py-1 text-[12px] leading-[1.4] outline-none bg-transparent placeholder:color-[#ffffff59]"
           :placeholder="$t('pages.chat.placeholders.input')"
           @keydown.enter.exact="handleSendKey"
           @keydown.esc.prevent="closeInput"
@@ -848,43 +858,54 @@ onMounted(async () => {
 
         <button
           class="mb-0.5 size-7 flex shrink-0 items-center justify-center transition rounded-full"
-          :class="sendReady ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-white/15'"
+          :class="sendReady ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-[#ffffff26]'"
           :disabled="!sendReady"
           :title="$t('pages.chat.buttons.send')"
           @click="handleSend"
         >
-          <span class="i-lucide:arrow-up text-[13px] color-white" />
+          <span class="i-lucide:arrow-up text-[13px] text-[#fff]" />
         </button>
       </div>
 
-      <div class="mt-1 flex items-center justify-between gap-2 px-0.5 text-[9px] color-white/35">
+      <div class="mt-1 flex items-center justify-between gap-2 px-0.5 text-[9px] color-[#ffffff59]">
         <span class="truncate">{{ $t('pages.chat.hints.inputKeys') }}</span>
 
         <span
           v-if="showingLimit"
-          :class="tooLong ? 'color-red-3' : ''"
+          :class="tooLong ? 'text-[#ff7875]' : ''"
         >
           {{ $t('pages.chat.hints.textLimit', { bytes: draftBytes }) }}
         </span>
       </div>
 
+      <!--
+        联机不正常时说一句人话。聊天窗口离线也能排队（§32），所以这里不是「发不出去」，
+        而是「先排队、等连上再发」——以前这件事只写在标题栏里，用户不会往上看。
+      -->
+      <p
+        v-if="pairState"
+        class="mt-1 break-all text-[9px] color-[#ffffff99]"
+      >
+        {{ $t('pages.chat.hints.queued', { state: pairState }) }}
+      </p>
+
       <p
         v-if="attaching"
-        class="mt-1 text-[9px] color-white/60"
+        class="mt-1 text-[9px] color-[#ffffff99]"
       >
         {{ $t('pages.chat.hints.sendingAttachment') }}
       </p>
 
       <p
         v-if="attachmentError"
-        class="mt-1 break-all text-[9px] color-red-3"
+        class="mt-1 break-all text-[9px] text-[#ff7875]"
       >
         {{ attachmentError }}
       </p>
 
       <p
         v-if="sendError"
-        class="mt-1 break-all text-[9px] color-red-3"
+        class="mt-1 break-all text-[9px] text-[#ff7875]"
       >
         {{ sendError }}
       </p>
@@ -895,7 +916,7 @@ onMounted(async () => {
       class="shrink-0 px-2.5 pb-2"
     >
       <button
-        class="cursor-pointer text-[9px] color-white/35 hover:color-white/70"
+        class="cursor-pointer text-[9px] color-[#ffffff59] hover:color-[#ffffffb2]"
         @click="openInput"
       >
         {{ footerHint }}
@@ -911,12 +932,12 @@ onMounted(async () => {
         class="flex shrink-0 cursor-move items-center gap-1.5 px-2.5 py-1.5"
         @mousedown="handleMouseDown"
       >
-        <span class="min-w-0 flex-1 truncate text-[11px] color-white/55">
+        <span class="min-w-0 flex-1 truncate text-[11px] color-[#ffffff8c]">
           {{ attachmentTitle(previewMessage.attachment) || $t('pages.chat.hints.attachment') }}
         </span>
 
         <button
-          class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-white/60 hover:color-white"
+          class="i-lucide:x shrink-0 cursor-pointer text-[14px] color-[#ffffff99] hover:text-[#fff]"
           :title="$t('pages.chat.hints.close')"
           @click="closePreview"
         />
@@ -932,14 +953,14 @@ onMounted(async () => {
 
       <div class="flex shrink-0 items-center justify-center gap-3 px-2.5 pb-2 text-[10px]">
         <button
-          class="cursor-pointer underline hover:color-white"
+          class="cursor-pointer underline hover:text-[#fff]"
           @click="handleCopyImage(previewMessage)"
         >
           {{ $t('pages.chat.buttons.copyImage') }}
         </button>
 
         <button
-          class="cursor-pointer underline hover:color-white"
+          class="cursor-pointer underline hover:text-[#fff]"
           :disabled="saving"
           @click="handleSaveAs(previewMessage)"
         >
