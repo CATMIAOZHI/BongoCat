@@ -31,6 +31,13 @@ const FALLBACK_SNAPSHOT_INTERVAL_MS = 333
 const STATS_INTERVAL_MS = 30_000
 /** §27：鼠标累计移动超过 4px 才算「真的回来了」 */
 const AWAY_MOVE_THRESHOLD_PX = 4
+/**
+ * 进入暂离后，要先安静这么久（没按键、没点击、没明显移动鼠标）才开始检测「回来了」。
+ *
+ * 「我暂离」多半是用鼠标点的（设置页开关、托盘菜单；另有快捷键），点完一挪鼠标就超过 4px，
+ * 不等这一下的话暂离会立刻被自动结束，看起来就是「打不开」。
+ */
+const AWAY_ARM_IDLE_MS = 5000
 
 export interface PointerPoint {
   x: number
@@ -70,6 +77,8 @@ export function usePairState() {
   let statsTimer: ReturnType<typeof setInterval> | undefined
   let lastPointer: PointerPoint | undefined
   let awayDistance = 0
+  /** 暂离期间最近一次有输入的时间；距今超过 AWAY_ARM_IDLE_MS 后，下一次输入才算回来 */
+  let awayLastInputAt = 0
 
   const today = () => dayjs().format('YYYY-MM-DD')
 
@@ -180,6 +189,16 @@ export function usePairState() {
     if (store.settings.presence !== 'away') return
     if (!store.settings.away.autoReturn) return
 
+    const now = Date.now()
+
+    // 刚进入暂离、人还在电脑前操作：只刷新时间，等真正离开后再检测
+    if (now - awayLastInputAt < AWAY_ARM_IDLE_MS) {
+      awayLastInputAt = now
+      awayDistance = 0
+
+      return
+    }
+
     setPresence('active')
   }
 
@@ -277,6 +296,13 @@ export function usePairState() {
   })
 
   watch(() => store.settings.presence, (presence) => {
+    if (presence === 'away') {
+      // 暂离可能是别的窗口（设置页 / 聊天 / 托盘）改的，这里统一从头计时
+      awayLastInputAt = Date.now()
+      awayDistance = 0
+      lastPointer = void 0
+    }
+
     sendPresence(presence)
   })
 

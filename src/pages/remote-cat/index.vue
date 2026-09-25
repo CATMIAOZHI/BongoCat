@@ -43,7 +43,6 @@ import { clearObject } from '@/utils/shared'
 /** §23 的无事件恢复：不同状态各自有 TTL，超过就释放，避免对端「一直按着」 */
 const TYPING_TTL_MS = 800
 const CLICK_TTL_MS = 500
-const SNAPSHOT_TTL_MS = 1500
 /**
  * 指针插值的时间常数（§6 / R23 的「远端本地插值」）。
  *
@@ -335,20 +334,20 @@ function renderRemoteSnapshot() {
   const online = isOnline()
   const elapsed = now - receivedAt
   const snapshot = online ? remote.value : defaultSnapshot()
-  // §23：三个 TTL 各自负责一项，超过就回到「没在动」的样子
+  // §23：两个 TTL 各自负责一项，超过就回到「没在动」的样子
   const handsFresh = online && elapsed <= TYPING_TTL_MS
   const clicksFresh = online && elapsed <= CLICK_TTL_MS
-  // 对方完全没有活动（1.5 秒内一个包都没有）时，鼠标比例也回到中位
-  const settled = online && elapsed <= SNAPSHOT_TTL_MS
-  const pointer = settled ? snapshot.pointer : defaultSnapshot().pointer
+  // 鼠标停在哪就留在哪（本机猫也是这样）；只有离线时才回到中位。以前 1.5 秒没包就回中位，
+  // 对方鼠标一停爪子就跳回屏幕中间，看起来像鼠标没同步
+  const pointer = online ? snapshot.pointer : defaultSnapshot().pointer
 
-  if (settled) {
+  if (online) {
     const alpha = 1 - Math.exp(-dt / interpolateTau())
 
     renderedX += (pointer.x - renderedX) * alpha
     renderedY += (pointer.y - renderedY) * alpha
   } else {
-    // 离线、过期或本窗口的第一帧：直接吸附，不做插值
+    // 离线：直接回中位，不做插值（本窗口的第一帧靠上面 dt=∞ → alpha=1 吸附）
     renderedX = pointer.x
     renderedY = pointer.y
   }
@@ -494,7 +493,7 @@ function handleMouseDown() {
 
 <template>
   <div
-    class="relative size-screen overflow-hidden"
+    class="group relative size-screen overflow-hidden"
     :style="{ opacity: pairStore.settings.remoteCat.opacity / 100 }"
     @mousedown="handleMouseDown"
   >
@@ -543,9 +542,14 @@ function handleMouseDown() {
       </div>
     </div>
 
+    <!--
+      统计平时藏起来，鼠标挪到对方猫上才显示，免得一直挡住猫。
+      开着「窗口穿透」时鼠标悬停不会生效，只能一直显示，否则就永远看不到了。
+    -->
     <div
       v-if="pairStore.settings.remoteCat.showStats && isOnline() && remoteStats"
-      class="absolute inset-x-0 bottom-0 flex justify-center pb-1.5"
+      class="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-1.5 transition-opacity"
+      :class="{ 'opacity-0 group-hover:opacity-100': !pairStore.settings.remoteCat.passThrough }"
     >
       <div class="bg-black/45 px-2 py-0.5 text-[10px] color-[#ffffffd9] rounded-md">
         {{ $t('pages.remoteCat.hints.today', {
@@ -562,7 +566,8 @@ function handleMouseDown() {
 
     <div
       v-if="isOnline() && pairStore.runtime.peerName"
-      class="absolute inset-x-0 bottom-0 flex justify-center pb-0.5"
+      class="absolute inset-x-0 bottom-0 flex justify-center pb-0.5 transition-opacity"
+      :class="{ 'group-hover:opacity-0': remoteStats && pairStore.settings.remoteCat.showStats && !pairStore.settings.remoteCat.passThrough }"
     >
       <span class="text-[9px] color-[#ffffff80]">{{ pairStore.runtime.peerName }}</span>
     </div>

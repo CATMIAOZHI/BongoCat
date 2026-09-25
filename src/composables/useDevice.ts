@@ -157,7 +157,7 @@ export function useDevice() {
     const x = cursorPoint.x * scaleFactor.value
     const y = cursorPoint.y * scaleFactor.value
 
-    // R12：屏幕比例只在这里算一次，本地渲染与联机同步共用同一个值
+    // R12：本机渲染用平滑后的点算比例；联机同步用原始点另算一次（见下面的 syncPointer）
     const point = new PhysicalPosition(x, y)
     const monitor = await getCursorMonitor(point)
 
@@ -167,12 +167,34 @@ export function useDevice() {
       const yRatio = (point.y - position.y) / size.height
 
       handleMouseRatio(xRatio, yRatio)
-      pairState.handlePointerRatio(xRatio, yRatio)
     }
 
     if (!catStore.window.hideOnHover) return
 
     onHideOnHover(x, y)
+  }
+
+  /**
+   * 联机同步用的鼠标比例，直接从原始鼠标事件算。
+   *
+   * 以前跟着本机猫的动画帧（Ticker）一起算：本机猫窗口被隐藏时浏览器会停掉动画帧，
+   * 于是鼠标位置一个都发不出去，而键盘照常同步——对方就只看到猫打字、爪子不动。
+   * 远端猫自己会做插值，这里不需要平滑。开了「忽略鼠标事件」就和以前一样不发。
+   */
+  const syncPointer = async (cursorPoint: CursorPoint) => {
+    if (catStore.model.ignoreMouse) return
+
+    const point = new PhysicalPosition(cursorPoint.x * scaleFactor.value, cursorPoint.y * scaleFactor.value)
+    const monitor = await getCursorMonitor(point)
+
+    if (!monitor) return
+
+    const { size, position } = monitor
+
+    pairState.handlePointerRatio(
+      (point.x - position.x) / size.width,
+      (point.y - position.y) / size.height,
+    )
   }
 
   const handleAutoRelease = (key: string, delay = 100) => {
@@ -230,6 +252,7 @@ export function useDevice() {
         return handleMouseChange(value, false)
       case 'MouseMove':
         pairState.handlePointerMove(value)
+        void syncPointer(value)
 
         return latestCursorPoint.value = value
     }

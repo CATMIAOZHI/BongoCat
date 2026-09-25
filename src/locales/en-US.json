@@ -323,7 +323,7 @@
           "autoConnect": "Connect automatically when the app starts.",
           "remoteCat": "Show your partner's cat in a separate desktop window.",
           "remoteModel": "Leave empty to use the same model as your own cat. Only models installed locally can be chosen.",
-          "remoteStats": "Requires your partner to enable \"Share Input Stats\" as well.",
+          "remoteStats": "Shown when you hover over your partner's cat (always shown while Pass Through is on). Requires your partner to enable \"Share Input Stats\" as well.",
           "windowSize": "Resize the remote cat window.",
           "chatWindow": "Show the chat window (bubbles) on the desktop.",
           "bubbleCount": "How many of the newest messages the chat window shows at once; use the wheel to look further back.",
@@ -350,7 +350,7 @@
           "shareInputStats": "On by default. When enabled, your partner sees today's and total input counts — still just numbers.",
           "pauseActivitySync": "Temporarily stop sending typing and mouse activity. Chat and presence stay available.",
           "stats": "Stats are stored locally; they are only sent when \"Share Input Stats\" is enabled.",
-          "autoReturn": "Typing, clicking or moving the mouse noticeably ends the away state.",
+          "autoReturn": "Starts watching after 5 seconds without input; typing, clicking, or a noticeable mouse move then ends the away state.",
           "awayMessage": "This text is shown above your cat for your partner while you are away.",
           "sendSystemNotice": "Flash \"your partner is back\" on the remote cat window when your partner stops being away.",
           "presence": "Your partner will see that you stepped away."
