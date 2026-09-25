@@ -12,6 +12,10 @@
 
 export interface PetKeyboardState {
   active: boolean
+  /**
+   * 物理键盘的左右手分工（R2）。新版远端猫不再读它（改按键名在模型里的目录判定），
+   * 但旧版接收端还靠它动爪子，所以照常发送，不要当死代码删掉。
+   */
   leftHand: boolean
   rightHand: boolean
   intensity: number

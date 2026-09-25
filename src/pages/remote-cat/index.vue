@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { PhysicalSize } from '@tauri-apps/api/dpi'
+import { sep } from '@tauri-apps/api/path'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { exists, readDir } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
 import { round } from 'es-toolkit'
+import { nth } from 'es-toolkit/compat'
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 
 import type { ModelSize } from '@/composables/useModel'
@@ -318,8 +320,8 @@ function applyPointer() {
 /**
  * 把远端快照写进模型参数（§6 / R23 的远端插值）。
  *
- * 只认「对方的左右手 + 鼠标比例」，永远不会读本机的 `modelStore.pressedKeys`
- * （那是本机按键，见 R11）。
+ * 只认「对方的键名 + 鼠标比例」。读的 `modelStore.pressedKeys` 是本窗口自己的那份
+ * （不跨窗口同步），里面只有对方的键，与本机输入无关（见 R11）。
  *
  * 每帧都跑，但只有真的变了才写模型参数：指针位置按时间指数趋近最新快照，TTL 判定与
  * 离线回中位照旧。窗口隐藏时浏览器会节流 rAF，恢复可见后的第一帧 `dt` 很大 →
@@ -352,14 +354,21 @@ function renderRemoteSnapshot() {
     renderedY = pointer.y
   }
 
+  // R37：键名跟着 TYPING_TTL 一起过期——对方把猫放下时，贴图也要放下
+  applyRemoteKeys(handsFresh ? snapshot.keyboard.keys : [])
+
+  // 哪只爪子在按键，和本机猫（pages/main）一样按「按着的键的贴图在模型的 left-keys 还是
+  // right-keys」来判断。以前用对方键盘上的物理左右手分工（leftHand/rightHand），和模型对不上：
+  // 标准模型只有 left-keys（键盘那只爪），握鼠标的是「右手」参数，对方一按 Y~P、回车、
+  // 退格这些物理右手键，握鼠标的爪子就被按下去，看起来像缩到了鼠标垫下面
+  const dirs = Object.values(modelStore.pressedKeys).map(path => nth(path.split(sep()), -2) ?? '')
+
   applyHands(
-    handsFresh && snapshot.keyboard.leftHand,
-    handsFresh && snapshot.keyboard.rightHand,
+    dirs.some(dir => dir.startsWith('left')),
+    dirs.some(dir => dir.startsWith('right')),
     clicksFresh && snapshot.pointer.leftDown,
     clicksFresh && snapshot.pointer.rightDown,
   )
-  // R37：键名跟着 TYPING_TTL 一起过期——对方把猫放下时，贴图也要放下
-  applyRemoteKeys(handsFresh ? snapshot.keyboard.keys : [])
   applyPointer()
 }
 
