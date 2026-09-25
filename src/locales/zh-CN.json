@@ -63,11 +63,8 @@
         "queued": "先记下了（{state}），连上就会发出去",
         "preview": "查看这张图片",
         "close": "关闭",
-        "pickAttachment": "发送文件",
-        "sendingAttachment": "正在发送附件...",
         "imageCopied": "图片已复制到剪贴板",
         "askPeerResend": "需要对方重新发送",
-        "attachmentBusy": "上一张还在发送，稍等一下再试",
         "moreInChat": "更早的消息在聊天窗口里"
       },
       "placeholders": {

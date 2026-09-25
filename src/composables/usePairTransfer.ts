@@ -3,7 +3,6 @@ import { ref } from 'vue'
 import type {
   AttachmentRecord,
   ChatMessage,
-  TransferKind,
   TransferProgress,
   TransferState,
 } from './usePair'
@@ -94,50 +93,6 @@ export function extensionOf(name: string) {
   if (dot <= 0 || dot === name.length - 1) return ''
 
   return name.slice(dot + 1).toLowerCase()
-}
-
-/** 当成图片发送的扩展名（§37）；其余一律按普通文件发（§38） */
-const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'svg', 'ico'])
-
-export function isImageName(name: string) {
-  return IMAGE_EXTENSIONS.has(extensionOf(name))
-}
-
-/** 用户从对话框里选的文件该按哪种类型发 */
-export function transferKindOfFile(name: string): TransferKind {
-  return isImageName(name) ? 'image' : 'file'
-}
-
-const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'image/bmp': 'bmp',
-  'image/avif': 'avif',
-  'image/svg+xml': 'svg',
-  'image/x-icon': 'ico',
-}
-
-/** 剪贴板里那张图的扩展名，未知类型一律当 png */
-export function imageExtensionForMime(mime: string) {
-  const known = IMAGE_MIME_EXTENSIONS[mime.trim().toLowerCase()]
-
-  if (known) return known
-
-  const subtype = mime.trim().toLowerCase().replace(/^image\//, '')
-
-  // 只接受干干净净的子类型（`svg+xml` 这类带参数的已经在上面的表里处理过）
-  return /^[a-z0-9]{2,10}$/.test(subtype) ? subtype : 'png'
-}
-
-/** 粘贴进来的图片要落成的临时文件名（真正的落盘名是 UUID，这个只用于显示） */
-export function pastedImageName(mime: string, now: number) {
-  const date = new Date(now)
-  const pad = (part: number) => String(part).padStart(2, '0')
-  const clock = `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
-
-  return `pasted-image-${clock}.${imageExtensionForMime(mime)}`
 }
 
 export function usePairTransfer() {

@@ -6,14 +6,10 @@ import {
   attachmentTitle,
   canCancel,
   formatFileSize,
-  imageExtensionForMime,
-  isImageName,
   isTransferActive,
   localPathOf,
   needsDecision,
-  pastedImageName,
   previewableImage,
-  transferKindOfFile,
   transferLabelKey,
 } from './usePairTransfer'
 
@@ -116,43 +112,6 @@ describe('文件大小只用于显示', () => {
     expect(formatFileSize(1536)).toBe('1.5 KB')
     expect(formatFileSize(256 * 1024 * 1024)).toBe('256 MB')
     expect(formatFileSize(1024 * 1024 * 1024)).toBe('1 GB')
-  })
-})
-
-describe('粘贴图片落成的临时文件名', () => {
-  it('用剪贴板给的 MIME 挑扩展名', () => {
-    expect(imageExtensionForMime('image/png')).toBe('png')
-    expect(imageExtensionForMime('image/JPEG')).toBe('jpg')
-    expect(imageExtensionForMime('image/svg+xml')).toBe('svg')
-  })
-
-  it('未知类型退回 png，别把奇怪字符带进文件名', () => {
-    expect(imageExtensionForMime('')).toBe('png')
-    expect(imageExtensionForMime('image/')).toBe('png')
-    expect(imageExtensionForMime('image/svg+xml;charset=utf-8')).toBe('png')
-    expect(imageExtensionForMime('image/bmp')).toBe('bmp')
-  })
-
-  it('文件名带本地时间戳，方便在目录里认出来', () => {
-    const noon = new Date(2026, 8, 23, 13, 5, 1).getTime()
-
-    expect(pastedImageName('image/png', noon)).toBe('pasted-image-130501.png')
-  })
-})
-
-describe('按扩展名决定附件的类型', () => {
-  it('只认图片扩展名，其余都算普通文件', () => {
-    expect(isImageName('cat.PNG')).toBe(true)
-    expect(isImageName('photo.jpeg')).toBe(true)
-    expect(isImageName('notes.md')).toBe(false)
-    expect(isImageName('archive.tar.gz')).toBe(false)
-    expect(isImageName('no-extension')).toBe(false)
-    expect(isImageName('.png')).toBe(false)
-  })
-
-  it('选择文件时映射成发送类型', () => {
-    expect(transferKindOfFile('cat.png')).toBe('image')
-    expect(transferKindOfFile('report.pdf')).toBe('file')
   })
 })
 

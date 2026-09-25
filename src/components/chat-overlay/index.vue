@@ -232,16 +232,21 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 </script>
 
 <template>
-  <div class="size-full flex flex-col justify-end gap-[2%] text-[#fff]">
-    <div class="min-h-0 flex flex-col justify-end gap-[1.5%] overflow-hidden">
+  <!--
+    R46：浮层里的字号、圆角、间距都用固定像素，不随猫的缩放变大变小（以前是 vw / %，
+    跟着窗口宽度走）。浮层那一块的高度仍按猫的比例留（R39），猫缩得很小时放不下的旧气泡
+    会从上沿被裁掉，输入条始终贴在最下面。
+  -->
+  <div class="size-full flex flex-col justify-end gap-[6px] px-[6px] pt-[4px] text-[#fff]">
+    <div class="min-h-0 flex flex-col justify-end gap-[4px] overflow-hidden">
       <div
         v-for="message in bubbles"
         :key="message.id"
-        class="max-w-[86%] break-all rounded-[2vw] px-[3%] py-[1.2%] text-[3.4vw] leading-[1.35]"
+        class="max-w-[86%] shrink-0 break-all rounded-[12px] px-[10px] py-[4px] text-[12px] leading-[1.4]"
         :class="[
           message.direction === 'outgoing'
-            ? 'self-end bg-[#1677ff] rounded-br-[0.5vw]'
-            : 'self-start bg-black/55 rounded-bl-[0.5vw]',
+            ? 'self-end bg-[#1677ff] rounded-br-[4px]'
+            : 'self-start bg-black/55 rounded-bl-[4px]',
           attachmentMessage(message) ? 'cursor-pointer' : '',
         ]"
         :title="attachmentMessage(message) ? $t('pages.main.hints.openInChat') : ''"
@@ -253,11 +258,11 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
     </div>
 
     <div
-      class="pointer-events-auto flex items-center gap-[2%] rounded-[3vw] bg-black/55 px-[3%] py-[1.5%]"
+      class="pointer-events-auto flex shrink-0 items-center gap-[8px] rounded-[14px] bg-black/55 px-[10px] py-[5px]"
       @mousedown.stop
     >
       <span
-        class="shrink-0 cursor-pointer text-[4.5vw] transition"
+        class="relative shrink-0 cursor-pointer text-[16px] transition before:absolute before:content-empty before:-inset-[0.4em]"
         :class="props.recording
           ? 'i-lucide:mic animate-pulse color-[#ff7875]'
           : 'i-lucide:mic color-[#ffffffb2] hover:text-[#fff]'"
@@ -270,29 +275,45 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
       <textarea
         ref="input"
         v-model="draft"
-        class="min-w-0 flex-1 resize-none text-[3.4vw] leading-[1.4] outline-none bg-transparent placeholder:color-[#ffffff66]"
+        class="min-w-0 flex-1 resize-none text-[12px] leading-[1.4] outline-none bg-transparent placeholder:color-[#ffffff66]"
         :placeholder="hint || $t('pages.chat.placeholders.input')"
         rows="1"
         @keydown="handleKeydown"
       />
 
       <span
-        class="size-[7vw] flex shrink-0 items-center justify-center transition rounded-full"
+        class="size-[22px] flex shrink-0 items-center justify-center transition rounded-full"
         :class="canSend ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-[#ffffff33]'"
         :title="$t('pages.main.hints.send')"
         @click="handleSend"
       >
-        <span class="i-lucide:arrow-up text-[4vw] text-[#fff]" />
+        <span class="i-lucide:arrow-up text-[13px] text-[#fff]" />
       </span>
     </div>
 
-    <!-- 发不出去的原因 / 上一次发送失败 / 更早的消息在哪：写在框外，框里一有字 placeholder 就看不见了 -->
+    <!--
+      发不出去的原因 / 上一次发送失败 / 更早的消息在哪：写在框外，框里一有字 placeholder 就看不见了。
+      猫缩得很小时（见下面的 <style>）这一行先让位，保住输入条。
+    -->
     <p
       v-if="statusNote"
-      class="truncate px-[3%] text-[2.8vw] color-[#ffffff99]"
+      class="overlay-status shrink-0 truncate px-[10px] text-[10px] color-[#ffffff99]"
       :title="statusNote"
     >
       {{ statusNote }}
     </p>
   </div>
 </template>
+
+<style scoped>
+/*
+ * R46：浮层里的东西是固定像素，浮层那一块的高度却随猫缩放（约占窗口高的 38%）。
+ * 输入条 + 状态行要约 60px，也就是窗口矮于约 160px 时就放不下了——先把状态行藏起来，
+ * 输入条（约 42px）还能完整显示到窗口约 110px 高。
+ */
+@media (max-height: 160px) {
+  .overlay-status {
+    display: none;
+  }
+}
+</style>

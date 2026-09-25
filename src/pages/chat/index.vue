@@ -2,17 +2,17 @@
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { writeImage, writeText } from '@tauri-apps/plugin-clipboard-manager'
-import { open, save } from '@tauri-apps/plugin-dialog'
-import { copyFile, readFile, writeFile } from '@tauri-apps/plugin-fs'
+import { save } from '@tauri-apps/plugin-dialog'
+import { copyFile, readFile } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { openPath } from '@tauri-apps/plugin-opener'
 import { useEventListener } from '@vueuse/core'
 import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import type { ChatMessage, MessageStatus, SendAttachmentOptions, TransferProgress } from '@/composables/usePair'
+import type { ChatMessage, MessageStatus, TransferProgress } from '@/composables/usePair'
 
-import { MESSAGE_TEXT_LIMIT, pairSendAttachment, pairSetMaxAttachmentMb, pairTransferPaths } from '@/composables/usePair'
+import { MESSAGE_TEXT_LIMIT, pairSetMaxAttachmentMb } from '@/composables/usePair'
 import { formatClock, usePairChat, visibleWindow } from '@/composables/usePairChat'
 import { usePairStatus } from '@/composables/usePairStatus'
 import {
@@ -25,11 +25,9 @@ import {
   isTransferActive,
   localPathOf,
   needsDecision,
-  pastedImageName,
   previewableImage,
   rejectTransfer,
   retryTransfer,
-  transferKindOfFile,
   transferLabelKey,
   usePairTransfer,
 } from '@/composables/usePairTransfer'
@@ -38,7 +36,6 @@ import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
 import { pairStateKey, usePairStore } from '@/stores/pair'
-import { join } from '@/utils/path'
 
 /**
  * 桌面聊天气泡窗口（§29 - §32）。
@@ -79,8 +76,6 @@ const draft = ref('')
 const sending = ref(false)
 const sendError = ref('')
 const copiedId = ref('')
-const attaching = ref(false)
-const attachmentError = ref('')
 const saving = ref(false)
 /** 打开图片预览时的那条消息（§37） */
 const previewMessage = ref<ChatMessage>()
@@ -332,79 +327,6 @@ const previewSource = computed(() => {
 
   return item ? assetSource(item) : void 0
 })
-
-/** 发一个附件：落库、显示、滚到最新（§38） */
-async function sendAttachment(options: SendAttachmentOptions) {
-  if (attaching.value) return
-
-  attaching.value = true
-  attachmentError.value = ''
-
-  try {
-    apply(await pairSendAttachment(options))
-
-    offset.value = 0
-
-    await scrollToNewest()
-  } catch (reason) {
-    attachmentError.value = String(reason)
-  } finally {
-    attaching.value = false
-  }
-}
-
-/**
- * §37：粘贴进来的图片先落成临时文件，再交给附件管线。
- *
- * `stage` 会让 Rust 把临时文件收进附件缓存，所以临时目录里不会留下副本。
- * 图片不当文本粘贴，否则输入框里会出现一串二进制乱码。
- */
-async function handlePaste(event: ClipboardEvent) {
-  const data = event.clipboardData
-
-  if (!data) return
-
-  const item = Array.from(data.items).find(entry => entry.type.startsWith('image/'))
-  const blob = item?.getAsFile()
-
-  if (!blob) return
-
-  event.preventDefault()
-
-  // 上一张还在算校验值时不要再写一个临时文件，否则它会留在临时目录里没人管
-  if (attaching.value) {
-    flash(t('pages.chat.hints.attachmentBusy'))
-
-    return
-  }
-
-  try {
-    const paths = await pairTransferPaths()
-    const path = join(paths.tmp, pastedImageName(blob.type, Date.now()))
-
-    await writeFile(path, new Uint8Array(await blob.arrayBuffer()))
-    await sendAttachment({ path, kind: 'image', mime: blob.type, stage: true })
-  } catch (reason) {
-    attachmentError.value = String(reason)
-  }
-}
-
-/** 从对话框里挑一个文件发送 */
-async function pickAttachment() {
-  if (attaching.value) return
-
-  try {
-    const selected = await open({ directory: false, multiple: false })
-
-    if (typeof selected !== 'string') return
-
-    const name = selected.split(/[\\/]/).pop() ?? selected
-
-    await sendAttachment({ path: selected, kind: transferKindOfFile(name) })
-  } catch (reason) {
-    attachmentError.value = String(reason)
-  }
-}
 
 function handleAccept(item: ChatMessage) {
   acceptTransfer(item.id).catch(reason => flash(String(reason)))
@@ -838,14 +760,11 @@ onMounted(async () => {
       v-if="inputMode"
       class="shrink-0 border-t border-[#ffffff14] p-1.5"
     >
-      <!-- R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款 -->
+      <!--
+        R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款。
+        R46：不再能发附件（去掉回形针与粘贴图片），只能发文字；语音从猫咪窗口的麦克风或快捷键发。
+      -->
       <div class="flex items-end gap-1.5 bg-[#ffffff14] px-2 py-1.5 rounded-xl">
-        <button
-          class="i-lucide:paperclip relative mb-1 shrink-0 cursor-pointer text-[13px] color-[#ffffff8c] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
-          :title="$t('pages.chat.hints.pickAttachment')"
-          @click="pickAttachment"
-        />
-
         <textarea
           ref="input"
           v-model="draft"
@@ -853,7 +772,6 @@ onMounted(async () => {
           :placeholder="$t('pages.chat.placeholders.input')"
           @keydown.enter.exact="handleSendKey"
           @keydown.esc.prevent="closeInput"
-          @paste="handlePaste"
         />
 
         <button
@@ -887,20 +805,6 @@ onMounted(async () => {
         class="mt-1 break-all text-[9px] color-[#ffffff99]"
       >
         {{ $t('pages.chat.hints.queued', { state: pairState }) }}
-      </p>
-
-      <p
-        v-if="attaching"
-        class="mt-1 text-[9px] color-[#ffffff99]"
-      >
-        {{ $t('pages.chat.hints.sendingAttachment') }}
-      </p>
-
-      <p
-        v-if="attachmentError"
-        class="mt-1 break-all text-[9px] text-[#ff7875]"
-      >
-        {{ attachmentError }}
       </p>
 
       <p

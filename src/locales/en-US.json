@@ -63,11 +63,8 @@
         "queued": "Saved for later ({state}) — it goes out once connected",
         "preview": "View this image",
         "close": "Close",
-        "pickAttachment": "Send a file",
-        "sendingAttachment": "Sending the attachment...",
         "imageCopied": "Image copied to the clipboard",
         "askPeerResend": "Ask your partner to send it again",
-        "attachmentBusy": "The previous one is still sending — try again in a moment",
         "moreInChat": "Earlier messages are in the chat window"
       },
       "placeholders": {
