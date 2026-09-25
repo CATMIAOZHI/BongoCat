@@ -10,7 +10,7 @@
 ## 工作区结构
 
 - 工作区根目录就是仓库本体（BongoCat 的本地 fork），没有子仓库。
-- 双人联机功能的设计真相来源分三份：`docs/pair-plan.md`（Phase 1~6：多窗口 / Cloudflare Relay / 对方猫 / 聊天 / 附件 / 语音，修订记录 R1~R19）、`docs/pair-plan-cloud-p2p.md`（Phase 7~10：自建中继 / P2P / 60Hz / reliable 通道，修订记录 R20~R33）与 `docs/pair-plan-multi-session.md`（Phase 11：一套服务器承载多个双人会话；Phase 12：服务器密码，修订记录 R34 起）。三份都冲突时以各自的修订记录为准；跨文档冲突以 `pair-plan-multi-session.md` 为准。
+- 双人联机功能的三份设计计划都**已完成并归档**（开头标了「状态：已完成」）：`docs/pair-plan.md`（Phase 1~6：多窗口 / Cloudflare Relay / 对方猫 / 聊天 / 附件 / 语音，修订记录到 R46）、`docs/pair-plan-cloud-p2p.md`（Phase 7~10：自建中继 / P2P / 60Hz / reliable 通道）与 `docs/pair-plan-multi-session.md`（Phase 11~12：多会话服务器 / 服务器密码）。它们只作历史记录：以后的改动不再往里追加修订记录（改动说明写在提交信息里；需要新计划时另开一份新文档），**独立审计也不以它们为参考**，以当前代码、提交信息与本文件为准。
 - 联机凭据有两层：**配对密码**（每一对用户自己的，决定「谁是同一对」，同时是 E2EE 密钥材料）与**服务器密码**（部署者在自建中继上设置的 `PAIR_SERVER_PASSWORD`，决定「谁能用这台服务器」，Phase 12 / R36）。客户端设置页因此有三项：服务器地址 / 服务器密码 / 配对密码；两个密码分别存在系统凭据库的两个条目里，且**不填服务器密码时就不发 `X-Bongo-Server` 头**（官方 Cloudflare 中继不需要它）。
 - 中继有两份实现：`server-cloudflare/`（Cloudflare Worker + Durable Object，**一个部署只服务一对用户**，忽略 `X-Bongo-Room` 与 `X-Bongo-Server`）与 `server-relay/`（自建 Rust 服务，**一套承载多个双人会话**，按 `X-Bongo-Room` 分组，并要求服务器密码）。线上契约以 `server-cloudflare/README.md` 为准，两侧必须一致（自建版多出 `server.welcome` 里可选的 `limits` / `iceServers` 字段、`/health` 的 `mode` / `passwordRequired` 字段、服务器密码不对时的 HTTP 403、容量满时的 HTTP 503，以及**本版必需**的 `X-Bongo-Room` 与 `X-Bongo-Server` 头——新客户端连两份中继都行，**旧客户端（或没填服务器密码的新客户端）连自建版会被挡下**，所以升级自建版要先升两台设备上的客户端并填好服务器密码，见 `server-relay/README.md` 的兼容矩阵）。`server-relay/` 是**独立 workspace**（不在根 workspace 里），单独用 `cargo test --manifest-path server-relay/Cargo.toml` 跑测试。
 - `src/`：前端，Vue 3 + TypeScript + Vite + Pinia + UnoCSS + antdv-next。

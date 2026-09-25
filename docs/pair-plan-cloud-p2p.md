@@ -1,5 +1,7 @@
 # BongoCat 双人联机（第二阶段）设计：自建云服务器中继 + P2P（WebRTC）+ 60Hz
 
+> **状态：已完成（归档，2026-09-25）**。Phase 7~10 都已实现并推送。本文只作历史记录：以后的改动不再往这里追加修订记录，独立审计也**不**以本文为参考，以当前代码、提交信息与 `AGENTS.md` 为准。
+
 > ## 与 v1（`docs/pair-plan.md`）的关系
 >
 > - v1 = `docs/pair-plan.md`。Phase 1~6（多窗口置顶 / Cloudflare Relay / 对方猫 / 文字聊天 / 附件 / 语音）已实现、独立审计通过并推送，分支 `feat/pair-desktop-v1`。
