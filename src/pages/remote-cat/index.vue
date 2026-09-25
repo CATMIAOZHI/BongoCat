@@ -517,7 +517,12 @@ function handleMouseDown() {
         :src="backgroundImagePath"
       >
 
-      <canvas id="live2dCanvas" />
+      <!-- 必须和背景图一样是绝对定位：否则浏览器会把背景图（桌子 + 鼠标垫）画在画布上面，
+           握鼠标的爪子就被鼠标垫整块挡住。本机猫窗口靠 children:(absolute size-full) 做到这点 -->
+      <canvas
+        id="live2dCanvas"
+        class="absolute size-full"
+      />
 
       <!-- R37：对方按着的键贴图，和猫咪窗口同一套渲染方式 -->
       <img
