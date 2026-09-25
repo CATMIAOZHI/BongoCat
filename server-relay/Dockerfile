@@ -23,5 +23,6 @@ USER relay
 ENV PAIR_LISTEN=0.0.0.0:8080
 
 EXPOSE 8080
+EXPOSE 3479/udp
 
 ENTRYPOINT ["bongocat-pair-relay"]

@@ -1,8 +1,8 @@
 //! 自建中继入口：读配置、监听、把连接交给 `server`。
 
 use bongocat_pair_relay::relay::Relay;
-use bongocat_pair_relay::server;
-use tokio::net::TcpListener;
+use bongocat_pair_relay::{server, stun};
+use tokio::net::{TcpListener, UdpSocket};
 
 #[tokio::main]
 async fn main() {
@@ -95,11 +95,35 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("无法监听 {listen}: {error}"))?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let limits = config.limits;
+
+    // 内置 STUN（见 `stun.rs`）。绑不上端口**不致命**：转发、聊天都不依赖它，只是 P2P
+    // 会退回「只有内网地址」。所以只打一条醒目的提示，并且不广告一个不存在的服务。
+    let stun_port = match config.stun_port {
+        Some(port) => match UdpSocket::bind(("0.0.0.0", port)).await {
+            Ok(socket) => {
+                tokio::spawn(stun::serve(socket));
+
+                Some(port)
+            }
+            Err(error) => {
+                eprintln!(
+                    "内置 STUN 无法监听 UDP {port}：{error}。P2P 直连将只能在同一局域网内成功；\
+                     多半是端口被占了（旧版 coturn 会顺带占 3479），换一个空闲的 \
+                     PAIR_STUN_PORT 即可（compose 的端口映射会跟着变）"
+                );
+
+                None
+            }
+        },
+        None => None,
+    };
+
     let relay = Relay::new(
         limits,
         config.max_sessions,
         config.stale_after,
         config.ice_servers.clone(),
+        stun_port,
         config.server_verifier,
     );
 
@@ -120,6 +144,13 @@ async fn run() -> Result<(), String> {
         limits.bytes_per_second / (1024.0 * 1024.0)
     );
     println!("  TLS       由前置的 Caddy 终结，本进程只说 HTTP/WS");
+    match (stun_port, config.ice_servers.is_some()) {
+        (Some(port), _) => {
+            println!("  STUN      内置，UDP {port}（安全组要放行 UDP {port}，P2P 直连才打得通）")
+        }
+        (None, true) => println!("  STUN      使用 PAIR_ICE_SERVERS 里的配置，内置 STUN 未启动"),
+        (None, false) => println!("  STUN      未启用：P2P 直连只能在同一局域网内成功"),
+    }
     println!("  服务器密码 PAIR_SERVER_PASSWORD 已生效（摘要形式，进程里没有原文）");
     println!("            客户端「服务器密码」必须填同一个值，否则连握手都过不去");
     println!("  配对密码  本进程**没有**任何配对密码：那是每一对用户自己的凭据");

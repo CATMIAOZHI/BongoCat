@@ -172,6 +172,9 @@ pub struct Relay {
     max_sessions: usize,
     stale_after: Duration,
     ice_servers: Option<serde_json::Value>,
+    /// 内置 STUN 的端口（`None` = 没有内置 STUN，见 `stun.rs`）。有它而 `ice_servers`
+    /// 为空时，welcome 里广告 `stun:<客户端连进来用的主机名>:<端口>`。
+    stun_port: Option<u16>,
     /// R36：`SHA256(derive_server_token(服务器密码))`。这一版中继**必须**有它：
     /// 它是「谁能连上这台服务器」的唯一门槛，缺了它任何人都能白用转发与 TURN。
     /// 与 Room 的 verifier 一样只存摘要——启动之后进程里没有密码原文。
@@ -186,6 +189,7 @@ impl Relay {
         max_sessions: usize,
         stale_after: Duration,
         ice_servers: Option<serde_json::Value>,
+        stun_port: Option<u16>,
         server_verifier: [u8; 32],
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -193,6 +197,7 @@ impl Relay {
             max_sessions,
             stale_after,
             ice_servers,
+            stun_port,
             server_verifier,
             next_id: AtomicU64::new(1),
             state: Mutex::new(State::default()),
@@ -203,6 +208,22 @@ impl Relay {
     /// （两边都是 32 字节摘要）。
     pub fn accepts_server_token(&self, token: &str) -> bool {
         constant_time_eq(&auth_verifier(token), &self.server_verifier)
+    }
+
+    /// 这次连接的 welcome 里该广告哪些 ICE 服务器。
+    ///
+    /// 部署者配了 `PAIR_ICE_SERVERS` 就原样用它；否则有内置 STUN 时，用客户端连进来时的
+    /// `Host` 拼出 `stun:<主机名>:<端口>`——客户端怎么找到这台服务器的，就怎么找到它的
+    /// STUN，部署者什么都不用填。`Host` 缺失或形状不对时不广告（P2P 退回只有内网地址）。
+    pub fn ice_servers_for(&self, host: Option<&str>) -> Option<serde_json::Value> {
+        if let Some(servers) = &self.ice_servers {
+            return Some(servers.clone());
+        }
+
+        let port = self.stun_port?;
+        let name = crate::stun::host_without_port(host?)?;
+
+        Some(serde_json::json!([{ "urls": [format!("stun:{name}:{port}")] }]))
     }
 
     /// 升级之前的容量与密钥判定（§8 / §9 / §27）。放行时**当场创建 Room**，让这份名额
@@ -330,7 +351,7 @@ impl Relay {
                     protocol: protocol::PROTOCOL_VERSION,
                     peer_online,
                     limits: self.limits,
-                    ice_servers: self.ice_servers.clone(),
+                    ice_servers: self.ice_servers_for(head.header("host")),
                 }
                 .to_json();
 
@@ -874,6 +895,7 @@ mod tests {
             Limits::default(),
             max_sessions,
             stale_after,
+            None,
             None,
             // 会话层用不到服务器密码（那是 `server.rs` 在升级之前判的），给一个固定摘要
             auth::server_verifier("relay-unit-tests-server-password"),

@@ -42,6 +42,11 @@ pub struct Config {
     pub stale_after: Duration,
     /// `/ws` 的 `server.welcome` 里附带的 ICE 服务器（可选，原样透传）
     pub ice_servers: Option<serde_json::Value>,
+    /// 内置 STUN 的 UDP 端口（`PAIR_STUN_PORT`，默认 3479，`0` 关闭）。
+    ///
+    /// 部署者自己配了 `PAIR_ICE_SERVERS` 时这里是 `None`：以他的配置为准，内置的不启动、
+    /// 也不混进广告里（两份 STUN 同时广告只会让客户端多问一次）。
+    pub stun_port: Option<u16>,
     /// R36：服务器密码的 verifier（`SHA256(derive_server_token(密码))`）。
     /// 配置里**没有**密码原文，也没有它的任何可逆形态。
     pub server_verifier: [u8; 32],
@@ -105,6 +110,20 @@ pub fn load_config() -> Result<Config, String> {
         ),
     };
 
+    let stun_port = match env_non_empty("PAIR_STUN_PORT") {
+        None => Some(crate::stun::DEFAULT_STUN_PORT),
+        Some(text) => match text.parse::<u16>() {
+            Ok(0) => None,
+            Ok(port) => Some(port),
+            Err(_) => {
+                return Err(format!(
+                    "PAIR_STUN_PORT 必须是 0~65535 的整数（0 表示关闭内置 STUN），实际是 {text:?}"
+                ))
+            }
+        },
+    }
+    .filter(|_| ice_servers.is_none());
+
     // R36：服务器密码是**必填**的。它是「谁能用这台服务器」的唯一门槛：没有它，
     // 任何人只要知道地址就能开一个自己的会话（还会顺走 welcome 里的 TURN 凭据）。
     // 与其允许一个默认开放、随时可能被白嫖的部署，不如启动就报错说清楚怎么设。
@@ -128,6 +147,7 @@ pub fn load_config() -> Result<Config, String> {
         max_sessions: env_positive_usize("PAIR_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?,
         stale_after: Duration::from_millis(env_u64("PAIR_STALE_AFTER_MS", DEFAULT_STALE_AFTER_MS)?),
         ice_servers,
+        stun_port,
         server_verifier: auth::server_verifier(&server_password),
     })
 }

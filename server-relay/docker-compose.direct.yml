@@ -9,7 +9,8 @@
 #    客户端在填了明文地址时也会显示一条同样的提醒。
 #
 # 客户端填法：服务器地址填 <公网 IP>:8080（不带 scheme，客户端会按 ws:// 处理）。
-# 别忘了在云控制台的安全组里放行 **TCP 8080**，否则容器起来了客户端也连不上。
+# 别忘了在云控制台的安全组里放行 **TCP 8080**（否则容器起来了客户端也连不上）
+# 与 **UDP 3479**（内置 STUN，不放行的话 P2P 直连打不通，只能走服务器转发）。
 
 services:
   relay:
@@ -26,11 +27,15 @@ services:
       PAIR_MAX_CHUNKS_PER_SECOND: ${PAIR_MAX_CHUNKS_PER_SECOND:-}
       PAIR_MAX_BYTES_PER_SECOND: ${PAIR_MAX_BYTES_PER_SECOND:-}
       PAIR_STALE_AFTER_MS: ${PAIR_STALE_AFTER_MS:-}
+      # 内置 STUN（同 docker-compose.yml）：要设成 0 关闭，必须先注释掉下面 `ports` 里
+      # 那行 udp，否则 `0:0/udp` 会让 compose 起不来
+      PAIR_STUN_PORT: ${PAIR_STUN_PORT:-3479}
       PAIR_ICE_SERVERS: ${PAIR_ICE_SERVERS:-}
     ports:
-      - "8080:8080"
+      - '8080:8080'
+      - '${PAIR_STUN_PORT:-3479}:${PAIR_STUN_PORT:-3479}/udp'
     healthcheck:
-      test: ["CMD", "bongocat-pair-relay", "--health-check"]
+      test: [CMD, bongocat-pair-relay, --health-check]
       interval: 10s
       timeout: 3s
       retries: 3

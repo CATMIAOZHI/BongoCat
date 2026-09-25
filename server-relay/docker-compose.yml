@@ -6,7 +6,8 @@
 #   1. cp .env.example .env，填 PAIR_DOMAIN=<你的域名> 与
 #      PAIR_SERVER_PASSWORD=<服务器密码>（缺任一个都会明确报错，不会半启动）
 #      ——服务器密码先生成好再 cp 更省事：`cargo run --release --bin generate-pair -- --server`
-#   2. 云控制台的安全组放行 80 与 443（Caddy 要用 80 申请证书），
+#   2. 云控制台的安全组放行 TCP 80、TCP 443 与 UDP 3479（Caddy 要用 80 申请证书；
+#      UDP 3479 是内置 STUN，不放行的话 P2P 直连打不通，只能走服务器转发），
 #      域名 A 记录指向这台机器
 #   3. docker compose up -d
 #   4. 自查：curl https://<你的域名>/health 应当打印
@@ -34,14 +35,22 @@ services:
       PAIR_MAX_CHUNKS_PER_SECOND: ${PAIR_MAX_CHUNKS_PER_SECOND:-}
       PAIR_MAX_BYTES_PER_SECOND: ${PAIR_MAX_BYTES_PER_SECOND:-}
       PAIR_STALE_AFTER_MS: ${PAIR_STALE_AFTER_MS:-}
+      # 内置 STUN 的 UDP 端口（告诉客户端它的公网地址，P2P 直连要用）。默认 3479；
+      # 改端口时下面 `ports` 那行会跟着变。要设成 0 关闭，必须先注释掉下面 `ports`
+      # 那行，否则 `0:0/udp` 会让 compose 起不来
+      PAIR_STUN_PORT: ${PAIR_STUN_PORT:-3479}
       # 自建 coturn 后把地址填在 .env 的 PAIR_ICE_SERVERS 里（coturn 本体见
-      # docker-compose.coturn.yml）；空值等于不广告
+      # docker-compose.coturn.yml）。填了它就以它为准，内置 STUN 不启动；空值时用内置的
       PAIR_ICE_SERVERS: ${PAIR_ICE_SERVERS:-}
     expose:
-      - "8080"
+      - '8080'
+    # 内置 STUN 直接对外（Caddy 只管 HTTP，不转 UDP）。宿主端口与容器端口必须一样：
+    # 中继广告给客户端的就是这个端口号
+    ports:
+      - '${PAIR_STUN_PORT:-3479}:${PAIR_STUN_PORT:-3479}/udp'
     # 让 `docker compose ps` 能看出中继到底在不在服务，也让 Caddy 等到它就绪
     healthcheck:
-      test: ["CMD", "bongocat-pair-relay", "--health-check"]
+      test: [CMD, bongocat-pair-relay, --health-check]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -56,9 +65,9 @@ services:
     environment:
       PAIR_DOMAIN: ${PAIR_DOMAIN:?请先在 .env 里设置 PAIR_DOMAIN}
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

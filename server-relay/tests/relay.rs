@@ -65,6 +65,16 @@ async fn start_relay_with(
     stale_after: Duration,
     ice_servers: Option<serde_json::Value>,
 ) -> SocketAddr {
+    start_relay_full(limits, max_sessions, stale_after, ice_servers, None).await
+}
+
+async fn start_relay_full(
+    limits: Limits,
+    max_sessions: usize,
+    stale_after: Duration,
+    ice_servers: Option<serde_json::Value>,
+    stun_port: Option<u16>,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let config = Config {
@@ -72,6 +82,7 @@ async fn start_relay_with(
         max_sessions,
         stale_after,
         ice_servers: ice_servers.clone(),
+        stun_port,
         server_verifier: auth::server_verifier(SERVER_PASSWORD),
     };
     let relay = Relay::new(
@@ -79,6 +90,7 @@ async fn start_relay_with(
         config.max_sessions,
         config.stale_after,
         ice_servers,
+        config.stun_port,
         config.server_verifier,
     );
 
@@ -844,4 +856,42 @@ async fn the_welcome_omits_ice_servers_when_not_configured() {
     let welcome = next_json(&mut client).await;
 
     assert!(welcome.get("iceServers").is_none());
+}
+
+/// 内置 STUN：没配 `PAIR_ICE_SERVERS` 时，用客户端连进来的主机名拼出 `stun:` 地址
+#[tokio::test]
+async fn the_welcome_advertises_the_builtin_stun_on_the_host_the_client_used() {
+    let address = start_relay_full(
+        Limits::default(),
+        20,
+        Duration::from_secs(120),
+        None,
+        Some(3479),
+    )
+    .await;
+    let mut client = connect_a(address, "aaaa").await;
+    let welcome = next_json(&mut client).await;
+
+    assert_eq!(
+        welcome["iceServers"],
+        serde_json::json!([{ "urls": ["stun:127.0.0.1:3479"] }])
+    );
+}
+
+/// 部署者自己配了 `PAIR_ICE_SERVERS`（比如装了 coturn）时，以他的为准
+#[tokio::test]
+async fn configured_ice_servers_win_over_the_builtin_stun() {
+    let ice_servers = serde_json::json!([{ "urls": ["stun:cat.example.com:3478"] }]);
+    let address = start_relay_full(
+        Limits::default(),
+        20,
+        Duration::from_secs(120),
+        Some(ice_servers.clone()),
+        Some(3479),
+    )
+    .await;
+    let mut client = connect_a(address, "aaaa").await;
+    let welcome = next_json(&mut client).await;
+
+    assert_eq!(welcome["iceServers"], ice_servers);
 }

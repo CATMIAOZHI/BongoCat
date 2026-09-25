@@ -1,11 +1,12 @@
-# 可选：STUN/TURN（打洞失败时的兜底）。只有自建中继才需要——Cloudflare 版
-# 目前不广告 `iceServers`。
+# 可选：TURN（内置 STUN 也打不通时的兜底，一般不需要）。中继本身已经在 UDP 3479
+# 自带 STUN；只有「两个人都在运营商大内网」这类情况才用得上这里。
 #
 # 用法（和主 compose 一起跑，注意 coturn 需要 host 网络才能拿到正确的 UDP 端口）：
 #   docker compose -f docker-compose.yml -f docker-compose.coturn.yml up -d
 #   docker compose -f docker-compose.yml -f docker-compose.coturn.yml down
 #
-# 起来之后把地址写进 .env 的 PAIR_ICE_SERVERS（见 README 的「可选：STUN/TURN」）。
+# 起来之后把地址写进 .env 的 PAIR_ICE_SERVERS（见 README 的「可选：TURN（coturn）」）。
+# 填了它之后中继的内置 STUN 就不再启动，所以 STUN 和 TURN 两个地址都要写上。
 #
 # 上线前记得改 turnserver.conf 里的 external-ip（写公网 IP 字面量，别写域名）、
 # realm / server-name 与 user= 的密码；改完不要把真实密码提交进仓库。
@@ -24,4 +25,4 @@ services:
     # （配置文件先被读，所以是 conf 里的值生效，命令行那条被忽略）。
     # 这里显式指定配置文件，并保留 `--log-file=stdout`：它的作用是「只往 stdout 打、
     # 不另开日志文件」（coturn 默认也会往 stdout 打，删掉不至于什么都看不到）。
-    command: ["-c", "/etc/coturn/turnserver.conf", "--log-file=stdout"]
+    command: [-c, /etc/coturn/turnserver.conf, --log-file=stdout]

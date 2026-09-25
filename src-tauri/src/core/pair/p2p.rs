@@ -142,8 +142,8 @@ impl P2pEvents {
 impl P2pLink {
     /// 起一条腿，并立刻向对端宣告自己支持 P2P（R21：能力门控只看对端）。
     ///
-    /// `ice_servers` 来自 `server.welcome` 的广告（R21）；空表示只有 host candidate，
-    /// 这是隐私缺省（不填任何公共 STUN）。
+    /// `ice_servers` 来自 `server.welcome` 的广告（R21）：自建中继默认给它内置的 STUN；
+    /// 空表示只有 host candidate（客户端自己从不填任何公共 STUN）。
     pub fn spawn(device_id: String, ice_servers: Vec<IceServer>) -> (Self, P2pEvents) {
         let (input, incoming) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
@@ -795,6 +795,46 @@ mod tests {
         assert_eq!(retry_delay(4), Duration::from_secs(80));
         assert_eq!(retry_delay(5), Duration::from_secs(120));
         assert_eq!(retry_delay(u32::MAX), Duration::from_secs(120));
+    }
+
+    /// 自建中继的内置 STUN（`server-relay/src/stun.rs`）真的能被这套 WebRTC 栈读懂：
+    /// 问它一次，就应该收集到一个 `srflx`（「服务器看到的我的地址」）候选。没有这类
+    /// 候选，两个不同局域网里的人永远打不通。
+    ///
+    /// 要先起一个中继，再用**本机的局域网地址**指过去（回环地址收不到 host 候选对应
+    /// 的响应）：`BONGO_PAIR_E2E_STUN=stun:192.168.x.x:3479`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "需要一个开着内置 STUN 的中继，见用例注释"]
+    async fn the_relay_builtin_stun_yields_a_srflx_candidate() {
+        let url = std::env::var("BONGO_PAIR_E2E_STUN").expect("先设 BONGO_PAIR_E2E_STUN");
+        let server = IceServer {
+            urls: vec![url],
+            username: String::new(),
+            credential: String::new(),
+        };
+        let (link, mut events) = P2pLink::spawn("a".to_string(), vec![server]);
+
+        // 对端的 hello：「b」字典序更大，所以我们是发起方，会立刻开始收集候选
+        link.handle_signal(PairSignalPayload::Hello {
+            version: SIGNAL_VERSION,
+            device_id: "b".to_string(),
+            features: vec![FEATURE_RELIABLE_CHANNEL.to_string()],
+        });
+
+        let found = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.next().await {
+                if let P2pEvent::Signal(PairSignalPayload::Candidate { candidate, .. }) = event {
+                    if candidate.contains(" typ srflx") {
+                        return candidate;
+                    }
+                }
+            }
+
+            panic!("腿提前结束了");
+        })
+        .await;
+
+        assert!(found.is_ok(), "10 秒内没有收集到 srflx 候选");
     }
 
     /// 两条腿在同一个进程里互相对接：不经过中继，不需要第二台机器，也不需要任何外部服务。

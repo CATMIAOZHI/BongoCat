@@ -489,8 +489,10 @@ pub fn sanitize_keys(keys: Vec<String>) -> Vec<String> {
 /// 形状跟 WebRTC 的 `RTCIceServer` 一致：`urls` 可以是单个字符串也可以是字符串数组，
 /// `username` / `credential` 是 TURN 的静态凭据。
 ///
-/// 默认**不填**任何公共 STUN——STUN 必然让第三方看到公网 IP，而 README 承诺不收集
-/// 任何用户数据。缺失时只有 host candidate（同局域网可用），这正是隐私默认。
+/// 客户端自己**不填**任何公共 STUN——STUN 必然让它所在的服务器看到公网 IP，而 README
+/// 承诺不收集任何用户数据。自建中继默认广告它**内置**的 STUN（`server-relay/src/stun.rs`），
+/// 公网 IP 只有部署者自己的服务器看得到；Cloudflare 版不广告，那时只有 host candidate
+/// （只在同一局域网内能直连）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IceServer {
@@ -553,8 +555,8 @@ pub enum ServerFrame {
         /// 畸形或不合常理的额度按「没广告」处理（见 `deserialize_limits`）。
         #[serde(default, deserialize_with = "deserialize_limits")]
         limits: Option<RelayLimits>,
-        /// R21：自建中继配了 coturn 才会广告；缺字段 / 畸形都按空处理
-        /// （见 `deserialize_ice_servers`）。
+        /// R21：自建中继默认广告内置 STUN（配了 coturn 时广告那一份）；CF 版不广告。
+        /// 缺字段 / 畸形都按空处理（见 `deserialize_ice_servers`）。
         #[serde(
             rename = "iceServers",
             default,
