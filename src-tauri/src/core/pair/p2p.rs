@@ -59,8 +59,19 @@ const SEND_BUFFER_HIGH: u32 = (SEND_BUFFER_LIMIT) as u32;
 /// 低水位 = 一个分片：排空到只剩一块时重新放行。
 const SEND_BUFFER_LOW: u32 = 48 * 1024;
 
-/// 一轮协商失败后，发起方隔多久再试一次
+/// 一轮协商失败后，发起方隔多久再试一次（第一次）。之后每失败一次翻倍，封顶
+/// [`RETRY_DELAY_MAX`]：双方都在 NAT 后面又没配 STUN 时永远打不通，固定 5 秒会让
+/// 两边一直重建 `PeerConnection`、白白占 CPU 和端口。
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// 退避的上限：网络恢复后最多等这么久就会再试（界面上没有手动重试入口）
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(120);
+
+/// 连续失败 `failures` 次之后该等多久：5 秒起、每次翻倍、封顶 2 分钟
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_DELAY
+        .saturating_mul(1u32 << failures.min(10))
+        .min(RETRY_DELAY_MAX)
+}
 
 /// 驱动循环的输入。PC 回调、会话层交给它的对端信令、会话层要发出去的字节，都走这一条
 /// 通道；驱动循环是唯一会向 [`P2pEvent`] 里写东西的地方（`Leg` 只发信令）。
@@ -98,6 +109,9 @@ pub enum P2pEvent {
     /// 某条 DataChannel 不能用了。**重复收到是无害的**（没开过也会收到，比如 ICE 直接
     /// 失败），调用方按「现在不可用」处理即可。
     ChannelClosed(Lane),
+    /// 这一轮协商失败了（ICE 打不通 / 通道断了），正在按退避等下一轮。UI 用它把
+    /// 「正在建立直连」换成「暂时连不上、已走服务器」；重复收到无害。
+    Unreachable,
 }
 
 /// 一条 P2P 腿。会话层持有它；丢掉它即收摊（见 `Drop`）。
@@ -198,6 +212,8 @@ async fn drive(
         buffered_candidates: Vec::new(),
     };
     let mut retry_at: Option<tokio::time::Instant> = None;
+    // 连续失败了几轮：决定下一轮等多久。通道开了、或对端重新 hello 时清零。
+    let mut failures: u32 = 0;
 
     leg.announce();
 
@@ -221,6 +237,7 @@ async fn drive(
                     Input::Peer(signal) => {
                         if leg.handle(signal).await {
                             retry_at = None;
+                            failures = 0;
                         }
                     }
                     Input::Signal(signal) => leg.emit_signal(signal),
@@ -247,6 +264,7 @@ async fn drive(
                     }
                     Input::Ready(lane) => {
                         retry_at = None;
+                        failures = 0;
                         let _ = leg.events.send(P2pEvent::ChannelOpen(lane));
                     }
                     Input::Failed => {
@@ -254,16 +272,22 @@ async fn drive(
                         // 调用方按 lane 各自复位自己的标志。
                         let _ = leg.events.send(P2pEvent::ChannelClosed(Lane::Replaceable));
                         let _ = leg.events.send(P2pEvent::ChannelClosed(Lane::Reliable));
+                        let _ = leg.events.send(P2pEvent::Unreachable);
                         // 这一轮没了，发送缓冲的判断也跟着作废，别把「不可写」留给下一轮
                         leg.writable.store(true, Ordering::Relaxed);
                         leg.reset().await;
 
-                        // 只有发起方能重开一轮：被动一方等对方的 offer，自己重试没意义
-                        retry_at = if leg.offerer && leg.peer_ready {
-                            Some(tokio::time::Instant::now() + RETRY_DELAY)
+                        // 只有发起方能重开一轮：被动一方等对方的 offer，自己重试没意义。
+                        // 同一轮会连着收到好几次 `Failed`（两条通道各一次 + 连接状态），
+                        // 已经排了下一轮就别再改时间，也别重复计数。
+                        if leg.offerer && leg.peer_ready {
+                            if retry_at.is_none() {
+                                retry_at = Some(tokio::time::Instant::now() + retry_delay(failures));
+                                failures = failures.saturating_add(1);
+                            }
                         } else {
-                            None
-                        };
+                            retry_at = None;
+                        }
                     }
                     Input::Stop => break,
                 }
@@ -762,6 +786,16 @@ mod tests {
     const ROOT_KEY: [u8; 32] = [7; 32];
     /// Poly1305 认证标签的长度（`transfer::AEAD_TAG_SIZE` 是私有的，这里只为对拍尺寸）
     const TAG_SIZE: usize = 16;
+
+    #[test]
+    fn retry_backs_off_and_caps() {
+        assert_eq!(retry_delay(0), Duration::from_secs(5));
+        assert_eq!(retry_delay(1), Duration::from_secs(10));
+        assert_eq!(retry_delay(3), Duration::from_secs(40));
+        assert_eq!(retry_delay(4), Duration::from_secs(80));
+        assert_eq!(retry_delay(5), Duration::from_secs(120));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(120));
+    }
 
     /// 两条腿在同一个进程里互相对接：不经过中继，不需要第二台机器，也不需要任何外部服务。
     ///

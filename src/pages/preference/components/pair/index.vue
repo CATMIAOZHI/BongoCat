@@ -374,9 +374,10 @@ const p2pStatus = computed(() => {
   const color = {
     connected: 'success',
     connecting: 'processing',
+    failed: 'warning',
   }[key] ?? 'default'
 
-  return { key, color } as { key: typeof key, color: 'success' | 'processing' | 'default' }
+  return { key, color } as { key: typeof key, color: 'success' | 'processing' | 'warning' | 'default' }
 })
 
 const modelOptions = computed(() => {

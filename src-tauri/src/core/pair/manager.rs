@@ -159,6 +159,9 @@ pub enum P2pState {
     Connecting,
     /// DataChannel 可用，可覆盖流可以切过去
     Connected,
+    /// 上一轮没打通，正按退避等下一轮。功能全在中继上照常跑，这只是一条显示：
+    /// 不然界面会一直停在「正在建立直连」，看不出其实已经放弃、在走服务器了
+    Failed,
 }
 
 /// 事件出口：真实运行时是 Tauri 的 `AppHandle`，测试里是记录器
@@ -1970,6 +1973,17 @@ where
                             manager,
                             generation,
                             P2pState::Connecting,
+                            false,
+                            outbound.frames_per_second,
+                        );
+                    }
+                    Some(link::P2pEvent::Unreachable) => {
+                        // 紧跟在 `ChannelClosed` 之后到达：那两条已经把两条腿的标志复位、
+                        // 选路回到中继，这里只改显示
+                        publish_route(
+                            manager,
+                            generation,
+                            P2pState::Failed,
                             false,
                             outbound.frames_per_second,
                         );

@@ -394,7 +394,8 @@
           "hint": "If a direct link works, pet state and input stats travel directly between the two computers instead of through the server. If it fails everything falls back to the server unchanged.",
           "off": "Not established",
           "connecting": "Setting up a direct link…",
-          "connected": "Direct"
+          "connected": "Direct",
+          "failed": "Unavailable, using the server"
         }
       },
       "about": {

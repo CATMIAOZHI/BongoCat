@@ -31,7 +31,7 @@ export interface PairStatus {
   plaintext?: boolean
 }
 
-export type P2pState = 'off' | 'connecting' | 'connected'
+export type P2pState = 'off' | 'connecting' | 'connected' | 'failed'
 
 export interface PairPresencePayload {
   state: PresenceState

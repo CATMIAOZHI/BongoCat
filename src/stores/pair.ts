@@ -175,7 +175,7 @@ export interface PairSettings {
 /** 连接相关的瞬时状态：不持久化，由 Tauri 事件与 `pair_get_status` 保持一致 */
 export interface PairRuntime {
   connection: PairConnectionState
-  /** P2P 这条腿：`off` / `connecting` / `connected`，纯显示用 */
+  /** P2P 这条腿：`off` / `connecting` / `connected` / `failed`，纯显示用 */
   p2p: P2pState
   /**
    * 桌宠快照的发送上限（Hz），由 Rust 按当前生效传输给出（§6 / R23）。

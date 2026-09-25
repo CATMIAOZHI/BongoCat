@@ -115,6 +115,7 @@ mod stub {
         Inbound(super::Lane, Vec<u8>),
         ChannelOpen(super::Lane),
         ChannelClosed(super::Lane),
+        Unreachable,
     }
 
     pub struct P2pLink;
