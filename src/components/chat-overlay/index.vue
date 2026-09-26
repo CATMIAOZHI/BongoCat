@@ -6,6 +6,7 @@ import type { ChatMessage } from '@/composables/usePair'
 
 import { MESSAGE_TEXT_LIMIT, RECORDING_LIMIT_SECS } from '@/composables/usePair'
 import { usePairChat } from '@/composables/usePairChat'
+import { setChatVisible } from '@/composables/usePairOverlay'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
 import { pairStateKey, usePairStore } from '@/stores/pair'
@@ -147,7 +148,7 @@ function attachmentMessage(message: ChatMessage) {
 }
 
 function openChatWindow() {
-  pairStore.settings.chat.visible = true
+  setChatVisible(true)
 }
 
 /**

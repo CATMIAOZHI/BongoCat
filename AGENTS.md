@@ -35,6 +35,7 @@
 - 中继的端到端验证：先起一个中继（`server-relay` 或 `server-cloudflare` 的 `pnpm dev`），再设 `BONGO_PAIR_E2E_RELAY` / `BONGO_PAIR_E2E_SECRET` / `BONGO_PAIR_HEARTBEAT_SECS`（自建中继还要 `BONGO_PAIR_E2E_SERVER_PASSWORD`），跑 `cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored`。换中继实现时，这套用例必须在两侧都通过。
 - `vite build` 不做类型检查，要单独跑 `node node_modules/typescript/bin/tsc --noEmit`；仓库没装 `vue-tsc`，所以这个检查只覆盖 `.ts`，`.vue` 里的类型问题目前只能靠 review 和实际运行发现。
 - 报告里区分静态检查、构建和实际运行三种证据。
+- WebView2 的浏览器参数统一写在 `src-tauri/tauri.conf.json` 的 `additionalBrowserArgs` 上（四个窗口都要写、值必须一致：WebView2 环境按 data_directory 共享，只有创建环境那一份生效）。这个字段的语义是**替换** wry 的默认参数，所以改动时必须把默认串 `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` 和 `--autoplay-policy=no-user-gesture-required`（wry 的 autoplay 默认项，丢了会拦下提示音与语音播放）一起带上。不要改用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 环境变量：应用以管理员权限跑（全局键鼠钩子需要），提权进程会被 WebView2 忽略该变量。以后若在 conf 里配了 `proxyUrl`，wry 还会追加 `--proxy-server=...`，那份也要跟着补进来。核验方式是启动后看 `msedgewebview2.exe` 里带 `--embedded-browser-webview=1` 那条命令行。
 
 ### 本机 pnpm 注意事项
 

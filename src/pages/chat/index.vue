@@ -14,6 +14,7 @@ import type { ChatMessage, MessageStatus, TransferProgress } from '@/composables
 
 import { MESSAGE_TEXT_LIMIT, pairSetMaxAttachmentMb } from '@/composables/usePair'
 import { formatClock, usePairChat, visibleWindow } from '@/composables/usePairChat'
+import { setChatVisible } from '@/composables/usePairOverlay'
 import { usePairStatus } from '@/composables/usePairStatus'
 import {
   acceptTransfer,
@@ -415,7 +416,7 @@ async function handleCopyImage(item: ChatMessage) {
 }
 
 function handleHide() {
-  pairStore.settings.chat.visible = false
+  setChatVisible(false)
 }
 
 async function backToNewest() {

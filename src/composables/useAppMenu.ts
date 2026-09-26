@@ -3,6 +3,7 @@ import { exit, relaunch } from '@tauri-apps/plugin-process'
 import { range } from 'es-toolkit'
 import { useI18n } from 'vue-i18n'
 
+import { setChatVisible, setRemoteCatVisible } from '@/composables/usePairOverlay'
 import { WINDOW_LABEL } from '@/constants'
 import { showWindow } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
@@ -78,7 +79,7 @@ export function useAppMenu() {
       MenuItem.new({
         text: pairStore.settings.remoteCat.visible ? t('composables.useAppMenu.labels.hideRemoteCat') : t('composables.useAppMenu.labels.showRemoteCat'),
         action: () => {
-          pairStore.settings.remoteCat.visible = !pairStore.settings.remoteCat.visible
+          setRemoteCatVisible(!pairStore.settings.remoteCat.visible)
         },
       }),
       // §53：右键菜单里给出暂离入口与当前连接状态，完整配置仍然只在偏好页
@@ -97,10 +98,10 @@ export function useAppMenu() {
           ]
         : []),
       MenuItem.new({
-        // 和对方猫一样以 store 里的开关为准：窗口真正显示/隐藏由聊天页面跟随开关执行
+        // 和对方猫一样以 store 里的开关为准，窗口由改开关的这个窗口直接切
         text: pairStore.settings.chat.visible ? t('composables.useAppMenu.labels.hideChat') : t('composables.useAppMenu.labels.showChat'),
         action: () => {
-          pairStore.settings.chat.visible = !pairStore.settings.chat.visible
+          setChatVisible(!pairStore.settings.chat.visible)
         },
       }),
       PredefinedMenuItem.new({ item: 'Separator' }),

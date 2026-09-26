@@ -32,6 +32,7 @@ import {
 } from '@/composables/usePair'
 import { chatExportFileName } from '@/composables/usePairChat'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
+import { setChatVisible, setRemoteCatVisible } from '@/composables/usePairOverlay'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
 import { useModelStore } from '@/stores/model'
@@ -1157,7 +1158,10 @@ watch(() => pairStore.settings.away.message, (value) => {
       :description="$t('pages.preference.pair.hints.remoteCat')"
       :title="$t('pages.preference.pair.labels.showRemoteCat')"
     >
-      <Switch v-model:checked="pairStore.settings.remoteCat.visible" />
+      <Switch
+        :checked="pairStore.settings.remoteCat.visible"
+        @update:checked="setRemoteCatVisible"
+      />
     </ProListItem>
 
     <ProListItem
@@ -1236,7 +1240,10 @@ watch(() => pairStore.settings.away.message, (value) => {
       :description="$t('pages.preference.pair.hints.chatWindow')"
       :title="$t('pages.preference.pair.labels.showChat')"
     >
-      <Switch v-model:checked="pairStore.settings.chat.visible" />
+      <Switch
+        :checked="pairStore.settings.chat.visible"
+        @update:checked="setChatVisible"
+      />
     </ProListItem>
 
     <ProListItem

@@ -50,6 +50,10 @@ pub async fn show_window_label<R: Runtime>(
         let _ = window.show();
         let _ = window.unminimize();
 
+        // 只把原生窗口显示出来不够：`WebviewWindow::show()` 不会下发 `WebviewMessage::Show`，
+        // 被冻结过的页面（对方猫窗口遇到的那种）靠这一步是醒不过来的。
+        set_webview_visible(&window, true);
+
         if focus {
             let _ = window.set_focus();
         }
@@ -72,6 +76,9 @@ pub async fn hide_window_label<R: Runtime>(
         hide_window(app_handle.clone(), window).await;
     } else {
         let _ = window.hide();
+
+        // 和显示对称：也让 webview 切一次，下次显示时那次可见性翻转才是真的变化
+        set_webview_visible(&window, false);
     }
 
     Ok(())

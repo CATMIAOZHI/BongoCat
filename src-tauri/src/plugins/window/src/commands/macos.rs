@@ -16,6 +16,9 @@ fn is_main_window<R: Runtime>(window: &WebviewWindow<R>) -> bool {
 /// macOS 通过 NSPanel 层级控制置顶，没有保持线程，这里是空实现
 pub fn stop_topmost_keep_alive(_label: &str) {}
 
+/// macOS 不需要单独切换 webview：WKWebView 跟着 NSWindow 一起显示 / 隐藏。
+pub fn set_webview_visible<R: Runtime>(_window: &WebviewWindow<R>, _visible: bool) {}
+
 fn set_macos_panel<R: Runtime>(
     app_handle: &AppHandle<R>,
     window: &WebviewWindow<R>,
@@ -69,6 +72,9 @@ pub async fn show_window<R: Runtime>(app_handle: AppHandle<R>, window: WebviewWi
     } else {
         let _ = window.show();
         let _ = window.unminimize();
+
+        set_webview_visible(&window, true);
+
         let _ = window.set_focus();
     }
 }
@@ -79,6 +85,8 @@ pub async fn hide_window<R: Runtime>(app_handle: AppHandle<R>, window: WebviewWi
         set_macos_panel(&app_handle, &window, MacOSPanelStatus::Hide);
     } else {
         let _ = window.hide();
+
+        set_webview_visible(&window, false);
     }
 }
 

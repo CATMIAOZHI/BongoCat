@@ -7,6 +7,7 @@ import ProListItem from '@/components/pro-list-item/index.vue'
 import ProList from '@/components/pro-list/index.vue'
 import Shortcut from '@/components/shortcut/index.vue'
 import { useKeyPress } from '@/composables/useKeyPress'
+import { setChatVisible, setRemoteCatVisible } from '@/composables/usePairOverlay'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { showWindowByLabel, toggleWindowVisible } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
@@ -49,11 +50,11 @@ useKeyPress(alwaysOnTop, () => {
 })
 
 useKeyPress(visibleRemoteCat, () => {
-  pairStore.settings.remoteCat.visible = !pairStore.settings.remoteCat.visible
+  setRemoteCatVisible(!pairStore.settings.remoteCat.visible)
 })
 
 useKeyPress(visibleChat, () => {
-  pairStore.settings.chat.visible = !pairStore.settings.chat.visible
+  setChatVisible(!pairStore.settings.chat.visible)
 })
 
 /**
