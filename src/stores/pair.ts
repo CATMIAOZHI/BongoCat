@@ -159,6 +159,7 @@ export interface PairSettings {
 
   /** Phase 4（聊天）使用；先在 store 里按 §8 建好结构 */
   chat: {
+    overlayVisible: boolean
     visible: boolean
     alwaysOnTop: boolean
     passThrough: boolean
@@ -238,6 +239,7 @@ export const usePairStore = defineStore('pair', () => {
       showStats: true,
     },
     chat: {
+      overlayVisible: true,
       visible: false,
       alwaysOnTop: true,
       passThrough: false,

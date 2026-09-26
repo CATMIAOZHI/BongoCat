@@ -123,10 +123,6 @@ const pairState = computed(() => {
   return key ? t(key) : ''
 })
 
-const peerTitle = computed(() => {
-  return pairState.value || pairStore.runtime.peerName || t('pages.chat.labels.peer')
-})
-
 /** 穿透开着时点不到窗口，提示一句，免得用户以为窗口坏了 */
 const footerHint = computed(() => {
   if (pairStore.settings.chat.passThrough && !inputMode.value) {
@@ -493,11 +489,15 @@ onMounted(async () => {
     以前是 `bg-black/45`，桌面上任何东西都会透进来，字很难读。气泡上的半透明白都是叠在
     这一层实色上面的，所以不用逐个改。
   -->
-  <div class="relative size-screen flex flex-col overflow-hidden bg-[#191c22] text-[#fff] ring-1 ring-[#ffffff1a] rounded-2xl">
+  <div class="chat-shell relative size-screen flex flex-col overflow-hidden text-[#fff] rounded-2xl">
     <header
-      class="flex shrink-0 cursor-move items-center gap-2 border-b border-[#ffffff14] bg-[#ffffff0d] px-2.5 py-2"
+      class="chat-header flex shrink-0 cursor-move items-center gap-3 px-4 py-3"
       @mousedown="handleMouseDown"
     >
+      <span
+        aria-hidden="true"
+        class="chat-avatar"
+      ><span class="i-lucide:cat" /></span>
       <!-- 状态点：未启用 / 对方离线 / 在线。必须是没有点击事件的元素，否则会变成拖窗口 -->
       <span
         class="size-1.5 shrink-0 rounded-full"
@@ -506,9 +506,14 @@ onMounted(async () => {
           : (pairStore.runtime.peerOnline ? 'bg-[#52c41a]' : 'bg-[#ffffff4c]')"
       />
 
-      <span class="min-w-0 flex-1 truncate text-[11px] color-[#ffffffcc] font-medium">
-        {{ peerTitle }}
-      </span>
+      <div class="min-w-0 flex-1">
+        <div class="truncate text-[13px] font-semibold">
+          {{ pairStore.runtime.peerName || $t('pages.chat.labels.peer') }}
+        </div>
+        <div class="chat-presence mt-0.5 truncate text-[10px] color-[#c1bbc9]">
+          {{ pairState || $t('pages.chat.hints.connected') }}
+        </div>
+      </div>
 
       <button
         v-if="!atNewest"
@@ -533,7 +538,7 @@ onMounted(async () => {
 
     <div
       ref="list"
-      class="min-h-0 flex flex-1 flex-col gap-1 overflow-y-auto px-2 py-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-[#ffffff26] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:hover:bg-[#ffffff40]"
+      class="chat-list min-h-0 flex flex-1 flex-col gap-3 overflow-y-auto px-3 py-4 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-[#ffffff26] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:hover:bg-[#ffffff40]"
       @wheel="handleWheel"
     >
       <div
@@ -548,8 +553,8 @@ onMounted(async () => {
         v-else-if="!messages.length"
         class="flex flex-1 flex-col items-center justify-center gap-2 color-[#ffffff59]"
       >
-        <span class="i-lucide:message-circle text-[22px]" />
-        <span class="text-[10px]">{{ $t('pages.chat.hints.empty') }}</span>
+        <span class="empty-avatar"><span class="i-lucide:messages-square" /></span>
+        <span class="mt-2 text-[12px] color-[#c1bbc9]">{{ $t('pages.chat.hints.empty') }}</span>
       </div>
 
       <div
@@ -559,10 +564,10 @@ onMounted(async () => {
         :class="item.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
       >
         <div
-          class="max-w-[86%] break-words px-2.5 py-1.5 text-[12px] leading-[1.4] rounded-2xl shadow-sm"
+          class="chat-bubble max-w-[86%] min-w-0 break-words px-3 py-2.5 text-[13px] leading-[1.55] rounded-2xl"
           :class="item.direction === 'outgoing'
-            ? 'bg-[#1677ff] rounded-br-md'
-            : 'bg-[#ffffff1a] ring-1 ring-[#ffffff1a] rounded-bl-md'"
+            ? 'bubble-out rounded-br-md'
+            : 'bubble-in rounded-bl-md'"
         >
           <template v-if="item.attachment">
             <button
@@ -584,9 +589,9 @@ onMounted(async () => {
                 换成自绘的一行：播放键 + 进度条 + 时长。播放走 `new Audio()` + asset 协议，
                 与猫咪窗口里试听录音同一套（`usePairVoicePlayback`）。
               -->
-              <div class="min-w-32 flex items-center gap-2">
+              <div class="voice-message min-w-0 flex items-center gap-2.5">
                 <button
-                  class="size-7 flex shrink-0 items-center justify-center transition rounded-full"
+                  class="size-9 flex shrink-0 items-center justify-center transition rounded-full"
                   :class="canPlayVoice(item) ? 'cursor-pointer bg-[#ffffff26] hover:bg-[#ffffff40]' : 'bg-[#ffffff1a] opacity-40'"
                   :disabled="!canPlayVoice(item)"
                   :title="canPlayVoice(item)
@@ -631,7 +636,10 @@ onMounted(async () => {
               </div>
             </template>
 
-            <div class="mt-1 flex items-center gap-1 text-[9px] color-[#ffffff99]">
+            <div
+              v-if="item.kind !== 'voice'"
+              class="mt-1 flex items-center gap-1 text-[10px] color-[#ffffff99]"
+            >
               <span>{{ formatFileSize(item.attachment.size ?? 0) }}</span>
             </div>
 
@@ -695,7 +703,7 @@ onMounted(async () => {
               class="mt-1.5 flex flex-wrap items-center gap-1"
             >
               <button
-                v-if="item.kind !== 'image' && localPathOf(item.attachment)"
+                v-if="item.kind !== 'image' && item.kind !== 'voice' && localPathOf(item.attachment)"
                 class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
                 @click="handleOpen(item)"
               >
@@ -735,10 +743,10 @@ onMounted(async () => {
             {{ item.text }}
           </p>
 
-          <div class="mt-1 flex items-center justify-end gap-1 text-[9px] color-[#ffffff73]">
+          <div class="bubble-meta mt-1.5 flex items-center justify-end gap-1.5 text-[10px] color-[#ffffffb2]">
             <button
               v-if="item.text"
-              class="relative shrink-0 cursor-pointer text-[10px] opacity-0 transition before:absolute hover:text-[#fff] group-hover:opacity-100 before:content-empty before:-inset-[0.4em]"
+              class="relative shrink-0 cursor-pointer text-[12px] opacity-0 transition before:absolute hover:text-[#fff] group-focus-within:opacity-100 group-hover:opacity-100 before:content-empty before:-inset-[0.4em]"
               :class="copiedId === item.id ? 'i-lucide:check' : 'i-lucide:copy'"
               :title="$t('pages.chat.hints.copy')"
               @click="handleCopy(item)"
@@ -758,26 +766,28 @@ onMounted(async () => {
     </div>
 
     <div
-      v-if="inputMode"
-      class="shrink-0 border-t border-[#ffffff14] p-1.5"
+      class="chat-composer shrink-0 p-3"
     >
       <!--
         R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款。
         R46：不再能发附件（去掉回形针与粘贴图片），只能发文字；语音从猫咪窗口的麦克风或快捷键发。
       -->
-      <div class="flex items-end gap-1.5 bg-[#ffffff14] px-2 py-1.5 rounded-xl">
+      <div class="composer-field flex items-end gap-2 px-3 py-2 rounded-xl">
         <textarea
           ref="input"
           v-model="draft"
-          class="max-h-24 min-h-9 w-full resize-none py-1 text-[12px] leading-[1.4] outline-none bg-transparent placeholder:color-[#ffffff59]"
+          :aria-label="$t('pages.chat.placeholders.input')"
+          class="max-h-24 min-h-10 min-w-0 flex-1 resize-none py-1 text-[13px] leading-[1.55] outline-none bg-transparent placeholder:color-[#aaa3b4]"
           :placeholder="$t('pages.chat.placeholders.input')"
+          rows="2"
+          @focus="inputMode = true"
           @keydown.enter.exact="handleSendKey"
           @keydown.esc.prevent="closeInput"
         />
 
         <button
-          class="mb-0.5 size-7 flex shrink-0 items-center justify-center transition rounded-full"
-          :class="sendReady ? 'cursor-pointer bg-[#1677ff] hover:bg-[#4096ff]' : 'bg-[#ffffff26]'"
+          class="send-button mb-0.5 size-8 flex shrink-0 items-center justify-center transition rounded-full"
+          :class="sendReady ? 'cursor-pointer bg-[#7964bc] hover:bg-[#917bd2]' : 'bg-[#ffffff14]'"
           :disabled="!sendReady"
           :title="$t('pages.chat.buttons.send')"
           @click="handleSend"
@@ -786,8 +796,15 @@ onMounted(async () => {
         </button>
       </div>
 
-      <div class="mt-1 flex items-center justify-between gap-2 px-0.5 text-[9px] color-[#ffffff59]">
-        <span class="truncate">{{ $t('pages.chat.hints.inputKeys') }}</span>
+      <div class="composer-hint mt-2 flex items-center justify-between gap-2 px-0.5 text-[10px] color-[#aaa3b4]">
+        <button
+          class="min-w-0 truncate text-left"
+          :title="footerHint"
+          type="button"
+          @click="openInput"
+        >
+          {{ inputMode ? $t('pages.chat.hints.inputKeys') : footerHint }}
+        </button>
 
         <span
           v-if="showingLimit"
@@ -814,18 +831,6 @@ onMounted(async () => {
       >
         {{ sendError }}
       </p>
-    </div>
-
-    <div
-      v-else
-      class="shrink-0 px-2.5 pb-2"
-    >
-      <button
-        class="cursor-pointer text-[9px] color-[#ffffff59] hover:color-[#ffffffb2]"
-        @click="openInput"
-      >
-        {{ footerHint }}
-      </button>
     </div>
 
     <!-- 图片预览（§37）：复制图片 / 另存为 -->
@@ -875,3 +880,127 @@ onMounted(async () => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.chat-shell {
+  background: #211f29;
+  border: 1px solid #4c4658;
+  color: #f6f2fa;
+}
+.chat-header {
+  background: #2b2734;
+  border-bottom: 1px solid #403949;
+}
+.chat-avatar,
+.empty-avatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: #44384f;
+  color: #edcbdc;
+  border: 1px solid #62516b;
+}
+.chat-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  font-size: 21px;
+}
+.empty-avatar {
+  width: 62px;
+  height: 62px;
+  border-radius: 23px;
+  font-size: 28px;
+  transform: rotate(-7deg);
+}
+.chat-list {
+  background: radial-gradient(ellipse at top left, #302735 0%, #211f29 65%);
+}
+.bubble-out {
+  background: #69559d;
+  box-shadow: 0 3px 9px #120e2026;
+  border: 1px solid #8570b2;
+}
+.bubble-in {
+  background: #35303f;
+  border: 1px solid #4b4255;
+}
+.voice-message {
+  width: 174px;
+  max-width: 100%;
+}
+.chat-composer {
+  background: #292530;
+  border-top: 1px solid #403949;
+}
+.composer-field {
+  border: 1px solid #51475e;
+  background: #322c3c;
+  transition: border-color 160ms;
+}
+.composer-field:focus-within {
+  border-color: #b79ddd;
+  box-shadow: 0 0 0 2px #b79ddd15;
+}
+.chat-shell button:focus-visible {
+  box-shadow: 0 0 0 2px #e2cafa;
+  border-radius: 5px;
+}
+.chat-header button {
+  min-width: 24px;
+  min-height: 24px;
+}
+.chat-shell button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+@media (max-width: 280px) {
+  .chat-header {
+    padding: 9px;
+    gap: 6px;
+  }
+  .chat-avatar {
+    width: 28px;
+    height: 28px;
+  }
+  .chat-composer {
+    padding: 8px;
+  }
+  .chat-list {
+    padding: 10px 8px;
+  }
+}
+@media (max-height: 260px) {
+  .chat-header {
+    padding: 5px 9px;
+    gap: 7px;
+  }
+  .chat-avatar {
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    font-size: 17px;
+  }
+  .chat-presence,
+  .composer-hint {
+    display: none;
+  }
+  .chat-composer {
+    padding: 5px;
+    max-height: 50%;
+    overflow-y: auto;
+  }
+  .composer-field {
+    padding: 4px 8px;
+  }
+  .composer-field textarea {
+    height: 28px;
+    min-height: 28px;
+  }
+  .chat-list {
+    padding: 7px;
+    gap: 7px;
+  }
+}
+</style>

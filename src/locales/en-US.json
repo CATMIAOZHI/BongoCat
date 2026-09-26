@@ -3,6 +3,8 @@
     "main": {
       "hints": {
         "redrawing": "Redrawing...",
+        "stopRecording": "Stop and preview recording",
+        "awaySign": "Be right back",
         "switching": "Switching...",
         "recording": "Recording {seconds}s / {limit}s",
         "cancelRecording": "Discard this recording",
@@ -49,6 +51,7 @@
       },
       "hints": {
         "loading": "Loading chat history...",
+        "connected": "Online · Here for a chat",
         "empty": "No messages yet — click the line below or use the shortcut to type",
         "backToNewest": "Back to the newest message",
         "hide": "Hide the chat window",
@@ -265,6 +268,7 @@
           "alwaysOnTop": "Always on Top",
           "passThrough": "Pass Through",
           "chatSettings": "Chat",
+          "chatOverlay": "Chat above my cat",
           "showChat": "Show Chat Window",
           "bubbleCount": "Visible Bubbles",
           "chatAlwaysOnTop": "Chat Always on Top",
@@ -298,6 +302,7 @@
         },
         "hints": {
           "enabled": "Once on, fill in the three values below and press Connect. Turning it off disconnects immediately and stops all data sharing.",
+          "chatOverlay": "Show bubbles, input and the microphone above your cat. Turning it off reclaims that space; the separate chat window remains available.",
           "syncModel": "Shares model names only, never files. Import the peer's model locally and give it the same name. Missing models fall back to your own. Name older imports using the pencil on the Models page. Both clients need an updated version.",
           "missingPeerModel": "Peer model “{name}” is missing or unavailable. Using your model. Place their model files locally and import them; for existing imports, set matching names on the Models page.",
           "connectSteps": "The order is: fill in the three values above → press Connect → then turn on \"Partner's Cat\" and \"Chat Window\" further down (both start off).",

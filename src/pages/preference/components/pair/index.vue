@@ -1274,6 +1274,12 @@ const {
 
   <ProList :title="$t('pages.preference.pair.labels.chatSettings')">
     <ProListItem
+      :description="$t('pages.preference.pair.hints.chatOverlay')"
+      :title="$t('pages.preference.pair.labels.chatOverlay')"
+    >
+      <Switch v-model:checked="pairStore.settings.chat.overlayVisible" />
+    </ProListItem>
+    <ProListItem
       :description="$t('pages.preference.pair.hints.chatWindow')"
       :title="$t('pages.preference.pair.labels.showChat')"
     >

@@ -15,6 +15,7 @@ import type { ChatMessage } from '@/composables/usePair'
 import type { PetSnapshot } from '@/composables/usePairActivity'
 import type { Model } from '@/stores/model'
 
+import AwaySign from '@/components/away-sign/index.vue'
 import { getSupportedKey, useModel } from '@/composables/useModel'
 import { defaultSnapshot, sanitizeSnapshot } from '@/composables/usePairActivity'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
@@ -568,14 +569,10 @@ function handleMouseDown() {
       </div>
     </div>
 
-    <div
+    <AwaySign
       v-if="pairStore.runtime.remotePresence === 'away' && isOnline()"
-      class="absolute inset-x-0 top-0 flex justify-center pt-2"
-    >
-      <div class="max-w-full break-all rounded-[0.5rem] bg-black/55 px-2.5 py-1 text-[11px] text-[#fff]">
-        {{ pairStore.runtime.remotePresenceMessage || $t('pages.remoteCat.hints.away') }}
-      </div>
-    </div>
+      :text="pairStore.runtime.remotePresenceMessage || $t('pages.main.hints.awaySign')"
+    />
 
     <div
       v-else-if="notice"

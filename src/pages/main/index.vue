@@ -13,6 +13,7 @@ import { nth } from 'es-toolkit/compat'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
+import AwaySign from '@/components/away-sign/index.vue'
 import ChatOverlay from '@/components/chat-overlay/index.vue'
 import { useAppMenu } from '@/composables/useAppMenu'
 import { useDevice } from '@/composables/useDevice'
@@ -71,7 +72,7 @@ const { stickActive } = useGamepad()
  * 它占窗口顶上一块（高度按 `CHAT_OVERLAY_RATIO` 相对模型高度算），猫咪本体贴底不动，
  * 所以窗口总高 = 模型高 × (1 + 比例)。没开联机时窗口尺寸与过去完全一样。
  */
-const overlayVisible = computed(() => pairStore.settings.enabled)
+const overlayVisible = computed(() => pairStore.settings.enabled && pairStore.settings.chat.overlayVisible !== false)
 
 /** 猫咪本体占窗口的百分比：浮层出现时把上面那块让出来 */
 const modelAreaPercent = computed(() => {
@@ -386,9 +387,17 @@ function handleMouseMove(event: MouseEvent) {
       >
     </div>
 
-    <!-- R39：聊天浮层。只在开启双人联机时占位置，猫咪本体不会被它遮住 -->
     <div
-      v-if="overlayVisible"
+      v-if="pairStore.settings.enabled && pairStore.settings.presence === 'away'"
+      class="pointer-events-none absolute inset-x-0 bottom-0"
+      :style="{ height: `${modelAreaPercent}%` }"
+    >
+      <AwaySign :text="pairStore.settings.away.message || $t('pages.main.hints.awaySign')" />
+    </div>
+
+    <!-- 关闭聊天浮层时收回上方空间，猫的模型尺寸保持不变。 -->
+    <div
+      v-show="overlayVisible"
       class="absolute inset-x-0 top-0"
       :style="{ height: `${overlayAreaPercent}%` }"
     >

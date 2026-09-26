@@ -162,7 +162,7 @@ export function useDevice() {
 
       // R39：开着双人联机时，窗口顶上那一条是聊天浮层。鼠标停在它上面不该让窗口淡出，
       // 否则「悬停就变透明」会把输入框也一起藏掉，根本点不到
-      const overlayBand = pairStore.settings.enabled
+      const overlayBand = pairStore.settings.enabled && pairStore.settings.chat.overlayVisible !== false
         ? height * (CHAT_OVERLAY_RATIO / (1 + CHAT_OVERLAY_RATIO))
         : 0
       const isOverOverlay = overlayBand > 0 && y <= winY + overlayBand
