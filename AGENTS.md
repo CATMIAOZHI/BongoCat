@@ -36,6 +36,7 @@
 - `vite build` 不做类型检查，要单独跑 `node node_modules/typescript/bin/tsc --noEmit`；仓库没装 `vue-tsc`，所以这个检查只覆盖 `.ts`，`.vue` 里的类型问题目前只能靠 review 和实际运行发现。
 - 报告里区分静态检查、构建和实际运行三种证据。
 - WebView2 的浏览器参数统一写在 `src-tauri/tauri.conf.json` 的 `additionalBrowserArgs` 上（四个窗口都要写、值必须一致：WebView2 环境按 data_directory 共享，只有创建环境那一份生效）。这个字段的语义是**替换** wry 的默认参数，所以改动时必须把默认串 `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` 和 `--autoplay-policy=no-user-gesture-required`（wry 的 autoplay 默认项，丢了会拦下提示音与语音播放）一起带上。不要改用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 环境变量：应用以管理员权限跑（全局键鼠钩子需要），提权进程会被 WebView2 忽略该变量。以后若在 conf 里配了 `proxyUrl`，wry 还会追加 `--proxy-server=...`，那份也要跟着补进来。核验方式是启动后看 `msedgewebview2.exe` 里带 `--embedded-browser-webview=1` 那条命令行。
+- 日志级别固定在 `src-tauri/src/lib.rs` 的 `tauri-plugin-log` builder 上（`LevelFilter::Info`）。插件默认是 `Trace`，会把 `tokio-tungstenite` 的逐帧收发连整包 payload 一起写盘，双人联机时是持续的 CPU / IO 源（磁盘占用本来就有上限：插件默认 `KeepOne` + 40KB，这里省的是 CPU / IO）。`.level()` 顺带把全局 `log::set_max_level` 也降到 `Info`，所以噪声在格式化之前就被丢掉；本项目自己的日志只用 `error` / `warn` / `info`，所以 `Info` 不影响排障。临时要查帧就用 `level_for` 单独放开某个模块——它会把全局上限抬回去，前提是别在别处再引入第二处 `set_max_level`（前端日志的 target 是 `webview:<location>`，按模块名放开时注意这点）。
 
 ### 本机 pnpm 注意事项
 

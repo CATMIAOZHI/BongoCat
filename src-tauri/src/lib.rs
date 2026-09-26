@@ -83,7 +83,13 @@ pub fn run() {
             },
         ))
         .plugin(
+            // 插件默认级别是 Trace，会把 tokio-tungstenite 的逐帧收发（连整包 payload 一起）
+            // 全写进日志：双人联机时每个桌宠快照 / 心跳都是「格式化 + 写盘」。插件默认的
+            // KeepOne + 40KB 只保住了磁盘占用，CPU 与 IO 是白花的。本项目自己的日志只用到
+            // error / warn / info 三个级别（`git grep 'trace!\|debug!' src-tauri/src` 为空），
+            // 所以 Info 一条都不漏。
             tauri_plugin_log::Builder::new()
+                .level(tauri_plugin_log::log::LevelFilter::Info)
                 .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
                 .filter(|metadata| !metadata.target().contains("gilrs"))
                 .build(),
