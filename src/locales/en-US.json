@@ -254,6 +254,7 @@
           "remoteStats": "Show Partner's Input Stats",
           "windowSize": "Window Size",
           "opacity": "Opacity",
+          "windowRadius": "Window Radius",
           "alwaysOnTop": "Always on Top",
           "passThrough": "Pass Through",
           "chatSettings": "Chat",

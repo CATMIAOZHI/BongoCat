@@ -20,6 +20,7 @@ import { useAppStore } from './stores/app'
 import { useCatStore } from './stores/cat'
 import { useGeneralStore } from './stores/general'
 import { useModelStore } from './stores/model'
+import { markPairStatsLoaded, usePairStatsStore } from './stores/pairStats'
 import { useShortcutStore } from './stores/shortcut.ts'
 
 const appStore = useAppStore()
@@ -27,12 +28,17 @@ const modelStore = useModelStore()
 const catStore = useCatStore()
 const generalStore = useGeneralStore()
 const shortcutStore = useShortcutStore()
+const pairStatsStore = usePairStatsStore()
 const appWindow = getCurrentWebviewWindow()
 const { isRestored, restoreState } = useWindowState()
 const { darkAlgorithm, defaultAlgorithm } = theme
 const { locale } = useI18n()
 
 onMounted(async () => {
+  // 输入统计这个 store 不自动启动（迁移老数字的写入要等它载入完才生效），而且每个窗口都要它，
+  // 所以放在最前面先起起来：后面任何一步失败都不至于漏掉它。
+  await pairStatsStore.$tauri.start()
+  markPairStatsLoaded()
   await appStore.$tauri.start()
   await appStore.init()
   await modelStore.$tauri.start()

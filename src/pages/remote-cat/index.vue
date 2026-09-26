@@ -243,7 +243,7 @@ function resetApplied() {
  * 模型（可能与本机不同），所以必须单独扫一次。这两个字段不跨窗口同步，各窗口一份。
  */
 async function loadSupportKeys(model: Model) {
-  clearObject([modelStore.supportKeys, modelStore.pressedKeys])
+  clearObject([modelStore.supportKeys, modelStore.pressedKeys, modelStore.heldKeys])
 
   const resourcePath = join(model.path, 'resources')
 
@@ -503,7 +503,10 @@ function handleMouseDown() {
 <template>
   <div
     class="group relative size-screen overflow-hidden"
-    :style="{ opacity: pairStore.settings.remoteCat.opacity / 100 }"
+    :style="{
+      opacity: pairStore.settings.remoteCat.opacity / 100,
+      borderRadius: `${pairStore.settings.remoteCat.radius}%`,
+    }"
     @mousedown="handleMouseDown"
   >
     <div

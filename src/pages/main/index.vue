@@ -244,7 +244,7 @@ watch(() => modelStore.currentModel, async (model) => {
 
   backgroundImagePath.value = existed ? convertFileSrc(path) : void 0
 
-  clearObject([modelStore.supportKeys, modelStore.pressedKeys])
+  clearObject([modelStore.supportKeys, modelStore.pressedKeys, modelStore.heldKeys])
 
   const resourcePath = join(model.path, 'resources')
   const groups = ['left-keys', 'right-keys']

@@ -4,6 +4,18 @@ import { reactive, ref } from 'vue'
 import type { P2pState, PresenceState } from '@/composables/usePair'
 
 import { ATTACHMENT_MAX_MB } from '@/composables/usePair'
+import { createBackendSyncGuard } from '@/utils/tauriStoreSync'
+
+import { takeLegacyStats } from './pairStats'
+
+/**
+ * pair store 里「窗口本地」的键：连接状态、对方是否在线、对方猫的统计、密钥指纹都是每个
+ * 窗口自己从 Rust 查询/订阅来的，既不发给后端也不落盘。
+ */
+const PAIR_LOCAL_STATE_KEYS = ['runtime', 'hasSecret', 'secretFingerprint']
+
+/** 发之前先比一下：只有这些键真的变了才发（见 `utils/tauriStoreSync.ts`） */
+const pairSync = createBackendSyncGuard(PAIR_LOCAL_STATE_KEYS)
 
 export type PairConnectionState
   = | 'disabled'
@@ -135,6 +147,8 @@ export interface PairSettings {
     visible: boolean
     scale: number
     opacity: number
+    /** 窗口圆角，和猫咪窗口用同一口径（百分比） */
+    radius: number
     alwaysOnTop: boolean
     passThrough: boolean
     modelId?: string
@@ -213,6 +227,7 @@ export const usePairStore = defineStore('pair', () => {
       visible: false,
       scale: 100,
       opacity: 100,
+      radius: 0,
       alwaysOnTop: true,
       passThrough: false,
       modelId: void 0,
@@ -241,14 +256,6 @@ export const usePairStore = defineStore('pair', () => {
       message: '',
       sendSystemNotice: true,
     },
-  })
-
-  const stats = reactive<PairStats>({
-    date: '',
-    todayKeyboard: 0,
-    todayMouse: 0,
-    totalKeyboard: 0,
-    totalMouse: 0,
   })
 
   const runtime = reactive<PairRuntime>({
@@ -280,7 +287,6 @@ export const usePairStore = defineStore('pair', () => {
 
   return {
     settings,
-    stats,
     runtime,
     hasSecret,
     hasServerPassword,
@@ -297,6 +303,25 @@ export const usePairStore = defineStore('pair', () => {
     autoStart: true,
     // 运行时状态与指纹不落盘：重新启动后必须先由 Rust 的真实状态覆盖，
     // 否则会先闪一下上一次会话的「已连接」
-    filterKeys: ['runtime', 'hasSecret', 'secretFingerprint'],
+    filterKeys: PAIR_LOCAL_STATE_KEYS,
+    hooks: {
+      /**
+       * 老文件里还躺着一份 `stats`（拆分前统计和设置挤在同一个 store 里），
+       * 载入或别的窗口发来时顺手交给 `pair-stats` store，并且不再让它进入这个 store 的状态。
+       * 见 `stores/pairStats.ts`。顺便记下「后端现在长这样」，给下面那个判据当基准。
+       */
+      beforeFrontendSync: (state) => {
+        const rest = takeLegacyStats(state)
+
+        pairSync.remember(rest)
+
+        return rest
+      },
+      /**
+       * 只有窗口本地的运行时状态变了就什么都不发（返回 `undefined` 会中止这次同步）。
+       * 见 `utils/tauriStoreSync.ts`。
+       */
+      beforeBackendSync: state => pairSync.sync(state),
+    },
   },
 })

@@ -5,6 +5,7 @@ import { onMounted, onUnmounted, watch } from 'vue'
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { usePairStore } from '@/stores/pair'
+import { markPairStatsLoaded, usePairStatsStore } from '@/stores/pairStats'
 import { isWindows } from '@/utils/platform'
 
 import type { PresenceState } from './usePair'
@@ -52,6 +53,7 @@ export interface PointerPoint {
  */
 export function usePairState() {
   const store = usePairStore()
+  const statsStore = usePairStatsStore()
   const catStore = useCatStore()
   const modelStore = useModelStore()
 
@@ -158,10 +160,10 @@ export function usePairState() {
     void pairSendStats({
       date: today(),
       // 不分享时连数字都不发出去，只告诉对端「我不分享」
-      todayKeyboard: share ? store.stats.todayKeyboard : 0,
-      todayMouse: share ? store.stats.todayMouse : 0,
-      totalKeyboard: share ? store.stats.totalKeyboard : 0,
-      totalMouse: share ? store.stats.totalMouse : 0,
+      todayKeyboard: share ? statsStore.stats.todayKeyboard : 0,
+      todayMouse: share ? statsStore.stats.todayMouse : 0,
+      totalKeyboard: share ? statsStore.stats.totalKeyboard : 0,
+      totalMouse: share ? statsStore.stats.totalMouse : 0,
       share,
     }).catch(() => void 0)
   }
@@ -204,7 +206,7 @@ export function usePairState() {
 
   const count = (outcome: 'pressed' | 'repeat' | 'released', source: 'keyboard' | 'mouse') => {
     // 跨过本地午夜时先把今日计数归零（countStats 的返回值就是这件事发生了）
-    if (countStats(store.stats, outcome, source, today())) {
+    if (countStats(statsStore.stats, outcome, source, today())) {
       sendStats()
     }
   }
@@ -274,12 +276,17 @@ export function usePairState() {
     })
   }
 
-  onMounted(() => {
+  onMounted(async () => {
+    // 输入统计单独一个 store，且不由 `autoStart` 启动：迁移老数字的写入必须发生在它载入完
+    // （`watch` 挂上）之后，否则写进去的数字不会被推给后端。这里 await 到那一刻再往下走。
+    await statsStore.$tauri.start()
+    markPairStatsLoaded()
+
     // 启动时先按本地日期校正一次，避免上次运行的「今日」数据被当成今天
-    if (rolloverStats(store.stats, today())) sendStats()
+    if (rolloverStats(statsStore.stats, today())) sendStats()
 
     statsTimer = setInterval(() => {
-      if (rolloverStats(store.stats, today())) sendStats()
+      if (rolloverStats(statsStore.stats, today())) sendStats()
 
       if (canSendStats()) sendStats()
     }, STATS_INTERVAL_MS)
@@ -321,6 +328,16 @@ export function usePairState() {
     // 开与关都要立刻同步一次：关闭时发的是 share=false 的清零载荷，
     // 对端据此清掉旧数字，而不是继续显示上一次的统计
     sendStats()
+  })
+
+  /**
+   * 暂离期间改了举牌文字：立刻按新的文字重发一次 presence。
+   *
+   * 偏好页那边是「草稿 + 保存」，保存只改 store 里的值；不重发的话对方猫头上的牌子
+   * 会一直停在旧文字上，直到下次切暂离才更新——按钮看着生效了、对面却没变。
+   */
+  watch(() => store.settings.away.message, () => {
+    if (store.settings.presence === 'away') sendPresence('away')
   })
 
   watch(() => store.settings.privacy.pauseActivitySync, (paused) => {

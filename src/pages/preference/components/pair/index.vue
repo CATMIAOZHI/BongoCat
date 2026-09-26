@@ -36,8 +36,10 @@ import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
 import { useModelStore } from '@/stores/model'
 import { pairStatusKey, usePairStore } from '@/stores/pair'
+import { usePairStatsStore } from '@/stores/pairStats'
 
 const pairStore = usePairStore()
+const pairStatsStore = usePairStatsStore()
 const modelStore = useModelStore()
 const { t } = useI18n()
 const secretInput = ref('')
@@ -747,6 +749,70 @@ const canPreviewSound = computed(
     pairStore.settings.chat.notificationSound
     && pairStore.settings.chat.notificationVolume > 0,
 )
+
+/**
+ * 暂离举牌文字的草稿，以及为什么必须用草稿。
+ *
+ * pair store 在几个窗口之间同步，而同步是**整份状态**：任何窗口只要改了自己那份里的
+ * 任何东西，就会把自己的整份 `settings` patch 给后端。猫咪窗口恰恰每敲一次键、每点一下
+ * 鼠标都在改统计（`stats`），于是「用户在偏好页打字」这条路上，每个按键都会有一帧**带着
+ * 旧 `away.message`** 的状态发出去，并且通常会盖在刚打的字后面。直接 `v-model` 绑到 store
+ * 上时，表现就是「输入框里的字会闪、丢字、打起来卡」——和用户之前报的服务器地址是同一个
+ * 病根（R40 / R45 就是因此改成草稿的），暂离文字当时漏了。
+ *
+ * 所以这里：输入框只认草稿，点「保存」才写进 store；草稿一旦被用户改过就不再被 store 回填。
+ */
+const awayMessageInput = ref(pairStore.settings.away.message)
+/**
+ * 草稿是否已经「归草稿所有」：回填只在这一位还是 false 时发生。
+ *
+ * 一次回填之后就置 true——包含初次从 store 载入的那一跳（那一跳草稿与 store 同值，
+ * 所以判断的是「草稿变过」而不是「用户动过」）。之后一律以草稿为准，别的窗口的旧值
+ * 再也进不来。全仓库只有偏好页会写 `away.message`，所以不再跟随 store 是安全的。
+ */
+const awayMessageDraftOwned = ref(false)
+/** 刚保存的值；保存后的守护窗口里它被别的窗口盖回来就再写一次（见下面的 watch） */
+let awayMessageSaved = ''
+let awayMessageGuardUntil = 0
+/**
+ * 保存后的守护时长。
+ *
+ * 带旧值的那一帧常常比我们的保存帧**晚**到后端，于是「谁最后发谁赢」会把刚保存的值顶掉：
+ * 盘上留下旧文字，对面猫头上的牌子也不跟着变。人一停手，猫咪窗口就不再发帧了，所以在这段
+ * 时间里把它写回去就能定下来。
+ */
+const AWAY_MESSAGE_GUARD_MS = 2000
+
+const awayMessageDirty = computed(
+  () => awayMessageInput.value !== pairStore.settings.away.message,
+)
+
+/** 还没被用户碰过时才回填（store 是异步载入的，落在组件挂载之后） */
+watch(() => pairStore.settings.away.message, (value) => {
+  if (awayMessageDraftOwned.value) return
+
+  awayMessageInput.value = value
+})
+
+watch(awayMessageInput, () => {
+  awayMessageDraftOwned.value = true
+})
+
+function handleSaveAwayMessage() {
+  awayMessageSaved = awayMessageInput.value
+  awayMessageGuardUntil = Date.now() + AWAY_MESSAGE_GUARD_MS
+
+  pairStore.settings.away.message = awayMessageSaved
+}
+
+/** 保存后被盖回来就再写一次；写回同一个值不会再触发自己（下一轮 value 已经相等） */
+watch(() => pairStore.settings.away.message, (value) => {
+  if (Date.now() > awayMessageGuardUntil) return
+  if (awayMessageInput.value !== awayMessageSaved) return
+  if (value === awayMessageSaved) return
+
+  pairStore.settings.away.message = awayMessageSaved
+})
 </script>
 
 <template>
@@ -1144,6 +1210,18 @@ const canPreviewSound = computed(
       />
     </ProListItem>
 
+    <ProListItem :title="$t('pages.preference.pair.labels.windowRadius')">
+      <Flex align="center">
+        <InputNumber
+          v-model:value="pairStore.settings.remoteCat.radius"
+          class="w-20"
+          :min="0"
+        />
+
+        <span class="ml-2">%</span>
+      </Flex>
+    </ProListItem>
+
     <ProListItem :title="$t('pages.preference.pair.labels.alwaysOnTop')">
       <Switch v-model:checked="pairStore.settings.remoteCat.alwaysOnTop" />
     </ProListItem>
@@ -1366,15 +1444,15 @@ const canPreviewSound = computed(
       >
         <span>
           {{ $t('pages.preference.pair.labels.todayInput', {
-            keyboard: pairStore.stats.todayKeyboard,
-            mouse: pairStore.stats.todayMouse,
+            keyboard: pairStatsStore.stats.todayKeyboard,
+            mouse: pairStatsStore.stats.todayMouse,
           }) }}
         </span>
 
         <span class="color-text-tertiary">
           {{ $t('pages.preference.pair.labels.totalInput', {
-            keyboard: pairStore.stats.totalKeyboard,
-            mouse: pairStore.stats.totalMouse,
+            keyboard: pairStatsStore.stats.totalKeyboard,
+            mouse: pairStatsStore.stats.totalMouse,
           }) }}
         </span>
       </Flex>
@@ -1394,10 +1472,34 @@ const canPreviewSound = computed(
       :title="$t('pages.preference.pair.labels.awayMessage')"
       vertical
     >
-      <Input
-        v-model:value="pairStore.settings.away.message"
+      <Flex
+        align="center"
         class="w-full"
-        :placeholder="$t('pages.preference.pair.placeholders.awayMessage')"
+        gap="small"
+        wrap
+      >
+        <Input
+          v-model:value="awayMessageInput"
+          class="flex-1"
+          :placeholder="$t('pages.preference.pair.placeholders.awayMessage')"
+          @press-enter="handleSaveAwayMessage"
+        />
+
+        <Button
+          :disabled="!awayMessageDirty"
+          type="primary"
+          @click="handleSaveAwayMessage"
+        >
+          {{ $t('pages.preference.pair.buttons.save') }}
+        </Button>
+      </Flex>
+
+      <Alert
+        v-if="awayMessageDirty"
+        class="w-full"
+        :message="$t('pages.preference.pair.hints.credentialUnsaved')"
+        show-icon
+        type="info"
       />
     </ProListItem>
 

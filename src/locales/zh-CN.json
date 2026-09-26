@@ -254,6 +254,7 @@
           "remoteStats": "显示对方的输入统计",
           "windowSize": "窗口尺寸",
           "opacity": "不透明度",
+          "windowRadius": "窗口圆角",
           "alwaysOnTop": "窗口置顶",
           "passThrough": "窗口穿透",
           "chatSettings": "聊天",

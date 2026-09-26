@@ -1,13 +1,13 @@
 import { LogicalSize } from '@tauri-apps/api/dpi'
-import { resolveResource, sep } from '@tauri-apps/api/path'
+import { resolveResource } from '@tauri-apps/api/path'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { message } from 'antdv-next'
 import { isNil, round } from 'es-toolkit'
-import { findKey, nth } from 'es-toolkit/compat'
 import { ref } from 'vue'
 
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
+import { pressKey, releaseKey } from '@/utils/keyHighlight'
 import { isMac } from '@/utils/platform'
 
 import live2d from '../utils/live2d'
@@ -169,25 +169,23 @@ export function useModel() {
     catStore.window.scale = round((size.width / width) * 100)
   }
 
+  /**
+   * 键盘高亮的显示与回退见 `utils/keyHighlight.ts`：
+   *
+   * 模型同一时刻只能显示一张键盘贴图，所以 `pressedKeys` 每个贴图目录只留一个键，
+   * 但「真的按着」的那份事实记在 `heldKeys` 里——否则「按住 w、再按 e、松开 e」
+   * 之后手上什么都没有，而 w 明明还按着。
+   */
   const handlePress = (key: string) => {
     const path = modelStore.supportKeys[key]
 
     if (!path) return
 
-    const dirName = nth(path.split(sep()), -2)!
-    const prevKey = findKey(modelStore.pressedKeys, (value) => {
-      return value.includes(dirName)
-    })
-
-    if (prevKey) {
-      handleRelease(prevKey)
-    }
-
-    modelStore.pressedKeys[key] = path
+    pressKey(modelStore.pressedKeys, modelStore.heldKeys, key, path)
   }
 
   const handleRelease = (key: string) => {
-    delete modelStore.pressedKeys[key]
+    releaseKey(modelStore.pressedKeys, modelStore.heldKeys, key)
   }
 
   function handleKeyChange(isLeft = true, pressed = true) {
