@@ -244,6 +244,7 @@
           "relayUrl": "Server Address",
           "serverPassword": "Server Password",
           "pairSecret": "Pairing Key",
+          "displayName": "My Nickname",
           "autoConnect": "Auto Connect",
           "status": "Connection Status",
           "lastError": "Last Error",
@@ -297,6 +298,7 @@
           "errorHowTo": "It is almost always one of these three: wrong address / wrong password / the server is not running.",
           "relayUrl": "The pairing server both sides use, for example cat.example.com. A self-hosted server without a certificate can be a plain IP, for example 123.123.123.123:8080. If you deployed it yourself, this is the address the deployment printed.",
           "pairSecret": "The same pairing key on both sides puts you in the same two-person session. Ask your partner for theirs, or press Generate and send one over. It is kept in the system credential vault.",
+          "displayName": "The name your partner sees in the chat window title and on the remote cat. Click Save and it updates on their side right away; leave it empty to show \"Partner\".",
           "retryAfterSave": "Updated. Press Connect to try again.",
           "serverPasswordSaved": "Server password saved",
           "relayUrlSaved": "Server address saved",
@@ -360,6 +362,7 @@
           "relayUrl": "cat.example.com or 123.123.123.123:8080",
           "serverPassword": "The password set when the server was deployed",
           "pairSecret": "Paste the pairing key",
+          "displayName": "e.g. Kitty",
           "remoteModel": "Same as mine",
           "awayMessage": "Going for a meal"
         },

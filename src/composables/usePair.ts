@@ -39,6 +39,15 @@ export interface PairPresencePayload {
   displayName?: string
 }
 
+/**
+ * 昵称的字符上限（按码点算，不是 UTF-16 单元，免得把 emoji 劈成两半）。
+ *
+ * 它会被三处用到：聊天窗口标题（本身就 truncate）、对方猫窗口底部那行 9px 小字（宽度
+ * 只有窗口那么宽）、以及存盘。太长会把那行小字撑出窗口，所以在源头就截断。协议里没有
+ * 这个上限，对端也不会校验，所以这里只保证「我发出去的不超长」。
+ */
+export const DISPLAY_NAME_LIMIT = 24
+
 export function pairGetStatus() {
   return invoke<PairStatus>(INVOKE_KEY.PAIR_GET_STATUS)
 }

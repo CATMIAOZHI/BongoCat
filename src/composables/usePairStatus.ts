@@ -61,7 +61,8 @@ export function usePairStatus() {
     store.runtime.plaintext = store.settings.enabled && (status.plaintext ?? false)
     store.runtime.relayUrl = status.relayUrl ?? void 0
     store.runtime.peerOnline = status.peerOnline
-    store.runtime.peerName = status.peerName ?? void 0
+    // `|| void 0`：对面清空昵称时 Rust 那份是 `Some("")`，别让它以空串的形态留在 store 里
+    store.runtime.peerName = status.peerName || void 0
     store.runtime.remotePresence = status.peerOnline
       ? (status.remotePresence ?? 'active')
       : 'offline'
@@ -91,8 +92,11 @@ export function usePairStatus() {
     store.runtime.remotePresence = payload.state
     store.runtime.remotePresenceMessage = payload.message || void 0
 
-    if (payload.displayName) {
-      store.runtime.peerName = payload.displayName
+    // 昵称是跟着 presence 帧来的（协议里没有独立的字段），对端**改名**、**清空**都靠这一句：
+    // 清空时对面发的是空串，只有把 `undefined`（老客户端根本不带这个字段）和空串分开处理，
+    // 才不会让旧名字一直挂在聊天窗口标题和对方猫上。
+    if (payload.displayName !== void 0) {
+      store.runtime.peerName = payload.displayName || void 0
     }
   })
 

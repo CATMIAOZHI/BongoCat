@@ -13,6 +13,7 @@ import ProListItem from '@/components/pro-list-item/index.vue'
 import ProList from '@/components/pro-list/index.vue'
 import {
   ATTACHMENT_MAX_MB,
+  DISPLAY_NAME_LIMIT,
   pairConnect,
   pairDeleteSecret,
   pairDeleteServerPassword,
@@ -33,6 +34,7 @@ import {
 import { chatExportFileName } from '@/composables/usePairChat'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
 import { setChatVisible, setRemoteCatVisible } from '@/composables/usePairOverlay'
+import { usePairSettingDraft } from '@/composables/usePairSettingDraft'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
 import { useModelStore } from '@/stores/model'
@@ -752,68 +754,39 @@ const canPreviewSound = computed(
 )
 
 /**
- * 暂离举牌文字的草稿，以及为什么必须用草稿。
+ * 跨窗口的文本设置都要「草稿 + 保存」，机制与理由全在 `usePairSettingDraft`：直接绑
+ * store 会被别的窗口带旧值的整份状态盖回去，表现就是打字时闪、丢字、打起来卡。
  *
- * pair store 在几个窗口之间同步，而同步是**整份状态**：任何窗口只要改了自己那份里的
- * 任何东西，就会把自己的整份 `settings` patch 给后端。猫咪窗口恰恰每敲一次键、每点一下
- * 鼠标都在改统计（`stats`），于是「用户在偏好页打字」这条路上，每个按键都会有一帧**带着
- * 旧 `away.message`** 的状态发出去，并且通常会盖在刚打的字后面。直接 `v-model` 绑到 store
- * 上时，表现就是「输入框里的字会闪、丢字、打起来卡」——和用户之前报的服务器地址是同一个
- * 病根（R40 / R45 就是因此改成草稿的），暂离文字当时漏了。
- *
- * 所以这里：输入框只认草稿，点「保存」才写进 store；草稿一旦被用户改过就不再被 store 回填。
+ * 这里有两项：暂离举牌文字，和「我的昵称」。
  */
-const awayMessageInput = ref(pairStore.settings.away.message)
-/**
- * 草稿是否已经「归草稿所有」：回填只在这一位还是 false 时发生。
- *
- * 一次回填之后就置 true——包含初次从 store 载入的那一跳（那一跳草稿与 store 同值，
- * 所以判断的是「草稿变过」而不是「用户动过」）。之后一律以草稿为准，别的窗口的旧值
- * 再也进不来。全仓库只有偏好页会写 `away.message`，所以不再跟随 store 是安全的。
- */
-const awayMessageDraftOwned = ref(false)
-/** 刚保存的值；保存后的守护窗口里它被别的窗口盖回来就再写一次（见下面的 watch） */
-let awayMessageSaved = ''
-let awayMessageGuardUntil = 0
-/**
- * 保存后的守护时长。
- *
- * 带旧值的那一帧常常比我们的保存帧**晚**到后端，于是「谁最后发谁赢」会把刚保存的值顶掉：
- * 盘上留下旧文字，对面猫头上的牌子也不跟着变。人一停手，猫咪窗口就不再发帧了，所以在这段
- * 时间里把它写回去就能定下来。
- */
-const AWAY_MESSAGE_GUARD_MS = 2000
-
-const awayMessageDirty = computed(
-  () => awayMessageInput.value !== pairStore.settings.away.message,
+const {
+  input: awayMessageInput,
+  dirty: awayMessageDirty,
+  save: handleSaveAwayMessage,
+} = usePairSettingDraft(
+  () => pairStore.settings.away.message,
+  (value) => {
+    pairStore.settings.away.message = value
+  },
 )
 
-/** 还没被用户碰过时才回填（store 是异步载入的，落在组件挂载之后） */
-watch(() => pairStore.settings.away.message, (value) => {
-  if (awayMessageDraftOwned.value) return
-
-  awayMessageInput.value = value
-})
-
-watch(awayMessageInput, () => {
-  awayMessageDraftOwned.value = true
-})
-
-function handleSaveAwayMessage() {
-  awayMessageSaved = awayMessageInput.value
-  awayMessageGuardUntil = Date.now() + AWAY_MESSAGE_GUARD_MS
-
-  pairStore.settings.away.message = awayMessageSaved
-}
-
-/** 保存后被盖回来就再写一次；写回同一个值不会再触发自己（下一轮 value 已经相等） */
-watch(() => pairStore.settings.away.message, (value) => {
-  if (Date.now() > awayMessageGuardUntil) return
-  if (awayMessageInput.value !== awayMessageSaved) return
-  if (value === awayMessageSaved) return
-
-  pairStore.settings.away.message = awayMessageSaved
-})
+/**
+ * 「我的昵称」：对方在聊天窗口标题和对方猫底部看到的就是它，留空就回落到「对方」。
+ *
+ * 保存时去掉首尾空格，并按**码点**截断到 `DISPLAY_NAME_LIMIT`（emoji 不会被劈成两半）。
+ * 送到对面是 `usePairState` 的事：保存后它会重发一次 presence。
+ */
+const {
+  input: displayNameInput,
+  dirty: displayNameDirty,
+  save: handleSaveDisplayName,
+} = usePairSettingDraft(
+  () => pairStore.settings.identity.displayName,
+  (value) => {
+    pairStore.settings.identity.displayName = value
+  },
+  value => [...value.trim()].slice(0, DISPLAY_NAME_LIMIT).join(''),
+)
 </script>
 
 <template>
@@ -1027,6 +1000,47 @@ watch(() => pairStore.settings.away.message, (value) => {
 
         <span class="font-mono">{{ pairStore.secretFingerprint }}</span>
       </Flex>
+    </ProListItem>
+
+    <!--
+      昵称是「我是谁」，不是「对方是谁」：填在这里，对方在他的聊天窗口标题和对方猫上看到。
+      和暂离文字同一套「草稿 + 保存」——直接绑 store 会被别的窗口带旧值的整份状态盖回去。
+    -->
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.displayName')"
+      :title="$t('pages.preference.pair.labels.displayName')"
+      vertical
+    >
+      <Flex
+        align="center"
+        class="w-full"
+        gap="small"
+        wrap
+      >
+        <Input
+          v-model:value="displayNameInput"
+          class="w-56"
+          :maxlength="DISPLAY_NAME_LIMIT"
+          :placeholder="$t('pages.preference.pair.placeholders.displayName')"
+          @press-enter="handleSaveDisplayName"
+        />
+
+        <Button
+          :disabled="!displayNameDirty"
+          type="primary"
+          @click="handleSaveDisplayName"
+        >
+          {{ $t('pages.preference.pair.buttons.save') }}
+        </Button>
+      </Flex>
+
+      <Alert
+        v-if="displayNameDirty"
+        class="w-full"
+        :message="$t('pages.preference.pair.hints.credentialUnsaved')"
+        show-icon
+        type="info"
+      />
     </ProListItem>
 
     <ProListItem

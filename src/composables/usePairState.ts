@@ -194,7 +194,9 @@ export function usePairState() {
     void pairSendPresence(
       presence,
       message || void 0,
-      store.settings.identity.displayName.trim() || void 0,
+      // 昵称永远带上，哪怕是空串：对方据此区分「还没收到过我的名字」和「我把名字清空了」，
+      // 后者要把他那边的旧名字也清掉（见 usePairStatus 与 Rust 侧 peer_name）
+      store.settings.identity.displayName.trim(),
     ).catch(() => void 0)
   }
 
@@ -402,6 +404,17 @@ export function usePairState() {
    */
   watch(() => store.settings.away.message, () => {
     if (store.settings.presence === 'away') sendPresence('away')
+  })
+
+  /**
+   * 改了自己的昵称：立刻重发一次 presence。
+   *
+   * 昵称没有独立的线上字段，它只搭 presence 这趟车（`PresencePayload.displayName`）；
+   * 不重发的话对方要等到下次切暂离或重连才看到新名字。这里不限制 presence 是不是
+   * `away`：`active` 那一条也带着昵称，对方收到就更新。
+   */
+  watch(() => store.settings.identity.displayName, () => {
+    sendPresence(store.settings.presence)
   })
 
   watch(() => store.settings.privacy.pauseActivitySync, (paused) => {

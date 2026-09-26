@@ -244,6 +244,7 @@
           "relayUrl": "服务器地址",
           "serverPassword": "服务器密码",
           "pairSecret": "配对密码",
+          "displayName": "我的昵称",
           "autoConnect": "自动连接",
           "status": "连接状态",
           "lastError": "最近一次错误",
@@ -297,6 +298,7 @@
           "errorHowTo": "多半就是这三种：地址填错了 / 密码不对 / 服务器没开。",
           "relayUrl": "双方共同使用的联机服务器地址，例如 cat.example.com。没有证书的自建服务器可以直接填 IP，例如 123.123.123.123:8080。自己部署的话，就是部署时输出的那串。",
           "pairSecret": "你们俩约定的同一条密码：两边填成一样，就会进入同一个双人会话。可以向对方要，也可以点「生成配对密码」再发过去。保存在系统凭据库里。",
+          "displayName": "对方在聊天窗口标题和对方猫上看到的就是这个名字。改完点「保存」，对方那边立刻更新；留空就显示「对方」。",
           "retryAfterSave": "已更新，点「立即连接」再试",
           "serverPasswordSaved": "服务器密码已保存",
           "relayUrlSaved": "服务器地址已保存",
@@ -360,6 +362,7 @@
           "relayUrl": "cat.example.com 或 123.123.123.123:8080",
           "serverPassword": "部署服务器时设置的密码",
           "pairSecret": "粘贴配对密码",
+          "displayName": "比如：小猫咪",
           "remoteModel": "与本机相同",
           "awayMessage": "去吃饭啦"
         },

@@ -586,7 +586,8 @@ function handleMouseDown() {
       class="absolute inset-x-0 bottom-0 flex justify-center pb-0.5 transition-opacity"
       :class="{ 'group-hover:opacity-0': remoteStats && pairStore.settings.remoteCat.showStats && !pairStore.settings.remoteCat.passThrough }"
     >
-      <span class="text-[9px] color-[#ffffff80]">{{ pairStore.runtime.peerName }}</span>
+      <!-- 昵称是对面自己填的，长度不可控：窗口只有这么宽，长了就省略号，别把窗口撑变形 -->
+      <span class="max-w-full truncate px-1 text-[9px] color-[#ffffff80]">{{ pairStore.runtime.peerName }}</span>
     </div>
 
     <div
