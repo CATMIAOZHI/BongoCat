@@ -118,9 +118,10 @@ jobs:
 # 以后想恢复「安装包 + 自动更新」的完整分发（四步）：
 #   1. 生成本仓库自用的密钥对：`pnpm tauri signer generate -w $HOME/.tauri/bongocat.key`
 #   2. 把生成的**公钥**填进 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`
-#      （现在是上游的公钥，与自己的私钥不匹配，tauri 会直接拒绝）
+#      （本 fork 已移除旧更新源、公钥与 updater 注册，需恢复插件和 capability）
 #   3. 在仓库 Settings → Secrets 里加 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）
 #      与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（私钥没设密码就留空）
 #   4. 去掉上面的 `--no-sign`、把 `uploadUpdaterJson` 改回 `true`，
 #      并把 `plugins.updater.endpoints` 指向本仓库的
-#      `releases/latest/download/latest.json`（现在指的是上游，装了这个包会拉到上游版本）
+#      `releases/latest/download/latest.json`；前端更新流程也需改为签名安装。
+#      当前前端只检查本仓库正式客户端 Release，并打开下载页让用户手动安装。

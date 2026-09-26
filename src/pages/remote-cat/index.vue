@@ -19,6 +19,7 @@ import { getSupportedKey, useModel } from '@/composables/useModel'
 import { defaultSnapshot, sanitizeSnapshot } from '@/composables/usePairActivity'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
 import { usePairStatus } from '@/composables/usePairStatus'
+import { usePeerModel } from '@/composables/usePeerModel'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
@@ -64,6 +65,8 @@ const POINTER_EPSILON = 0.001
 const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
 const modelStore = useModelStore()
+const peerModel = usePeerModel()
+const modelLoadFailed = ref(false)
 const { handleMouseRatio, handleKeyChange, handleMouseChange, handlePress, handleRelease } = useModel()
 
 usePairStatus()
@@ -98,19 +101,6 @@ let soundFailed = false
  * 猫咪窗口的按键贴图改坏（R11）。
  */
 const appliedRemoteKeys = new Set<string>()
-
-/** 默认和本机用同一个模型（§22），也可以在偏好页里单独指定 */
-function remoteModel() {
-  const { modelId } = pairStore.settings.remoteCat
-
-  if (modelId) {
-    const matched = modelStore.models.find(model => model.id === modelId)
-
-    if (matched) return matched
-  }
-
-  return modelStore.currentModel
-}
 
 const isOnline = () => pairStore.runtime.peerOnline
 
@@ -198,11 +188,34 @@ useEventListener('resize', () => {
   debouncedResize()
 })
 
+let loadingModel = false
+let reloadModel = false
+
+// presence、模型列表和当前模型可能一起改变；串行加载，避免旧异步结果盖掉新模型。
 async function loadModel() {
-  const model = remoteModel()
+  reloadModel = true
+  if (loadingModel) return
 
-  if (!model) return
+  loadingModel = true
+  try {
+    while (reloadModel) {
+      reloadModel = false
+      modelLoadFailed.value = false
+      const model = peerModel.selected.value
+      if (!model) continue
+      const loaded = await loadModelOnce(model)
+      if (!loaded && peerModel.automatic.value) {
+        modelLoadFailed.value = true
+        const fallback = modelStore.currentModel
+        if (fallback && fallback.path !== model.path) await loadModelOnce(fallback)
+      }
+    }
+  } finally {
+    loadingModel = false
+  }
+}
 
+async function loadModelOnce(model: Model) {
   modelReady.value = false
 
   try {
@@ -222,8 +235,10 @@ async function loadModel() {
       : void 0
 
     await applySize()
+    return true
   } catch (reason) {
     error(String(reason))
+    return false
   } finally {
     modelReady.value = true
   }
@@ -430,11 +445,13 @@ watch(() => pairStore.settings.remoteCat.visible, (visible) => {
   }
 })
 
-watch(() => pairStore.settings.remoteCat.modelId, loadModel)
+watch(() => {
+  const model = peerModel.selected.value
+  return model ? `${model.id}:${model.path}:${model.mode}` : ''
+}, loadModel)
 
-// 没有单独指定模型时跟随本机模型（本机换模型会经 tauri-pinia 同步过来）
 watch(() => modelStore.currentModel, () => {
-  if (!pairStore.settings.remoteCat.modelId) void loadModel()
+  if (modelLoadFailed.value && peerModel.automatic.value) void loadModel()
 })
 
 watch(() => pairStore.settings.remoteCat.scale, applySize)
@@ -540,6 +557,16 @@ function handleMouseDown() {
       ref="flash"
       class="pointer-events-none absolute inset-0 bg-[#ff7ac6] opacity-0"
     />
+
+    <div
+      v-if="peerModel.missing.value || modelLoadFailed"
+      class="pointer-events-none absolute inset-x-0 px-2 pt-1"
+      :class="pairStore.runtime.remotePresence === 'away' || notice ? 'top-10' : 'top-0'"
+    >
+      <div class="bg-black/80 px-2 py-1 text-[11px] text-white rounded-md">
+        {{ $t('pages.preference.pair.hints.missingPeerModel', { name: peerModel.peer.value?.name || $t('pages.preference.model.labels.unnamedModel') }) }}
+      </div>
+    </div>
 
     <div
       v-if="pairStore.runtime.remotePresence === 'away' && isOnline()"

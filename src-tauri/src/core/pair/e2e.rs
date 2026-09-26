@@ -305,6 +305,7 @@ async fn two_clients_exchange_encrypted_presence() {
                 state: PresenceState::Away,
                 message: Some("去吃饭啦".into()),
                 display_name: Some("A".into()),
+                model: None,
             })
             .unwrap(),
         )
@@ -416,6 +417,7 @@ async fn two_rooms_share_one_relay_without_crossing() {
                     state: PresenceState::Away,
                     message: Some(label.into()),
                     display_name: Some(label.into()),
+                    model: None,
                 })
                 .unwrap(),
             )

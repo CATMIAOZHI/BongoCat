@@ -1,6 +1,4 @@
-export const GITHUB_LINK = 'https://github.com/ayangweb/BongoCat'
-
-export const UPGRADE_LINK_ACCESS_KEY = 'xDbrq2rOoRThDqKOHL2ZRA'
+export const GITHUB_LINK = 'https://github.com/CATMIAOZHI/BongoCat'
 
 /**
  * 聊天浮层（R39）占猫咪窗口的高度比例：**相对模型高度**。

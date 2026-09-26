@@ -24,6 +24,8 @@ const modelSync = createBackendSyncGuard(MODEL_LOCAL_STATE_KEYS)
 
 export interface Model {
   id: string
+  /** 导入前的目录名称；旧数据可在模型页补填，绝不使用存储目录的随机 ID。 */
+  name?: string
   path: string
   mode: ModelMode
   isPreset: boolean

@@ -1,6 +1,7 @@
 import { onMounted } from 'vue'
 
 import type { PairConnectionState } from '@/stores/pair'
+import type { PairModelIdentity } from '@/utils/pairModel'
 
 import { LISTEN_KEY } from '@/constants'
 import { usePairStore } from '@/stores/pair'
@@ -18,6 +19,7 @@ interface PresenceEventPayload {
   state: 'active' | 'away'
   message?: string
   displayName?: string
+  model?: PairModelIdentity
 }
 
 interface ErrorPayload {
@@ -63,6 +65,7 @@ export function usePairStatus() {
     store.runtime.peerOnline = status.peerOnline
     // `|| void 0`：对面清空昵称时 Rust 那份是 `Some("")`，别让它以空串的形态留在 store 里
     store.runtime.peerName = status.peerName || void 0
+    store.runtime.peerModel = status.peerModel ?? void 0
     store.runtime.remotePresence = status.peerOnline
       ? (status.remotePresence ?? 'active')
       : 'offline'
@@ -85,12 +88,14 @@ export function usePairStatus() {
     if (!payload.online) {
       store.runtime.remotePresence = 'offline'
       store.runtime.remotePresenceMessage = void 0
+      store.runtime.peerModel = void 0
     }
   })
 
   useTauriListen<PresenceEventPayload>(LISTEN_KEY.PAIR_PRESENCE, ({ payload }) => {
     store.runtime.remotePresence = payload.state
     store.runtime.remotePresenceMessage = payload.message || void 0
+    store.runtime.peerModel = payload.model
 
     // 昵称是跟着 presence 帧来的（协议里没有独立的字段），对端**改名**、**清空**都靠这一句：
     // 清空时对面发的是空串，只有把 `undefined`（老客户端根本不带这个字段）和空串分开处理，

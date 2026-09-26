@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import type { PairStatsPayload } from '@/stores/pair'
+import type { PairModelIdentity } from '@/utils/pairModel'
 
 import { INVOKE_KEY } from '@/constants'
 
@@ -13,6 +14,7 @@ export interface PairStatus {
   state: 'disabled' | 'disconnected' | 'connecting' | 'connected-peer-offline' | 'connected' | 'reconnecting' | 'error'
   peerOnline: boolean
   peerName?: string
+  peerModel?: PairModelIdentity
   remotePresence?: PresenceState
   remoteStats?: PairStatsPayload
   deviceId: string
@@ -37,6 +39,7 @@ export interface PairPresencePayload {
   state: PresenceState
   message?: string
   displayName?: string
+  model?: PairModelIdentity
 }
 
 /**
@@ -120,8 +123,8 @@ export function pairDisconnect() {
   return invoke<void>(INVOKE_KEY.PAIR_DISCONNECT)
 }
 
-export function pairSendPresence(presence: PresenceState, message?: string, displayName?: string) {
-  return invoke<void>(INVOKE_KEY.PAIR_SEND_PRESENCE, { presence, message, displayName })
+export function pairSendPresence(presence: PresenceState, message?: string, displayName?: string, model?: PairModelIdentity) {
+  return invoke<void>(INVOKE_KEY.PAIR_SEND_PRESENCE, { presence, message, displayName, model })
 }
 
 export function pairSendPetState(snapshot: PetSnapshot) {

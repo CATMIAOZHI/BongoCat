@@ -4,8 +4,8 @@
   "version": "1.2.1",
   "private": true,
   "author": {
-    "name": "ayangweb",
-    "email": "ayangweb@foxmail.com"
+    "name": "CATMIAOZHI",
+    "url": "https://github.com/CATMIAOZHI"
   },
   "scripts": {
     "dev": "run-s build:icon dev:vite",

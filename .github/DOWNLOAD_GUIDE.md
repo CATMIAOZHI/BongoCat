@@ -1,65 +1,12 @@
-# 下载指南
+# Windows 下载指南
 
-## 系统要求
+打开 [CATMIAOZHI/BongoCat Releases](https://github.com/CATMIAOZHI/BongoCat/releases)，选择 `v*` 客户端版本：
 
-- macOS 12 或更高版本。
-- Windows 10 或更高版本。
-- Linux 带有 X11 环境。
+- 大多数 Windows 电脑：`x64-setup.exe`。
+- Windows ARM 设备：`arm64-setup.exe`。
+- 32 位 Windows：`x86-setup.exe`。
 
-## macOS
+运行安装包，按提示安装。更新前退出正在运行的 BongoCat。
 
-### 手动下载
-
-- Apple Silicon：下载 `BongoCat_aarch64.dmg`
-- Intel Chip：下载 `BongoCat_x64.dmg`
-
-### Homebrew 下载
-
-1. 添加 BongoCat 的 tap 源：
-
-```bash
-brew tap ayangweb/BongoCat
-```
-
-2. 安装：
-
-```bash
-brew install --no-quarantine bongo-cat
-```
-
-3. 更新：
-
-```bash
-brew upgrade bongo-cat
-```
-
-4. 卸载：
-
-```bash
-brew uninstall --cask bongo-cat
-
-brew untap ayangweb/BongoCat
-```
-
-## Windows
-
-- 64 位系统：下载 `BongoCat_x64.exe`
-- 32 位系统：下载 `BongoCat_x86.exe`
-- ARM64 架构：下载 `BongoCat_arm64.exe`
-
-## Linux(X11)
-
-### 手动下载
-
-- 64 位系统：
-  - Debian / Ubuntu：下载 `BongoCat_amd64.deb`
-  - Fedora / RHEL：下载 `BongoCat_x86_64.rpm`
-  - 通用版本：下载 `BongoCat_amd64.AppImage`
-- ARM64 架构：
-  - Debian / Ubuntu：下载 `BongoCat_arm64.deb`
-  - Fedora / RHEL：下载 `BongoCat_aarch64.rpm`
-  - 通用版本：下载 `BongoCat_aarch64.AppImage`
-
-### AUR 下载
-
-- Manjaro / ArchLinux: `yay -S bongo-cat`
+本 fork 目前只发布 Windows 安装包。`relay-v*` 是服务器发布，不是桌面客户端。
+自用安装包未做代码签名，请确认来自本仓库的 Release。

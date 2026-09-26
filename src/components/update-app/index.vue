@@ -1,194 +1,85 @@
 <script setup lang="ts">
-import type { Update } from '@tauri-apps/plugin-updater'
-
-import { relaunch } from '@tauri-apps/plugin-process'
-import { check } from '@tauri-apps/plugin-updater'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { useIntervalFn } from '@vueuse/core'
-import { Flex, message, Modal } from 'antdv-next'
-import dayjs from 'dayjs'
-import utc from 'dayjs/plugin/utc'
-import { computed, reactive, watch } from 'vue'
+import { message, Modal } from 'antdv-next'
+import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import VueMarkdown from 'vue-markdown-render'
 
 import { useTauriListen } from '@/composables/useTauriListen'
-import { GITHUB_LINK, LISTEN_KEY, UPGRADE_LINK_ACCESS_KEY } from '@/constants'
+import { GITHUB_LINK, LISTEN_KEY } from '@/constants'
 import { showWindow } from '@/plugins/window'
+import { useAppStore } from '@/stores/app'
 import { useGeneralStore } from '@/stores/general'
+import { latestClientTag } from '@/utils/releaseVersion'
 
-dayjs.extend(utc)
-
-interface State {
-  open: boolean
-  update?: Update
-  downloading: boolean
-  totalProgress?: number
-  downloadProgress: number
-}
-
-const generalStore = useGeneralStore()
-const state = reactive<State>({
-  open: false,
-  downloading: false,
-  downloadProgress: 0,
-})
-const MESSAGE_KEY = 'updatable'
+const general = useGeneralStore()
+const app = useAppStore()
 const { t } = useI18n()
+const open = ref(false)
+const nextTag = ref('')
+let checking = false
 
-const { pause, resume } = useIntervalFn(checkUpdate, 1000 * 60 * 60 * 24)
+// 自用包未签名：只检查本 fork 的客户端版本，下载由用户在 Releases 中选择。
+async function checkUpdate(manual = false) {
+  if (checking) return
+  checking = true
+  if (manual) message.loading({ key: 'update', duration: 0, content: t('components.updateApp.hints.checkingUpdates') })
 
-watch(() => generalStore.update.autoCheck, (value) => {
-  pause()
-
-  if (!value) return
-
-  checkUpdate()
-
-  resume()
-}, { immediate: true })
-
-useTauriListen<boolean>(LISTEN_KEY.UPDATE_APP, () => {
-  checkUpdate(true)
-
-  message.loading({
-    key: MESSAGE_KEY,
-    duration: 0,
-    content: t('components.updateApp.hints.checkingUpdates'),
-  })
-})
-
-const downloadProgress = computed(() => {
-  const { downloadProgress, totalProgress } = state
-
-  if (!totalProgress) return '0%'
-
-  const progress = ((downloadProgress / totalProgress) * 100).toFixed(2)
-
-  return `${progress}%`
-})
-
-async function checkUpdate(visibleMessage = false) {
   try {
-    const update = await check({
-      timeout: 5000,
-      headers: {
-        'X-AccessKey': UPGRADE_LINK_ACCESS_KEY,
-      },
+    const response = await fetch('https://api.github.com/repos/CATMIAOZHI/BongoCat/releases?per_page=100', {
+      signal: AbortSignal.timeout(10000),
+      headers: { Accept: 'application/vnd.github+json' },
     })
-
-    if (update) {
-      const { version, currentVersion, body = '', date, downloadAndInstall } = update
-
-      state.update = Object.assign(update, {
-        version: `v${version}`,
-        currentVersion: `v${currentVersion}`,
-        body: replaceBody(body),
-        date: dayjs.utc(date?.split('.')[0]).local().format('YYYY-MM-DD HH:mm:ss'),
-        downloadAndInstall: downloadAndInstall.bind(update),
-      })
-
-      showWindow()
-
-      state.open = true
-
-      message.destroy(MESSAGE_KEY)
-    } else if (visibleMessage) {
-      message.success({ key: MESSAGE_KEY, content: t('components.updateApp.hints.alreadyLatest') })
+    if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`)
+    const tag = latestClientTag(await response.json(), app.version)
+    if (tag) {
+      nextTag.value = tag
+      open.value = true
+      await showWindow()
+      message.destroy('update')
+    } else if (manual) {
+      message.success({ key: 'update', content: t('components.updateApp.hints.alreadyLatest') })
     }
-  } catch (error) {
-    if (!visibleMessage) return
-
-    message.error({ key: MESSAGE_KEY, content: String(error) })
+  } catch {
+    if (manual) {
+      message.warning({ key: 'update', content: t('components.updateApp.hints.openReleases') })
+      await openUrl(`${GITHUB_LINK}/releases`).catch(() => void 0)
+    }
+  } finally {
+    checking = false
   }
 }
 
-function replaceBody(body: string) {
-  return body
-    .replace(/&nbsp;/g, '')
-    .split('\n')
-    .map(line => line.replace(/\s*-\s+by\s+@.*/, ''))
-    .join('\n')
-}
+const { pause, resume } = useIntervalFn(() => checkUpdate(), 86400000, { immediate: false })
+watch(() => general.update.autoCheck, (enabled) => {
+  pause()
+  if (enabled) {
+    void checkUpdate()
+    resume()
+  }
+}, { immediate: true })
 
-async function handleOk() {
+useTauriListen(LISTEN_KEY.UPDATE_APP, () => void checkUpdate(true))
+
+async function download() {
   try {
-    state.downloading = true
-
-    await state.update?.downloadAndInstall((progress) => {
-      switch (progress.event) {
-        case 'Started':
-          state.totalProgress = progress.data.contentLength ?? 0
-          break
-        case 'Progress':
-          state.downloadProgress += progress.data.chunkLength
-          break
-      }
-    })
-
-    relaunch()
-  } catch (error) {
-    message.error(String(error))
-  } finally {
-    Object.assign(state, {
-      downloading: false,
-      downloadProgress: 0,
-    })
+    await openUrl(`${GITHUB_LINK}/releases/tag/${encodeURIComponent(nextTag.value)}`)
+    open.value = false
+  } catch (reason) {
+    message.error(String(reason))
   }
 }
 </script>
 
 <template>
   <Modal
-    v-model:open="state.open"
+    v-model:open="open"
     :cancel-text="$t('components.updateApp.buttons.updateLater')"
-    centered
-    :closable="false"
-    :mask-closable="false"
+    :ok-text="$t('components.updateApp.buttons.openDownload')"
     :title="$t('components.updateApp.title')"
-    @ok="handleOk"
+    @ok="download"
   >
-    <template #okText>
-      {{ state.downloading ? downloadProgress : $t('components.updateApp.buttons.updateNow') }}
-    </template>
-
-    <Flex
-      class="pt-1"
-      gap="small"
-      vertical
-    >
-      <Flex align="center">
-        <span>{{ $t('components.updateApp.labels.updateVersion') }}</span>
-        <span>
-          <span>{{ state.update?.currentVersion }} 👉 </span>
-          <a
-            :href="`${GITHUB_LINK}/releases/tag/${state.update?.version}`"
-          >
-            {{ state.update?.version }}
-          </a>
-        </span>
-      </Flex>
-
-      <Flex align="center">
-        <span>{{ $t('components.updateApp.labels.updateTime') }}</span>
-        <span>{{ state.update?.date }}</span>
-      </Flex>
-
-      <Flex vertical>
-        <span>{{ $t('components.updateApp.labels.changelog') }}</span>
-
-        <VueMarkdown
-          class="update-note max-h-40 overflow-auto"
-          :source="state.update?.body ?? ''"
-        />
-      </Flex>
-    </Flex>
+    <p>{{ app.version }} → {{ nextTag }}</p>
+    <p>{{ $t('components.updateApp.hints.manualInstall') }}</p>
   </Modal>
 </template>
-
-<style lang="scss" scoped>
-.update-note {
-  :not(a) {
-    all: revert;
-  }
-}
-</style>

@@ -242,11 +242,13 @@ pub async fn pair_send_presence(
     presence: PresenceState,
     message: Option<String>,
     display_name: Option<String>,
+    model: Option<protocol::PeerModelIdentity>,
 ) -> Result<(), String> {
     let payload = serde_json::to_value(PresencePayload {
         state: presence,
         message,
         display_name,
+        model,
     })
     .map_err(|err| format!("序列化 presence 失败: {err}"))?;
 

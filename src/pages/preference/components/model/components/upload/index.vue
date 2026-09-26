@@ -84,6 +84,7 @@ watch(selectPaths, async (paths) => {
 
       modelStore.models.push({
         id,
+        name: fromPath.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop() ?? '',
         path: toPath,
         mode,
         isPreset: false,

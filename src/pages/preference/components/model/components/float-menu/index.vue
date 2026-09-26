@@ -1,44 +1,19 @@
 <script setup lang="ts">
-import { EditOutlined, MenuOutlined, SyncOutlined, UnorderedListOutlined } from '@antdv-next/icons'
+import { QuestionOutlined } from '@antdv-next/icons'
 import { openUrl } from '@tauri-apps/plugin-opener'
-import { FloatButton, FloatButtonGroup } from 'antdv-next'
+import { FloatButton } from 'antdv-next'
+
+import { GITHUB_LINK } from '@/constants'
 </script>
 
 <template>
-  <FloatButtonGroup
+  <FloatButton
     class="bottom-4 right-4"
-    trigger="click"
-    type="primary"
+    :tooltip="$t('pages.preference.model.tooltips.modelGuide')"
+    @click="openUrl(`${GITHUB_LINK}#模型`)"
   >
     <template #icon>
-      <MenuOutlined />
+      <QuestionOutlined />
     </template>
-
-    <FloatButton
-      :tooltip="$t('pages.preference.model.tooltips.createModel')"
-      @click="openUrl('https://juejin.cn/post/7509872655802269731')"
-    >
-      <template #icon>
-        <EditOutlined />
-      </template>
-    </FloatButton>
-
-    <FloatButton
-      :tooltip="$t('pages.preference.model.tooltips.convertModel')"
-      @click="openUrl('https://bongocat.vteamer.cc')"
-    >
-      <template #icon>
-        <SyncOutlined />
-      </template>
-    </FloatButton>
-
-    <FloatButton
-      :tooltip="$t('pages.preference.model.tooltips.moreModels')"
-      @click="openUrl('https://github.com/ayangweb/Awesome-BongoCat')"
-    >
-      <template #icon>
-        <UnorderedListOutlined />
-      </template>
-    </FloatButton>
-  </FloatButtonGroup>
+  </FloatButton>
 </template>

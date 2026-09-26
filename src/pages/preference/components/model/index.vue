@@ -3,7 +3,7 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { remove } from '@tauri-apps/plugin-fs'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { useElementSize } from '@vueuse/core'
-import { Card, Masonry, message, Popconfirm } from 'antdv-next'
+import { Card, Input, Masonry, message, Modal, Popconfirm } from 'antdv-next'
 import { computed, ref, useTemplateRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -23,6 +23,27 @@ const firstCardRef = useTemplateRef('firstCard')
 const { height } = useElementSize(firstCardRef)
 const { t } = useI18n()
 const openBehaviorModal = ref(false)
+const namingModel = ref<string>()
+const nameDraft = ref('')
+
+function editName(model: Model) {
+  namingModel.value = model.id
+  nameDraft.value = model.name ?? ''
+}
+
+function saveName() {
+  const name = nameDraft.value.trim()
+  if (!name || /[/\\]/.test(name) || Array.from(name).length > 255) {
+    message.warning(t('pages.preference.model.hints.modelNameRequired'))
+    return
+  }
+  const model = modelStore.models.find(item => item.id === namingModel.value)
+  if (model) {
+    model.name = name
+    if (modelStore.currentModel?.id === model.id) modelStore.currentModel = { ...model }
+  }
+  namingModel.value = void 0
+}
 
 const masonryItems = computed(() => {
   const items = modelStore.models.map((item) => {
@@ -83,6 +104,14 @@ async function handleDelete(item: Model) {
         size="small"
         @click="handleToggle(data)"
       >
+        <template #title>
+          <span
+            class="block truncate"
+            :title="data.name || data.mode"
+          >
+            {{ data.isPreset ? data.mode : data.name || $t('pages.preference.model.labels.unnamedModel') }}
+          </span>
+        </template>
         <template #cover>
           <img
             alt="example"
@@ -108,6 +137,14 @@ async function handleDelete(item: Model) {
           />
 
           <template v-if="!data.isPreset">
+            <button
+              :aria-label="$t('pages.preference.model.labels.modelName')"
+              :title="$t('pages.preference.model.labels.modelName')"
+              type="button"
+              @click.stop="editName(data)"
+            >
+              <i class="i-lucide:pencil" />
+            </button>
             <Popconfirm
               :description="$t('pages.preference.model.hints.deleteModel')"
               placement="topRight"
@@ -126,6 +163,22 @@ async function handleDelete(item: Model) {
   </Masonry>
 
   <FloatMenu />
+
+  <Modal
+    :open="!!namingModel"
+    :title="$t('pages.preference.model.labels.modelName')"
+    @cancel="namingModel = undefined"
+    @ok="saveName"
+  >
+    <p class="mb-3">
+      {{ $t('pages.preference.model.hints.modelName') }}
+    </p>
+    <Input
+      v-model:value="nameDraft"
+      :maxlength="255"
+      @press-enter="saveName"
+    />
+  </Modal>
 
   <BehaviorModal
     v-if="catStore.model.behavior"

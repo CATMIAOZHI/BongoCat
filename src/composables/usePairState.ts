@@ -7,6 +7,7 @@ import { useModelStore } from '@/stores/model'
 import { usePairStore } from '@/stores/pair'
 import { markPairStatsLoaded, usePairStatsStore } from '@/stores/pairStats'
 import { shouldSendKeepAlive } from '@/utils/keepAlive'
+import { modelIdentity } from '@/utils/pairModel'
 import { isWindows } from '@/utils/platform'
 
 import type { PresenceState } from './usePair'
@@ -197,6 +198,7 @@ export function usePairState() {
       // 昵称永远带上，哪怕是空串：对方据此区分「还没收到过我的名字」和「我把名字清空了」，
       // 后者要把他那边的旧名字也清掉（见 usePairStatus 与 Rust 侧 peer_name）
       store.settings.identity.displayName.trim(),
+      modelIdentity(modelStore.currentModel),
     ).catch(() => void 0)
   }
 
@@ -416,6 +418,10 @@ export function usePairState() {
   watch(() => store.settings.identity.displayName, () => {
     sendPresence(store.settings.presence)
   })
+
+  watch(() => modelIdentity(modelStore.currentModel), () => {
+    sendPresence(store.settings.presence)
+  }, { deep: true })
 
   watch(() => store.settings.privacy.pauseActivitySync, (paused) => {
     if (paused) {

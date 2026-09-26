@@ -232,6 +232,17 @@ pub struct PresencePayload {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<PeerModelIdentity>,
+}
+
+/// Small metadata only. Never contains file contents or a local filesystem path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerModelIdentity {
+    pub name: String,
+    pub mode: String,
+    pub is_preset: bool,
 }
 
 /// `chat.text` 的载荷（§31）。`message_id` 由发送方生成，也是本地库里的主键。
@@ -737,6 +748,22 @@ impl RecentMessageIds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_model_metadata_is_optional_and_contains_no_files() {
+        let legacy: PresencePayload =
+            serde_json::from_str(r#"{"state":"active","displayName":"cat"}"#).unwrap();
+        assert!(legacy.model.is_none());
+        let presence: PresencePayload = serde_json::from_str(
+            r#"{"state":"active","model":{"name":"小猫","mode":"standard","isPreset":false}}"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(presence).unwrap();
+        assert_eq!(value["model"]["name"], "小猫");
+        assert_eq!(value["model"].as_object().unwrap().len(), 3);
+        assert!(value["model"].get("path").is_none());
+        assert!(value["model"].get("id").is_none());
+    }
 
     #[test]
     fn header_round_trip() {

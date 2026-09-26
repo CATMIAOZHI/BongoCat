@@ -185,15 +185,20 @@
       "model": {
         "title": "Model",
         "labels": {
-          "deleteModel": "Delete Model"
+          "deleteModel": "Delete Model",
+          "modelName": "Model name",
+          "unnamedModel": "Unnamed model"
         },
         "hints": {
           "deleteSuccess": "Deleted Successfully",
+          "modelName": "Both peers need matching model names. Use the pencil on the model card to name older imports without importing again.",
+          "modelNameRequired": "Enter a model name (up to 255 characters, without slashes).",
           "deleteModel": "Are you sure you want to delete this model?",
           "importSuccess": "Imported Successfully",
           "clickOrDragToImport": "Click or drag here to import"
         },
         "tooltips": {
+          "modelGuide": "Model import and sync guide",
           "createModel": "Create Model",
           "convertModel": "Convert Model",
           "moreModels": "More Models"
@@ -252,6 +257,7 @@
           "remoteCatSettings": "Remote Cat",
           "showRemoteCat": "Show Remote Cat",
           "remoteModel": "Remote Cat Model",
+          "syncModel": "Follow peer's model",
           "remoteStats": "Show Partner's Input Stats",
           "windowSize": "Window Size",
           "opacity": "Opacity",
@@ -292,6 +298,8 @@
         },
         "hints": {
           "enabled": "Once on, fill in the three values below and press Connect. Turning it off disconnects immediately and stops all data sharing.",
+          "syncModel": "Shares model names only, never files. Import the peer's model locally and give it the same name. Missing models fall back to your own. Name older imports using the pencil on the Models page. Both clients need an updated version.",
+          "missingPeerModel": "Peer model “{name}” is missing or unavailable. Using your model. Place their model files locally and import them; for existing imports, set matching names on the Models page.",
           "connectSteps": "The order is: fill in the three values above → press Connect → then turn on \"Partner's Cat\" and \"Chat Window\" further down (both start off).",
           "missingRelayUrl": "The server address is still missing: type it into \"Server Address\" (or ask your partner for it), then press Connect.",
           "missingSecret": "The pairing key is still missing: it must match your partner's, and goes into \"Pairing Key\".",
@@ -439,10 +447,13 @@
       },
       "hints": {
         "checkingUpdates": "Checking for updates...",
+        "openReleases": "Could not check for updates. Trying to open this fork's releases.",
+        "manualInstall": "Open CATMIAOZHI/BongoCat releases, choose your installer and install it manually.",
         "alreadyLatest": "Already on the latest version 🎉"
       },
       "buttons": {
         "updateNow": "Update Now",
+        "openDownload": "Open Downloads",
         "updateLater": "Update Later"
       }
     }

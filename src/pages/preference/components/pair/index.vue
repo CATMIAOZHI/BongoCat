@@ -35,6 +35,7 @@ import { chatExportFileName } from '@/composables/usePairChat'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
 import { setChatVisible, setRemoteCatVisible } from '@/composables/usePairOverlay'
 import { usePairSettingDraft } from '@/composables/usePairSettingDraft'
+import { usePeerModel } from '@/composables/usePeerModel'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
 import { useModelStore } from '@/stores/model'
@@ -44,6 +45,7 @@ import { usePairStatsStore } from '@/stores/pairStats'
 const pairStore = usePairStore()
 const pairStatsStore = usePairStatsStore()
 const modelStore = useModelStore()
+const peerModel = usePeerModel()
 const { t } = useI18n()
 const secretInput = ref('')
 const serverPasswordInput = ref('')
@@ -390,7 +392,7 @@ const modelOptions = computed(() => {
     const current = model.id === modelStore.currentModel?.id
 
     return {
-      label: current ? `${model.mode} ✓` : model.mode,
+      label: `${model.name || model.mode}${current ? ' ✓' : ''}`,
       value: model.id,
     }
   })
@@ -1169,6 +1171,26 @@ const {
 
   <ProList :title="$t('pages.preference.pair.labels.remoteCatSettings')">
     <ProListItem
+      :description="$t('pages.preference.pair.hints.syncModel')"
+      :title="$t('pages.preference.pair.labels.syncModel')"
+    >
+      <Switch v-model:checked="pairStore.settings.remoteCat.syncModel" />
+    </ProListItem>
+    <Alert
+      v-if="modelStore.currentModel && !modelStore.currentModel.isPreset && !modelStore.currentModel.name"
+      class="mb-2"
+      :message="$t('pages.preference.model.hints.modelName')"
+      show-icon
+      type="warning"
+    />
+    <Alert
+      v-if="peerModel.missing.value"
+      class="mb-2"
+      :message="$t('pages.preference.pair.hints.missingPeerModel', { name: peerModel.peer.value?.name || $t('pages.preference.model.labels.unnamedModel') })"
+      show-icon
+      type="warning"
+    />
+    <ProListItem
       :description="$t('pages.preference.pair.hints.remoteCat')"
       :title="$t('pages.preference.pair.labels.showRemoteCat')"
     >
@@ -1186,6 +1208,7 @@ const {
         v-model:value="pairStore.settings.remoteCat.modelId"
         allow-clear
         class="w-40"
+        :disabled="peerModel.automatic.value"
         :options="modelOptions"
         :placeholder="$t('pages.preference.pair.placeholders.remoteModel')"
       />

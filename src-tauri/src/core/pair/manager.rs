@@ -131,6 +131,7 @@ pub struct PairStatus {
     pub state: PairConnectionState,
     pub peer_online: bool,
     pub peer_name: Option<String>,
+    pub peer_model: Option<super::protocol::PeerModelIdentity>,
     pub remote_presence: Option<PresenceState>,
     pub remote_stats: Option<InputStats>,
     pub device_id: String,
@@ -363,6 +364,7 @@ impl PairManager {
                 state: PairConnectionState::Disconnected,
                 peer_online: false,
                 peer_name: None,
+                peer_model: None,
                 remote_presence: None,
                 remote_stats: None,
                 device_id,
@@ -521,6 +523,7 @@ impl PairManager {
             status.state = PairConnectionState::Disconnected;
             status.peer_online = false;
             status.peer_name = None;
+            status.peer_model = None;
             status.remote_presence = None;
             status.remote_stats = None;
             // 会话没了，P2P 那条腿也跟着没了：不复位的话 UI 会一直显示「已直连」
@@ -814,6 +817,9 @@ impl PairManager {
             let mut status = Self::lock(&self.status);
 
             mutate(&mut status);
+            if !status.peer_online {
+                status.peer_model = None;
+            }
             status.clone()
         };
 
@@ -860,6 +866,7 @@ impl PairManager {
             status.state = PairConnectionState::Error;
             status.peer_online = false;
             status.peer_name = None;
+            status.peer_model = None;
             status.remote_presence = None;
             status.remote_stats = None;
             status.last_error = Some(message.clone());
@@ -3302,14 +3309,20 @@ fn handle_binary(
         }
         message_type::PRESENCE => {
             // 载荷不合法就丢掉：对端本来就不可信，不能让一条畸形消息把 UI 推进错误状态
-            let Ok(payload) = serde_json::from_value::<PresencePayload>(envelope.payload.clone())
+            let Ok(mut payload) = serde_json::from_value::<PresencePayload>(envelope.payload.clone())
             else {
                 return Ok(None);
             };
 
+            payload.model = payload.model.filter(|model| {
+                model.name.chars().count() <= 255
+                    && !model.name.contains(['/', '\\'])
+                    && matches!(model.mode.as_str(), "standard" | "keyboard" | "gamepad")
+            });
             manager.publish(generation, |status| {
                 status.remote_presence = Some(payload.state);
                 status.peer_name = payload.display_name.clone();
+                status.peer_model = payload.model.clone();
             });
 
             manager.sink.emit(

@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { reactive, ref } from 'vue'
 
 import type { P2pState, PresenceState } from '@/composables/usePair'
+import type { PairModelIdentity } from '@/utils/pairModel'
 
 import { ATTACHMENT_MAX_MB } from '@/composables/usePair'
 import { createBackendSyncGuard } from '@/utils/tauriStoreSync'
@@ -152,6 +153,7 @@ export interface PairSettings {
     alwaysOnTop: boolean
     passThrough: boolean
     modelId?: string
+    syncModel: boolean
     showStats: boolean
   }
 
@@ -205,6 +207,7 @@ export interface PairRuntime {
   relayUrl?: string
   peerOnline: boolean
   peerName?: string
+  peerModel?: PairModelIdentity
   remotePresence: RemotePresenceState
   remotePresenceMessage?: string
   remoteStats?: PairStatsPayload
@@ -231,6 +234,7 @@ export const usePairStore = defineStore('pair', () => {
       alwaysOnTop: true,
       passThrough: false,
       modelId: void 0,
+      syncModel: true,
       showStats: true,
     },
     chat: {

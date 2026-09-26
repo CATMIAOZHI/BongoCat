@@ -27,7 +27,8 @@
 - 远端：`origin` = CATMIAOZHI/BongoCat（fork）；上游 = ayangweb/BongoCat，主分支为 `master`（上游没有 `dev` 分支）。
 - 从 `feat/pair-desktop-v1` 分支起，本 fork 在上游 `master` 之上有本地定制（双人联机功能，仅 Windows 范围）。
 - 除非用户明确要求，不主动同步、对比或合并上游。准备向上游贡献时，先做只读可行性分析（含上游重复 issue/PR 检索），报告需要重新验证的部分，等用户明确许可后再建分支或提 PR。
-- `src-tauri/tauri.conf.json` 的 `identifier`（`com.ayangweb.BongoCat`）和 updater 端点仍指向上游。自行打包时自动更新会拉取上游版本，改动这些标识需用户明确要求。
+- 对外仓库链接、下载、反馈和维护者署名统一为 `CATMIAOZHI/BongoCat` / `CATMIAOZHI`。许可证保留原作者版权。`identifier`（`com.ayangweb.BongoCat`）与系统凭据库 SERVICE 保留以兼容已安装客户端数据；它们不是网络地址。`ayangweb/gilrs` 是实际依赖源，不替换成不存在的 fork。
+- 对方模型自动同步默认开启，只在 presence 中携带 `model: { name, mode, isPreset }`，不发送路径、随机 ID 或文件。内置模型按模式匹配，自定义模型按 `Model.name` 和模式匹配本地已导入列表；导入时保存原始目录名，旧模型在模型卡片点铅笔补填。存储目录末段是随机 ID，不能用它匹配。缺失、未命名或重名时使用自己的模型并提示。用户关闭自动同步后仍可手动选模型。加载串行执行，避免异步覆盖。
 
 ## 构建与验证
 
@@ -50,10 +51,10 @@
 ## 提交与发布
 
 - 提交信息遵循 Conventional Commits（`commitlint` 经 `simple-git-hooks` 的 `commit-msg`、`pre-commit` 钩子校验，pre-commit 会跑 `eslint --fix`）。
-- 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 构建 Draft Release。CI **只构建 Windows 三个目标**（x64 / x86 / arm64），macOS 与 Linux 已从矩阵里去掉（双人联机只做 Windows，那些包没人用）；要恢复上游的全平台见 workflow 里矩阵旁的注释。**本 fork 自用版不需要配任何 Secret**：推 `v*` 标签（或手动 Run workflow）就出安装包，用的是 GitHub 自带的 `GITHUB_TOKEN`（workflow 里已声明 `permissions: contents: write`），构建时 `--no-sign`、不生成 `latest.json`。想恢复「签名 + 自动更新分发」，按 `release.yml` 末尾的四步做（含要换掉 `tauri.conf.json` 里的 `pubkey`，上游公钥和自己的私钥配不上）。
-- `.github/workflows/upgradelink.yml` 与 `sync-to-gitee.yml` 依赖只属于上游作者的第三方账号 Secret（UpgradeLink、Gitee），在 fork 里只能失败，所以已改成**只能手动触发**；要恢复上游行为见两个文件顶部的注释。
+- 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 构建 Draft Release。CI **只构建 Windows 三个目标**（x64 / x86 / arm64），macOS 与 Linux 已从矩阵里去掉（双人联机只做 Windows，那些包没人用）；要恢复上游的全平台见 workflow 里矩阵旁的注释。**本 fork 自用版不需要配任何 Secret**：推 `v*` 标签（或手动 Run workflow）就出安装包，用的是 GitHub 自带的 `GITHUB_TOKEN`（workflow 里已声明 `permissions: contents: write`），构建时 `--no-sign`、不生成 `latest.json`。想恢复「签名 + 自动更新分发」，按 `release.yml` 末尾的步骤重新配置自有公钥、私钥与插件（旧公钥已移除）。
+- 上游专用的 UpgradeLink 与 Gitee 同步 workflow 已移除；不再访问上游更新服务或携带其 access key。
 - 自建中继（`server-relay/`）的预编译二进制走 `.github/workflows/relay-release.yml`：推 `relay-v*` 标签（如 `relay-v1`）出 Release，或在 Actions 手动跑存 Artifact。**runner 必须留在 ubuntu-22.04**（服务器是 `debian:bookworm-slim`，glibc 2.36；用 24.04 编出来的会报 `GLIBC_2.3x not found`），workflow 里那步 `Check glibc requirement` 把这条钉住。包里除 `bongocat-pair-relay` 还带 `generate-pair`，服务器上不用装 Rust 也能生成服务器密码；下载与校验方式见 `server-relay/README.md` 的「预编译二进制」一节。
-- 注意 `src-tauri/tauri.conf.json` 的 updater 端点仍指向上游（见「仓库边界」），自己装的版本会提示更新到上游版本；自用发布不带签名，属于预期。
+- 更新检查通过 GitHub API 读取本 fork 正式客户端 `vX.Y.Z` Release，过滤 draft / prerelease / `relay-v*`；发现新版后打开本 fork 下载页供用户手动安装。旧 updater 端点、公钥与运行时插件注册已移除，自用发布不做自动覆盖安装。
 - 未经用户明确要求，不提交、不推送、不打标签、不发布 Release。
 
 ## 通用安全

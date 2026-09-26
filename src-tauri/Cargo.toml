@@ -2,7 +2,7 @@
 name = "bongo-cat"
 version = "1.2.1"
 description = "A Tauri App"
-authors = [ "ayangweb" ]
+authors = [ "CATMIAOZHI" ]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

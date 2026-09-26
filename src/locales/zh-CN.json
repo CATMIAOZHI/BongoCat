@@ -185,15 +185,20 @@
       "model": {
         "title": "模型管理",
         "labels": {
-          "deleteModel": "删除模型"
+          "deleteModel": "删除模型",
+          "modelName": "模型名称",
+          "unnamedModel": "未命名模型"
         },
         "hints": {
           "deleteSuccess": "删除成功",
+          "modelName": "联机匹配需要双方的模型名称一致。旧模型请点击卡片上的铅笔补填名称，无需重新导入。",
+          "modelNameRequired": "请填写模型名称（最多 255 个字符，不含斜杠）。",
           "deleteModel": "你确定要删除此模型吗？",
           "importSuccess": "导入成功",
           "clickOrDragToImport": "点击或拖动至此区域导入"
         },
         "tooltips": {
+          "modelGuide": "模型导入与同步说明",
           "createModel": "制作模型",
           "convertModel": "转换模型",
           "moreModels": "更多模型"
@@ -252,6 +257,7 @@
           "remoteCatSettings": "对方猫",
           "showRemoteCat": "显示对方猫",
           "remoteModel": "对方猫模型",
+          "syncModel": "自动同步对方模型",
           "remoteStats": "显示对方的输入统计",
           "windowSize": "窗口尺寸",
           "opacity": "不透明度",
@@ -292,6 +298,8 @@
         },
         "hints": {
           "enabled": "打开后填好下面三项，点「立即连接」。关闭会立即断开连接，也不再发送任何数据。",
+          "syncModel": "只同步模型名称，不传文件。请先把对方模型放到本地并导入，双方模型名称保持一致；未找到时使用自己的模型。旧模型可在「模型」页点铅笔补填名称。双方需更新客户端。",
+          "missingPeerModel": "本地缺少或无法使用「{name}」，暂用自己的模型。请把对方模型放到本地并导入；已导入则在「模型」页把名称设为与对方一致。",
           "connectSteps": "顺序就是：填好上面三个值 → 点「立即连接」→ 连上后再到下面打开「对方猫」和「聊天窗口」（它们默认是关的）。",
           "missingRelayUrl": "还差服务器地址：填在「服务器地址」那一栏（或向对方要），再点「立即连接」。",
           "missingSecret": "还差配对密码：和对方用同一串，填在「配对密码」那一栏。",
@@ -439,10 +447,13 @@
       },
       "hints": {
         "checkingUpdates": "正在检查更新...",
+        "openReleases": "暂时无法检查更新，已尝试打开本仓库下载页。",
+        "manualInstall": "打开 CATMIAOZHI/BongoCat 下载页，选择适合你的安装包后手动安装。",
         "alreadyLatest": "当前已是最新版本🎉"
       },
       "buttons": {
         "updateNow": "立即更新",
+        "openDownload": "打开下载页",
         "updateLater": "稍后更新"
       }
     }

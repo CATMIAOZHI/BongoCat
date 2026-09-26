@@ -49,6 +49,10 @@ function feedbackIssue() {
 <template>
   <ProList :title="$t('pages.preference.about.labels.aboutApp')">
     <ProListItem
+      :description="GITHUB_LINK"
+      title="CATMIAOZHI"
+    />
+    <ProListItem
       :description="`v${appStore.version}`"
       :title="appStore.name"
     >
