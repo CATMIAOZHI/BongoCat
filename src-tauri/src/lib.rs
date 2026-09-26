@@ -2,7 +2,7 @@ mod core;
 mod utils;
 
 use core::{
-    device::start_device_listening,
+    device::{is_key_down, start_device_listening},
     gamepad::{start_gamepad_listing, stop_gamepad_listing},
     prevent_default, setup,
 };
@@ -32,6 +32,7 @@ pub fn run() {
         .invoke_handler(generate_handler![
             copy_dir,
             start_device_listening,
+            is_key_down,
             start_gamepad_listing,
             stop_gamepad_listing,
             core::pair::pair_get_status,

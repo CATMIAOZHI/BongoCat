@@ -6,6 +6,7 @@ import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { usePairStore } from '@/stores/pair'
 import { markPairStatsLoaded, usePairStatsStore } from '@/stores/pairStats'
+import { shouldSendKeepAlive } from '@/utils/keepAlive'
 import { isWindows } from '@/utils/platform'
 
 import type { PresenceState } from './usePair'
@@ -30,6 +31,20 @@ import { usePairStatus } from './usePairStatus'
 const FALLBACK_SNAPSHOT_INTERVAL_MS = 333
 /** §25：统计最多每 30 秒一次 */
 const STATS_INTERVAL_MS = 30_000
+/**
+ * 「还按着东西」时的重发节奏（R46）。
+ *
+ * 对方猫的按键/爪子 TTL 是 800ms、点击是 500ms，看的是**收到包的时间**；而按住键不动时
+ * 快照没有任何变化（R4：量化后一样就不发），对面就会自己把贴图与爪子放下来。所以还按着
+ * 东西的时候要把同一份快照再发一次：间隔取 `max(这个值, 当前快照间隔)`——250ms 压得住两个
+ * TTL，又远低于传输额度（自建中继 20 帧/秒、DC 那条腿 60Hz）。判据本身在
+ * `utils/keepAlive.ts`（含「窗口藏起来就不补」）。
+ *
+ * `KEEP_ALIVE_TICK_MS` 只是检查节奏：它要明显比上面那个下限小，否则 CF 那种 333ms 的快照
+ * 间隔会被「250 + 250」凑成 500ms，正好压不住点击的 500ms TTL。
+ */
+const KEEP_ALIVE_MIN_MS = 250
+const KEEP_ALIVE_TICK_MS = 50
 /** §27：鼠标累计移动超过 4px 才算「真的回来了」 */
 const AWAY_MOVE_THRESHOLD_PX = 4
 /**
@@ -65,7 +80,9 @@ export function usePairState() {
       // Windows 下有些系统级按键收不到释放事件，用本机同样的自动释放延迟兜底
       if (!isWindows) return 0
 
-      return Math.max(catStore.model.autoReleaseDelay, 1) * 1000
+      // 比本机多留 1 秒：本机到点要先问一次系统才续期（一次 IPC），这段时间里这一帧会被
+      // 按「超过按住上限」裁掉发出去，对方猫就缺一帧；余量比探询往返大得多就撞不上
+      return Math.max(catStore.model.autoReleaseDelay, 1) * 1000 + 1000
     },
     // R37：只有本机模型真的有这张贴图的键才发出去（对端还要用它自己的模型再认一遍）
     isSupportedKey: (key) => {
@@ -77,6 +94,7 @@ export function usePairState() {
   let lastSentAt = 0
   let trailingTimer: ReturnType<typeof setTimeout> | undefined
   let statsTimer: ReturnType<typeof setInterval> | undefined
+  let keepAliveTimer: ReturnType<typeof setInterval> | undefined
   let lastPointer: PointerPoint | undefined
   let awayDistance = 0
   /** 暂离期间最近一次有输入的时间；距今超过 AWAY_ARM_IDLE_MS 后，下一次输入才算回来 */
@@ -180,6 +198,39 @@ export function usePairState() {
     ).catch(() => void 0)
   }
 
+  /**
+   * 还按着东西时把同一份快照再发一次：对方猫的 TTL 才不至于把还按着的键/爪子放下来。
+   *
+   * 重算一遍再发：这段时间里发送侧自己的状态可能变了（比如某个键到了按住上限），
+   * 不能把一份陈旧的「还按着」一直发下去。
+   */
+  const sendKeepAlive = () => {
+    if (!canSendActivity() || !lastSnapshot) return
+
+    const { keyboard, pointer } = lastSnapshot
+    const now = Date.now()
+
+    if (!shouldSendKeepAlive({
+      keys: keyboard.keys,
+      leftDown: pointer.leftDown,
+      rightDown: pointer.rightDown,
+      sinceLastSentMs: now - lastSentAt,
+      minIntervalMs: Math.max(KEEP_ALIVE_MIN_MS, snapshotIntervalMs()),
+      pageVisible: document.visibilityState === 'visible',
+    })) {
+      return
+    }
+
+    mapper.advance(now)
+
+    const snapshot = applyPrivacy(mapper.snapshot(now))
+
+    lastSnapshot = snapshot
+    lastSentAt = now
+
+    void pairSendPetState(snapshot).catch(() => void 0)
+  }
+
   const setPresence = (presence: PresenceState) => {
     awayDistance = 0
     lastPointer = void 0
@@ -239,6 +290,16 @@ export function usePairState() {
     sendSnapshot()
   }
 
+  /**
+   * 系统确认这些键还按着（R46）：给发送侧的按键续期，别让对方猫看到它掉下去。
+   *
+   * 续期可能把刚被按住上限剔掉的键找回来，所以这里再算一次快照。
+   */
+  const noteKeysStillDown = (keys: readonly string[]) => {
+    mapper.noteKeysStillDown(keys, Date.now())
+    sendSnapshot()
+  }
+
   /** 原始物理坐标只用于 §27 的「移动超过 4px 自动回来」 */
   const handlePointerMove = (point: PointerPoint) => {
     if (store.settings.presence === 'away') {
@@ -291,6 +352,8 @@ export function usePairState() {
       if (canSendStats()) sendStats()
     }, STATS_INTERVAL_MS)
 
+    keepAliveTimer = setInterval(sendKeepAlive, KEEP_ALIVE_TICK_MS)
+
     // §74：开机启动后按设置自动连接
     if (store.settings.enabled && store.settings.relay.autoConnect && store.settings.relay.url) {
       void pairConnect(store.settings.relay.url).catch(() => void 0)
@@ -299,6 +362,7 @@ export function usePairState() {
 
   onUnmounted(() => {
     if (statsTimer) clearInterval(statsTimer)
+    if (keepAliveTimer) clearInterval(keepAliveTimer)
     if (trailingTimer) clearTimeout(trailingTimer)
   })
 
@@ -370,5 +434,6 @@ export function usePairState() {
     handleMouseButton,
     handlePointerRatio,
     handlePointerMove,
+    noteKeysStillDown,
   }
 }

@@ -342,6 +342,16 @@ export interface PairActivityMapper {
   handleKeyboard: (key: string, pressed: boolean, now: number) => InputOutcome
   handleMouseButton: (button: string, pressed: boolean) => InputOutcome
   handlePointerRatio: (xRatio: number, yRatio: number, now: number) => void
+  /**
+   * 这些原始键名「系统确认还按着」（R46）。把它们的按下时间推到 `now`。
+   *
+   * 和本机高亮是同一个成因：Windows 的键盘自动重复只跟**最后按下**的那个键，被后来者压住的
+   * 键会完全安静下来，于是 [`MapperOptions.handHoldLimitMs`] 会把它当成「丢了抬起事件」的陈旧键
+   * 剔掉——对方猫就看不到这个键了（贴图与那只爪子一起放下去）。收到系统确认时续一次期。
+   *
+   * 只续本来就在按着的键：没在按着的一律忽略，不凭空造出一个按着的键。
+   */
+  noteKeysStillDown: (keys: readonly string[], now: number) => void
   /** 推进时间窗口（强度衰减、指针不活跃），不会发送任何东西 */
   advance: (now: number) => void
   /** 当前快照：已完成裁剪与量化，可以直接发到网络 */
@@ -412,9 +422,18 @@ export function createPairActivityMapper(options: MapperOptions = {}): PairActiv
 
   const handleKeyboard = (key: string, pressed: boolean, now: number): InputOutcome => {
     if (pressed) {
-      if (pressedKeys.has(key)) return 'repeat'
+      const repeated = pressedKeys.has(key)
 
+      /**
+       * 重复事件也是「这个键还按着」的证据（R46）：把按下时间往后推。
+       *
+       * 不推的话，单键按住超过 `handHoldLimitMs` 就会被当成「丢了抬起事件」的陈旧键剔掉——
+       * 对方猫于是看不到它（贴图与那只爪子一起放下）。真的抬起之后不再有事件，
+       * 上限照旧能把陈旧键清掉。
+       */
       pressedKeys.set(key, now)
+
+      if (repeated) return 'repeat'
 
       if (!MODIFIER_KEYS.has(key)) {
         pressTimes.push(now)
@@ -440,6 +459,14 @@ export function createPairActivityMapper(options: MapperOptions = {}): PairActiv
     pressedButtons.delete(button)
 
     return 'released'
+  }
+
+  const noteKeysStillDown = (keys: readonly string[], now: number) => {
+    for (const key of keys) {
+      if (!pressedKeys.has(key)) continue
+
+      pressedKeys.set(key, now)
+    }
   }
 
   const handlePointerRatio = (xRatio: number, yRatio: number, now: number) => {
@@ -521,6 +548,7 @@ export function createPairActivityMapper(options: MapperOptions = {}): PairActiv
     handleKeyboard,
     handleMouseButton,
     handlePointerRatio,
+    noteKeysStillDown,
     advance,
     snapshot,
     reset,

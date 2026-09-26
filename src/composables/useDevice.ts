@@ -5,11 +5,14 @@ import { isNil } from 'es-toolkit'
 import { Ticker } from 'pixi.js'
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 
+import type { KeyAutoReleasePressOptions } from '@/utils/keyAutoRelease'
+
 import { useAppStore } from '@/stores/app'
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { usePairStore } from '@/stores/pair'
 import { inBetween } from '@/utils/is'
+import { createKeyAutoRelease } from '@/utils/keyAutoRelease'
 import { getCursorMonitor } from '@/utils/monitor'
 import { isMac, isWindows } from '@/utils/platform'
 
@@ -41,11 +44,19 @@ interface KeyboardEvent {
 type DeviceEvent = MouseButtonEvent | MouseMoveEvent | KeyboardEvent
 
 const DAMPING_DECAY = 0.75
+/** CapsLock 只亮一下（它的「按下」是切换语义，不适合长亮，也不去问系统） */
+const CAPS_LOCK_FLASH_MS = 100
+/**
+ * 鼠标比例夹到 0..1。
+ *
+ * 正常情况（点在命中显示器内）本来就落在 0..1；只有 `utils/monitor.ts` 那种兜底——
+ * 点在所有显示器之外的排列空档里、按上一块显示器算——才会越界，夹住它比让模型参数越界好。
+ */
+const clampRatio = (value: number) => Math.min(1, Math.max(0, value))
 const appWindow = getCurrentWebviewWindow()
 
 export function useDevice() {
   const modelStore = useModelStore()
-  const releaseTimers = new Map<string, NodeJS.Timeout>()
   const appStore = useAppStore()
   const catStore = useCatStore()
   const pairStore = usePairStore()
@@ -55,6 +66,33 @@ export function useDevice() {
   const { handlePress, handleRelease, handleMouseChange, handleMouseRatio } = useModel()
   // 本地输入同时喂给联机同步：远程猫要「哪只手 + 强度 + 比例 + 能显示的键名」（R37）
   const pairState = usePairState()
+
+  /**
+   * 问系统：这些键里有没有还按着的（R46 的「安静 ≠ 抬起」）。
+   *
+   * 调用失败（或键名没见过）时一律当「没有按着」，也就是退回原来的「到点就释放」，
+   * 不会因为拿不到答案就让贴图一直亮着。
+   */
+  const isKeyStillDown = async (keys: string[]) => {
+    try {
+      return await invoke<boolean>(INVOKE_KEY.IS_KEY_DOWN, { keys })
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Windows 的「按键自动释放」（见 `utils/keyAutoRelease.ts`）。
+   *
+   * `onStillDown` 把「系统确认还按着」告诉联机那侧：发送侧的按键也有同一个时限，
+   * 不续期的话对方猫同样会在 3 秒后看不到这个键。
+   */
+  const keyAutoRelease = createKeyAutoRelease({
+    delay: () => catStore.model.autoReleaseDelay * 1000,
+    isKeyStillDown,
+    onRelease: key => handleRelease(key),
+    onStillDown: keys => pairState.noteKeysStillDown(keys),
+  })
 
   const tickerCallback = (ticker: Ticker) => {
     const destination = latestCursorPoint.value
@@ -93,6 +131,7 @@ export function useDevice() {
 
   onUnmounted(() => {
     Ticker.shared.remove(tickerCallback)
+    keyAutoRelease.stop()
   })
 
   watch(() => catStore.model.ignoreMouse, (value) => {
@@ -163,8 +202,8 @@ export function useDevice() {
 
     if (monitor) {
       const { size, position } = monitor
-      const xRatio = (point.x - position.x) / size.width
-      const yRatio = (point.y - position.y) / size.height
+      const xRatio = clampRatio((point.x - position.x) / size.width)
+      const yRatio = clampRatio((point.y - position.y) / size.height)
 
       handleMouseRatio(xRatio, yRatio)
     }
@@ -192,25 +231,27 @@ export function useDevice() {
     const { size, position } = monitor
 
     pairState.handlePointerRatio(
-      (point.x - position.x) / size.width,
-      (point.y - position.y) / size.height,
+      clampRatio((point.x - position.x) / size.width),
+      clampRatio((point.y - position.y) / size.height),
     )
   }
 
-  const handleAutoRelease = (key: string, delay = 100) => {
+  /**
+   * Windows：按下后等 `autoReleaseDelay` 秒（设置项），到点再向系统确认一次才当作松开了。
+   *
+   * 为什么不能只按时间判断：Windows 的键盘自动重复只跟**最后按下**的那个键，按住 w 再按
+   * a/d 之后 w 会完全安静（松开 a/d 也不会恢复重复），于是「多久没事件」这件事根本说明不了
+   * 它抬没抬起——只看时间就会把一直按着的 w 当成松开，高亮就没了（R46）。
+   */
+  const handleAutoRelease = (key: string, raw: string, pressOptions?: KeyAutoReleasePressOptions) => {
     handlePress(key)
+    keyAutoRelease.press(key, raw, pressOptions)
+  }
 
-    if (releaseTimers.has(key)) {
-      clearTimeout(releaseTimers.get(key))
-    }
-
-    const timer = setTimeout(() => {
-      handleRelease(key)
-
-      releaseTimers.delete(key)
-    }, delay)
-
-    releaseTimers.set(key, timer)
+  /** 真的收到了抬起事件：先把待发的自动释放撤掉（少一次多余的判断），再松开显示 */
+  const handleAutoReleaseRelease = (key: string) => {
+    keyAutoRelease.release(key)
+    handleRelease(key)
   }
 
   useTauriListen<DeviceEvent>(LISTEN_KEY.DEVICE_CHANGED, ({ payload }) => {
@@ -225,18 +266,21 @@ export function useDevice() {
       if (!nextValue) return
 
       if (nextValue === 'CapsLock') {
-        return handleAutoRelease(nextValue)
+        if (kind === 'KeyboardPress') {
+          return handleAutoRelease(nextValue, value, { delay: CAPS_LOCK_FLASH_MS, probe: false })
+        }
+
+        return handleAutoReleaseRelease(nextValue)
       }
 
       if (kind === 'KeyboardPress') {
-        if (isWindows) {
-          const delay = catStore.model.autoReleaseDelay * 1000
-
-          return handleAutoRelease(nextValue, delay)
-        }
+        // Windows 下部分系统级按键收不到抬起事件，所以走「到点再确认」这条路（R46）
+        if (isWindows) return handleAutoRelease(nextValue, value)
 
         return handlePress(nextValue)
       }
+
+      if (isWindows) return handleAutoReleaseRelease(nextValue)
 
       return handleRelease(nextValue)
     }

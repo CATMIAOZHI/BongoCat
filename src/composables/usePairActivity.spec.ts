@@ -164,6 +164,53 @@ describe('r2 左右手分区', () => {
     // 键本身仍在按下集合里，所以 OS 自动重复不会被算成新的按下
     expect(mapper.handleKeyboard('KeyA', true, 1_600)).toBe('repeat')
   })
+
+  /**
+   * R46：被后来按下的键「压住」的那个键会完全安静下来（Windows 只重复最后按下的键），
+   * 只看「多久没事件」会把一直按着的 w 剔掉，对方猫就看不到它了。
+   */
+  it('系统确认还按着就续期，不被按住上限剔掉', () => {
+    const mapper = createPairActivityMapper({ handHoldLimitMs: () => 1_000 })
+
+    mapper.handleKeyboard('KeyW', true, 0)
+
+    // 到点之前系统确认一次：按下时间被推到 900，于是 1_500 那会儿还不算陈旧
+    mapper.noteKeysStillDown(['KeyW'], 900)
+
+    expect(mapper.snapshot(1_500).keyboard.keys).toEqual(['KeyW'])
+    expect(mapper.snapshot(1_500).keyboard.leftHand).toBe(true)
+
+    // 不再确认的话，仍然按老规矩在时限后剔掉（真抬起时不会被挂着）
+    expect(mapper.snapshot(2_500).keyboard.keys).toEqual([])
+  })
+
+  it('只续本来就在按着的键，不会凭空造出一个按着的键', () => {
+    const mapper = createPairActivityMapper({ handHoldLimitMs: () => 1_000 })
+
+    mapper.noteKeysStillDown(['KeyA'], 0)
+
+    expect(mapper.snapshot(0).keyboard.keys).toEqual([])
+    expect(mapper.snapshot(0).keyboard.active).toBe(false)
+  })
+
+  /**
+   * R46 的另一半：单键按住时 OS 自动重复一直在来，那些重复事件本身就是「还按着」的证据。
+   * 不拿它续期的话，按住超过按住上限就会被剔掉，对方猫同样看不到。
+   */
+  it('重复事件也会续期：单键按住不会被按住上限剔掉', () => {
+    const mapper = createPairActivityMapper({ handHoldLimitMs: () => 1_000 })
+
+    mapper.handleKeyboard('KeyA', true, 0)
+    mapper.handleKeyboard('KeyA', true, 900)
+    mapper.handleKeyboard('KeyA', true, 1_800)
+
+    expect(mapper.snapshot(2_500).keyboard.keys).toEqual(['KeyA'])
+
+    // 真的抬起之后不再有事件：上限照旧把陈旧键清掉（不会一直挂着）
+    mapper.handleKeyboard('KeyA', false, 2_600)
+
+    expect(mapper.snapshot(2_700).keyboard.keys).toEqual([])
+  })
 })
 
 describe('r3 打字强度', () => {

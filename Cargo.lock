@@ -624,6 +624,7 @@ dependencies = [
  "tokio-tungstenite",
  "uuid",
  "webrtc",
+ "winapi",
 ]
 
 [[package]]

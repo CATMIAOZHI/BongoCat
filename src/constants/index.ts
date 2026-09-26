@@ -39,6 +39,7 @@ export const LISTEN_KEY = {
 export const INVOKE_KEY = {
   COPY_DIR: 'copy_dir',
   START_DEVICE_LISTENING: 'start_device_listening',
+  IS_KEY_DOWN: 'is_key_down',
   START_GAMEPAD_LISTING: 'start_gamepad_listing',
   STOP_GAMEPAD_LISTING: 'stop_gamepad_listing',
   PAIR_GET_STATUS: 'pair_get_status',

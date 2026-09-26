@@ -68,6 +68,10 @@ async-trait.workspace = true
 # `DataChannel::send` 收的是 `BytesMut`。这个 crate 本来就在依赖树里（tungstenite），
 # 只是之前没有直接用到。
 bytes = "1"
+# 「按键安静了很久 ≠ 已经抬起」那道判断要问操作系统（`GetAsyncKeyState`，见
+# `core/device.rs` 的 `is_key_down`）。版本与 rdev 用的 winapi 一致，只是把它已经带进来的
+# `winuser` 直接引出来，不新增依赖、不新增构建。
+winapi = { version = "0.3", features = ["winuser"] }
 
 [features]
 cargo-clippy = []
