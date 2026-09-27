@@ -33,7 +33,7 @@
 ## 构建与验证
 
 - 包管理器只用 pnpm（`preinstall` 里有 `only-allow pnpm`），不要用 npm/yarn 安装依赖。
-- 常用命令：`pnpm install`、`pnpm tauri dev`、`pnpm tauri build`（调试加 `--debug`）、`pnpm lint`、`pnpm test`。**本 fork 自用不签名，本地打包要加 `--no-sign`**：`tauri.conf.json` 里 `createUpdaterArtifacts: true`，本机又没有 updater 私钥，不加这个参数打包会在签名那步失败（报「A public key has been found, but no private key」）。CI 里同理（见 `release.yml`）。
+- 常用命令：`pnpm install`、`pnpm tauri dev`、`pnpm tauri build`（调试加 `--debug`）、`pnpm lint`、`pnpm test`。**本 fork 自用不签名、也不做自动更新**：`tauri.conf.json` 里 `createUpdaterArtifacts: false`，本地打包加不加 `--no-sign` 都能过。这个字段**不能置 `true`**（除非同时把 `plugins.updater`、`updater:default` capability 与 updater 插件注册一起恢复）：它为 `true` 时打包器要先读 `plugins.updater` 才知道公钥，而本 fork 已移除该插件配置，于是在「构建 bundler 设置」那一步直接失败（报 `failed to get updater configuration: plugins > updater doesn't exist`）——这一步在签名之前，`--no-sign` 挡不住，本地与 CI 都会挂。CI 里的 `--no-sign` 只是顺手保险（见 `release.yml`）。
 - 前端改动至少跑 `pnpm lint`；涉及 Rust 或打包配置时说明是否真的跑过 `pnpm tauri build` 或 `cargo check`，没验证的要标注。
 - 前端有 vitest 单测（`pnpm test`，用例在 `src/**/*.spec.ts`，目前覆盖双人联机的纯函数映射），Rust 有 `cargo test --lib` 与 `cargo test --all-targets`。
 - 中继的端到端验证：先起一个中继（`server-relay` 或 `server-cloudflare` 的 `pnpm dev`），再设 `BONGO_PAIR_E2E_RELAY` / `BONGO_PAIR_E2E_SECRET` / `BONGO_PAIR_HEARTBEAT_SECS`（自建中继还要 `BONGO_PAIR_E2E_SERVER_PASSWORD`），跑 `cargo test --manifest-path src-tauri/Cargo.toml --lib pair::e2e -- --ignored`。换中继实现时，这套用例必须在两侧都通过。
@@ -54,7 +54,7 @@
 ## 提交与发布
 
 - 提交信息遵循 Conventional Commits（`commitlint` 经 `simple-git-hooks` 的 `commit-msg`、`pre-commit` 钩子校验，pre-commit 会跑 `eslint --fix`）。
-- 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 构建 Draft Release。CI **只构建 Windows 三个目标**（x64 / x86 / arm64），macOS 与 Linux 已从矩阵里去掉（双人联机只做 Windows，那些包没人用）；要恢复上游的全平台见 workflow 里矩阵旁的注释。**本 fork 自用版不需要配任何 Secret**：推 `v*` 标签（或手动 Run workflow）就出安装包，用的是 GitHub 自带的 `GITHUB_TOKEN`（workflow 里已声明 `permissions: contents: write`），构建时 `--no-sign`、不生成 `latest.json`。想恢复「签名 + 自动更新分发」，按 `release.yml` 末尾的步骤重新配置自有公钥、私钥与插件（旧公钥已移除）。
+- 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 构建 Draft Release。CI **只构建 Windows 三个目标**（x64 / x86 / arm64），macOS 与 Linux 已从矩阵里去掉（双人联机只做 Windows，那些包没人用）；要恢复上游的全平台见 workflow 里矩阵旁的注释。**本 fork 自用版不需要配任何 Secret**：推 `v*` 标签（或手动 Run workflow）就出安装包，用的是 GitHub 自带的 `GITHUB_TOKEN`（workflow 里已声明 `permissions: contents: write`），构建时 `--no-sign` 且 `createUpdaterArtifacts: false`、不生成 `latest.json`。想恢复「签名 + 自动更新分发」，按 `release.yml` 末尾的步骤重新配置自有公钥、私钥与插件（旧公钥已移除）。
 - 上游专用的 UpgradeLink 与 Gitee 同步 workflow 已移除；不再访问上游更新服务或携带其 access key。
 - 自建中继（`server-relay/`）的预编译二进制走 `.github/workflows/relay-release.yml`：推 `relay-v*` 标签（如 `relay-v1`）出 Release，或在 Actions 手动跑存 Artifact。**runner 必须留在 ubuntu-22.04**（服务器是 `debian:bookworm-slim`，glibc 2.36；用 24.04 编出来的会报 `GLIBC_2.3x not found`），workflow 里那步 `Check glibc requirement` 把这条钉住。包里除 `bongocat-pair-relay` 还带 `generate-pair`，服务器上不用装 Rust 也能生成服务器密码；下载与校验方式见 `server-relay/README.md` 的「预编译二进制」一节。
 - 更新检查通过 GitHub API 读取本 fork 正式客户端 `vX.Y.Z` Release，过滤 draft / prerelease / `relay-v*`；发现新版后打开本 fork 下载页供用户手动安装。旧 updater 端点、公钥与运行时插件注册已移除，自用发布不做自动覆盖安装。

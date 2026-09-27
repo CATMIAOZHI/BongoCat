@@ -5,12 +5,15 @@ name: BongoCat Release
 #   1. `secrets.RELEASE_TOKEN` → `secrets.GITHUB_TOKEN`（上游用的是作者自己的 PAT；
 #      fork 里没有那个 Secret，第一个 job 直接失败，而后面依赖它）。自带令牌的权限
 #      由下面的 `permissions` 给，job 结束即失效，不用维护 PAT。
-#   2. `--no-sign`：本仓库自用不发布自动更新，不需要 updater 签名；而
-#      `tauri.conf.json` 里 `createUpdaterArtifacts: true` 时缺
-#      `TAURI_SIGNING_PRIVATE_KEY` 会让打包报错（「A public key has been found,
-#      but no private key」）。
-#   3. `uploadUpdaterJson: false`：没有签名就不生成 `latest.json`
-#      （这是 tauri-action 现在的 input 名，上游的 `includeUpdaterJson` 早就改名了）。
+#   2. `--no-sign`：本仓库自用不发布自动更新，不需要 updater 签名
+#      （`tauri.conf.json` 里 `createUpdaterArtifacts` 已是 `false`，本来也不会
+#      因缺 `TAURI_SIGNING_PRIVATE_KEY` 报错；留着它只是保险）。
+#      注意这个字段不能置 `true`：那样打包器要先读 `plugins.updater` 拿公钥，
+#      而本 fork 已移除该插件配置，会在签名之前就报
+#      `failed to get updater configuration: plugins > updater doesn't exist`。
+#   3. `includeUpdaterJson: false`：没有 `.sig` 就不传 `latest.json`
+#      （tauri-action 的 input 名是 `includeUpdaterJson`；写成 `uploadUpdaterJson`
+#      并不存在，只会让 action 警告一句「Unexpected input(s)」而已）。
 # 想恢复「签名 + 自动更新分发」，见文件末尾的说明。
 on:
   push:
@@ -112,7 +115,7 @@ jobs:
           releaseBody: ''
           releaseDraft: true
           prerelease: false
-          uploadUpdaterJson: false
+          includeUpdaterJson: false
           args: --target ${{ matrix.target }} --no-sign
 
 # 以后想恢复「安装包 + 自动更新」的完整分发（四步）：
@@ -121,7 +124,8 @@ jobs:
 #      （本 fork 已移除旧更新源、公钥与 updater 注册，需恢复插件和 capability）
 #   3. 在仓库 Settings → Secrets 里加 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）
 #      与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（私钥没设密码就留空）
-#   4. 去掉上面的 `--no-sign`、把 `uploadUpdaterJson` 改回 `true`，
+#   4. 把 `createUpdaterArtifacts` 改回 `true`、去掉上面的 `--no-sign`、
+#      把 `includeUpdaterJson` 改回 `true`，
 #      并把 `plugins.updater.endpoints` 指向本仓库的
 #      `releases/latest/download/latest.json`；前端更新流程也需改为签名安装。
 #      当前前端只检查本仓库正式客户端 Release，并打开下载页让用户手动安装。
