@@ -11,7 +11,7 @@
           "SimpChinese",
           "TradChinese"
         ],
-        "installMode": "both",
+        "installMode": "perMachine",
         "displayLanguageSelector": true
       }
     }
