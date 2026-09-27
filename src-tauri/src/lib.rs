@@ -91,6 +91,12 @@ pub fn run() {
             tauri_plugin_log::Builder::new()
                 .level(tauri_plugin_log::log::LevelFilter::Info)
                 .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                // 插件默认的 KeepOne + 40KB 太小：WebRTC / TURN 的错误每 5 分钟就写两行
+                //（实测基线约 60KB/天），40KB 只够半天——问「今天几点直连上的」时历史已经
+                // 被覆盖了。留 2MB：平稳时约一个月，持续「打不通」风暴（退避封顶 120 秒
+                // 一轮）时约一天半。口径与估算见 AGENTS.md 的「日志保留量」。
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .max_file_size(2 * 1024 * 1024)
                 .filter(|metadata| !metadata.target().contains("gilrs"))
                 .build(),
         )

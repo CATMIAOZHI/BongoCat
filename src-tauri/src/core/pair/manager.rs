@@ -2176,6 +2176,11 @@ fn publish_route(
 ) {
     let hz = pet_state_hz(direct, relay_frames_per_second);
 
+    // 只在状态真的变了时写一行：重连退避里这条路径每轮都会被调用，每轮都写会把日志刷满
+    if PairManager::lock(&manager.status).p2p != p2p {
+        tauri_plugin_log::log::info!("直连（P2P）状态：{p2p:?}，桌宠快照 {hz}Hz");
+    }
+
     manager.publish(generation, |status| {
         status.p2p = p2p;
         status.pet_state_hz = hz;

@@ -25,13 +25,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use tauri_plugin_log::log::warn;
+use tauri_plugin_log::log::{info, warn};
 use tokio::sync::mpsc;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
-    RTCSessionDescription,
+    RTCIceCandidateInit, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
+    RTCPeerConnectionState, RTCSessionDescription,
 };
 
 use super::link::Lane;
@@ -71,6 +71,47 @@ fn retry_delay(failures: u32) -> Duration {
     RETRY_DELAY
         .saturating_mul(1u32 << failures.min(10))
         .min(RETRY_DELAY_MAX)
+}
+
+/// 协商现场写进日志时用的 ICE 服务器描述：只写地址，凭据一律不进日志。
+///
+/// `turn:user:pass@host` 这种把凭据塞进 URL 的写法也要挡住，所以 '@' 之前的部分全部丢掉。
+fn describe_ice_servers(servers: &[IceServer]) -> String {
+    let urls: Vec<&str> = servers
+        .iter()
+        .flat_map(|server| server.urls.iter())
+        .map(|url| url.trim())
+        .filter(|url| !url.is_empty())
+        .collect();
+
+    if urls.is_empty() {
+        return "没有（只有 host 候选）".to_string();
+    }
+
+    urls.iter()
+        .map(|url| url.rsplit('@').next().unwrap_or(url))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 候选的日志描述：类型 + 协议 + 地址。
+///
+/// 判断「直连是真的直连、还是绕了 TURN 中转」要看候选里有没有 `relay`，光靠「已直连」
+/// 那个徽标看不出来。
+fn describe_candidate(candidate: &str) -> String {
+    if candidate.trim().is_empty() {
+        return "候选收集结束".to_string();
+    }
+
+    let tokens = candidate.split_whitespace();
+    let proto = tokens.clone().nth(2).unwrap_or("?");
+    let address = tokens.clone().nth(4).unwrap_or("?");
+    let typ = tokens
+        .skip_while(|token| *token != "typ")
+        .nth(1)
+        .unwrap_or("unknown");
+
+    format!("{typ} {proto} {address}")
 }
 
 /// 驱动循环的输入。PC 回调、会话层交给它的对端信令、会话层要发出去的字节，都走这一条
@@ -265,6 +306,9 @@ async fn drive(
                     Input::Ready(lane) => {
                         retry_at = None;
                         failures = 0;
+
+                        info!("P2P 通道就绪：{lane:?}");
+
                         let _ = leg.events.send(P2pEvent::ChannelOpen(lane));
                     }
                     Input::Failed => {
@@ -282,7 +326,11 @@ async fn drive(
                         // 已经排了下一轮就别再改时间，也别重复计数。
                         if leg.offerer && leg.peer_ready {
                             if retry_at.is_none() {
-                                retry_at = Some(tokio::time::Instant::now() + retry_delay(failures));
+                                let delay = retry_delay(failures);
+
+                                info!("P2P 这一轮没打通，{} 秒后重试", delay.as_secs());
+
+                                retry_at = Some(tokio::time::Instant::now() + delay);
                                 failures = failures.saturating_add(1);
                             }
                         } else {
@@ -461,6 +509,10 @@ impl Leg {
                 sdp_mid,
                 sdp_mline_index,
             } => {
+                if !candidate.trim().is_empty() {
+                    info!("P2P 远端候选：{}", describe_candidate(&candidate));
+                }
+
                 let init = RTCIceCandidateInit {
                     candidate,
                     sdp_mid,
@@ -487,6 +539,18 @@ impl Leg {
 
     /// 建一条 `PeerConnection`。发起方还会建 `pet-state` 通道并发 offer。
     async fn start(&mut self) {
+        // 一轮协商的现场：有了这一行，事后才能看出「什么时候开始连、用的哪些服务器」
+        info!(
+            "P2P 开始协商（{}）：ICE 服务器 {} 个 [{}]",
+            if self.offerer {
+                "本端发起 offer"
+            } else {
+                "本端等 offer"
+            },
+            self.ice_servers.len(),
+            describe_ice_servers(&self.ice_servers),
+        );
+
         let configuration = RTCConfigurationBuilder::new()
             .with_ice_servers(self.ice_servers.iter().map(to_rtc_ice_server).collect())
             .build();
@@ -666,6 +730,8 @@ impl PeerConnectionEventHandler for Handler {
             return;
         };
 
+        info!("P2P 本地候选：{}", describe_candidate(&init.candidate));
+
         let _ = self
             .driver
             .send(Input::Signal(PairSignalPayload::Candidate {
@@ -678,12 +744,19 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         // R21：立即失败条件是「DC 或 ICE 进入 failed/closed」。`Disconnected` 不算——
         // 它是暂时的，会自己恢复，当成失败会让两边反复重建。
+        info!("P2P 连接状态：{state:?}");
+
         if matches!(
             state,
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
         ) {
             let _ = self.driver.send(Input::Failed);
         }
+    }
+
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        // `Connected` = 至少一对候选通了；`Completed` = 最终那一对已经选定
+        info!("P2P ICE 状态：{state:?}");
     }
 
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
@@ -775,6 +848,44 @@ mod tests {
     use super::super::protocol::{FRAME_HEADER_SIZE, FrameHeader, FrameKind, NONCE_SIZE};
     use super::super::transfer::P2P_CHUNK_SIZE;
     use super::*;
+
+    /// 日志里的现场必须能回答「走了哪种候选」，同时**绝不能**带出凭据。
+    #[test]
+    fn the_logged_site_keeps_the_facts_and_no_credentials() {
+        let servers = vec![
+            IceServer {
+                urls: vec!["turn:cat.example.com:3478?transport=udp".to_string()],
+                username: "pair-user".to_string(),
+                credential: "s3cret".to_string(),
+            },
+            IceServer {
+                urls: vec!["turn:u:p@hidden.example.com:3478".to_string()],
+                username: String::new(),
+                credential: String::new(),
+            },
+        ];
+
+        let text = describe_ice_servers(&servers);
+
+        assert!(text.contains("cat.example.com:3478"), "{text}");
+        assert!(text.contains("hidden.example.com:3478"), "{text}");
+        assert!(!text.contains("pair-user"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains("u:p@"), "{text}");
+        assert!(describe_ice_servers(&[]).contains("host"));
+
+        // `candidate:... udp 2130706431 192.168.1.9 50000 typ host ...`
+        let host = describe_candidate(
+            "candidate:1 1 udp 2130706431 192.168.1.9 50000 typ host generation 0",
+        );
+
+        assert_eq!(host, "host udp 192.168.1.9");
+        assert_eq!(
+            describe_candidate("candidate:2 1 udp 1 203.0.113.7 61000 typ relay raddr 0.0.0.0"),
+            "relay udp 203.0.113.7"
+        );
+        assert_eq!(describe_candidate("   "), "候选收集结束");
+    }
 
     /// 这一层用的 transfer id（值本身不重要，帧头里带上它只是为了让「错帧」看得出来）
     const TRANSFER_ID: u64 = 42;
