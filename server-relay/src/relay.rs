@@ -11,6 +11,7 @@
 //! `../README.md` 的「与 Cloudflare 版的差异」那一节。
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,8 +30,9 @@ use tokio_tungstenite::WebSocketStream;
 use crate::auth::{auth_verifier, constant_time_eq, room_fingerprint};
 use crate::http::{write_upgrade, RequestHead};
 use crate::protocol::{
-    self, close_code, is_known_frame_kind, Limits, ServerFrame, FRAME_HEADER_SIZE,
-    FRAME_KIND_TRANSFER_CHUNK, LAST_SEEN_WRITE_INTERVAL_MS, MAX_BINARY_FRAME_SIZE, PAIR_SIZE,
+    self, close_code, is_known_frame_kind, Limits, ServerFrame, Tier, FRAME_HEADER_SIZE,
+    FRAME_KIND_SIGNAL, FRAME_KIND_TRANSFER_CHUNK, LAST_SEEN_WRITE_INTERVAL_MS,
+    MAX_BINARY_FRAME_SIZE, MAX_PUBLIC_FRAME_SIZE, PAIR_SIZE,
 };
 
 /// 一条已经登记进某个 Room 的连接。
@@ -52,6 +54,15 @@ struct PairRoom {
     /// `SHA256(AUTH_TOKEN)`。中继**不保存明文 token**，后续连接按同样方式算一份，
     /// 与它做恒定时间比较（§4 / §9）。
     auth_hash: [u8; 32],
+    /// 这个会话是**创建它的那条连接**的档位（决定它占哪一份名额）。
+    ///
+    /// 档位定在 Room 上而不是「每条连接各自算」，是为了让名额归属唯一：同一个会话的
+    /// 两个人必须用同一类凭据——填错了会被 403 挡住，而不是让一个人有中继兜底、另一个人
+    /// 什么都没有。
+    tier: Tier,
+    /// 创建这个会话时那条连接来自哪个 IP（IPv6 按 /64 归并）。公益档的每 IP 限额与它
+    /// 挂钩，`sweep` 释放时靠它把账还回去。
+    ip: IpKey,
     /// 按 deviceId 索引：同一个 deviceId 重连天然就是「换掉原来那条」。
     clients: HashMap<String, ClientEntry>,
     /// 已经由 `reserve` 放行、还没走进 `admit` 的连接数。
@@ -86,6 +97,9 @@ const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 「状态变化立即发送」，一次抖动就可能被误判成超限并关掉连接。
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
+    /// 这条连接所属档位的额度。公益档有自己的小额度（见 `RelayOptions::public_limits`），
+    /// 所以桶自己记着该用哪一份，不必在每次扣额度时回头查档位。
+    limits: Limits,
     frames: f64,
     chunks: f64,
     bytes: f64,
@@ -95,6 +109,7 @@ struct Bucket {
 impl Bucket {
     fn full(limits: Limits, now: Instant) -> Self {
         Self {
+            limits,
             frames: limits.frames_per_second,
             chunks: limits.chunks_per_second,
             bytes: limits.bytes_per_second,
@@ -102,7 +117,8 @@ impl Bucket {
         }
     }
 
-    fn refill(&mut self, limits: Limits, now: Instant) {
+    fn refill(&mut self, now: Instant) {
+        let limits = self.limits;
         let elapsed = now.duration_since(self.updated_at).as_secs_f64();
 
         self.updated_at = now;
@@ -114,8 +130,8 @@ impl Bucket {
     }
 
     /// 扣掉本次额度；不够就返回 false（连接随之关闭，所以负值不必回滚，与 CF 版一致）
-    fn take(&mut self, limits: Limits, now: Instant, frames: f64, chunks: f64, bytes: f64) -> bool {
-        self.refill(limits, now);
+    fn take(&mut self, now: Instant, frames: f64, chunks: f64, bytes: f64) -> bool {
+        self.refill(now);
 
         self.frames -= frames;
         self.chunks -= chunks;
@@ -130,6 +146,9 @@ struct State {
     /// `ROOM_ID` → 双人会话
     rooms: HashMap<String, PairRoom>,
     buckets: HashMap<u64, Bucket>,
+    /// 公益档的每 IP **会话**数（`IpKey` → 组数）。只算新建的那一组，房间空了（`sweep`）
+    /// 就还回去；计数归零删键，别让扫描器留下小条目。
+    public_rooms_per_ip: HashMap<IpKey, usize>,
 }
 
 /// `admit` 的结果
@@ -152,8 +171,12 @@ enum Admit {
 pub enum RoomRejection {
     /// 同名的 Room 已经存在，但这次带来的 token 摘要对不上 → 401
     AuthMismatch,
+    /// 同名的 Room 已经存在，但这次的档位与创建时不同（两边填了不同类型的密码）→ 403
+    TierMismatch,
     /// 这是一个新 Room，而服务器已经承载了 `PAIR_MAX_SESSIONS` 个 → 503
     Capacity,
+    /// 这个 IP 的公益会话已经开满（`PAIR_MAX_PUBLIC_PER_IP`）→ 429
+    PublicIpLimit,
 }
 
 /// 一次已经被计进容量的入场许可：`reserve` 签发，`serve` 消费。
@@ -165,49 +188,141 @@ pub enum RoomRejection {
 pub struct Reservation {
     room_id: String,
     auth_hash: [u8; 32],
+    /// 这次连接算哪一档（welcome 要广告它，桶要按它取额度）
+    tier: Tier,
+    /// 这条连接来自哪个 IP（IPv6 按 /64 归并）。只在极少数「Room 被并发清掉、就地重建」
+    /// 的路径上要用它，所以跟着许可一起走，不必再回头问调用方。
+    ip: IpKey,
 }
 
-pub struct Relay {
-    limits: Limits,
-    max_sessions: usize,
-    stale_after: Duration,
-    ice_servers: Option<serde_json::Value>,
-    /// 内置 STUN 的端口（`None` = 没有内置 STUN，见 `stun.rs`）。有它而 `ice_servers`
+/// `Relay` 的全部构造参数。
+///
+/// 参数已经有十来项，全平铺进 `new()` 会让每个调用点都变成一串看不出含义的位置参数
+/// （公益档又加了 6 项）；这里一次性收成一个结构，调用点只写关心的字段。
+#[derive(Debug, Clone)]
+pub struct RelayOptions {
+    /// 部署者那一档的额度（也是它的桶容量）
+    pub limits: Limits,
+    /// 公益档自己的额度。公益档只放行小帧（信令），所以这份值比 `limits` 小得多
+    pub public_limits: Limits,
+    /// 部署者那一档能同时承载的会话数（`PAIR_MAX_SESSIONS`）
+    pub max_sessions: usize,
+    /// 公益档能同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。0 = 公益档关闭
+    pub max_public_sessions: usize,
+    /// 同一个 IP 最多几条公益连接（`PAIR_MAX_PUBLIC_PER_IP`）。0 = 不限
+    pub max_public_per_ip: usize,
+    /// 公益档的空闲回收窗口：多久没收到任何入站消息就断开。`None` = 不回收
+    pub public_window: Option<Duration>,
+    /// 多久没有消息的连接可以被新连接顶替
+    pub stale_after: Duration,
+    /// `server.welcome` 里附带的 ICE 服务器（`PAIR_ICE_SERVERS`，可选，原样透传）
+    pub ice_servers: Option<serde_json::Value>,
+    /// 内置 STUN 的 UDP 端口（`None` = 没有内置 STUN，见 `stun.rs`）。有它而 `ice_servers`
     /// 为空时，welcome 里广告 `stun:<客户端连进来用的主机名>:<端口>`。
-    stun_port: Option<u16>,
+    pub stun_port: Option<u16>,
     /// R36：`SHA256(derive_server_token(服务器密码))`。这一版中继**必须**有它：
     /// 它是「谁能连上这台服务器」的唯一门槛，缺了它任何人都能白用转发与 TURN。
     /// 与 Room 的 verifier 一样只存摘要——启动之后进程里没有密码原文。
-    server_verifier: [u8; 32],
+    pub server_verifier: [u8; 32],
+    /// 公益密码的 verifier（`PAIR_PUBLIC_SERVER_PASSWORD`）。`None` = 这台服务器没有公益档
+    pub public_verifier: Option<[u8; 32]>,
+    /// 信不信 `X-Forwarded-For`（`PAIR_TRUST_PROXY`）。只在前面有可信反代时打开
+    pub trust_proxy: bool,
+}
+
+impl Default for RelayOptions {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            public_limits: Limits {
+                frames_per_second: protocol::DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND,
+                chunks_per_second: protocol::DEFAULT_MAX_CHUNKS_PER_SECOND,
+                bytes_per_second: protocol::DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+            },
+            max_sessions: protocol::DEFAULT_MAX_SESSIONS,
+            max_public_sessions: protocol::DEFAULT_MAX_PUBLIC_SESSIONS,
+            max_public_per_ip: protocol::DEFAULT_MAX_PUBLIC_PER_IP,
+            public_window: Some(Duration::from_secs(protocol::DEFAULT_PUBLIC_WINDOW_SECS)),
+            stale_after: Duration::from_millis(protocol::DEFAULT_STALE_AFTER_MS),
+            ice_servers: None,
+            stun_port: None,
+            server_verifier: [0u8; 32],
+            public_verifier: None,
+            trust_proxy: false,
+        }
+    }
+}
+
+pub struct Relay {
+    options: RelayOptions,
     next_id: AtomicU64,
     state: Mutex<State>,
 }
 
 impl Relay {
-    pub fn new(
-        limits: Limits,
-        max_sessions: usize,
-        stale_after: Duration,
-        ice_servers: Option<serde_json::Value>,
-        stun_port: Option<u16>,
-        server_verifier: [u8; 32],
-    ) -> Arc<Self> {
+    pub fn new(options: RelayOptions) -> Arc<Self> {
         Arc::new(Self {
-            limits,
-            max_sessions,
-            stale_after,
-            ice_servers,
-            stun_port,
-            server_verifier,
+            options,
             next_id: AtomicU64::new(1),
             state: Mutex::new(State::default()),
         })
     }
 
-    /// 这次连接带来的服务器凭据对不对（R36）。恒定时间比较，与长度无关的旁路不成立
-    /// （两边都是 32 字节摘要）。
-    pub fn accepts_server_token(&self, token: &str) -> bool {
-        constant_time_eq(&auth_verifier(token), &self.server_verifier)
+    pub fn trust_proxy(&self) -> bool {
+        self.options.trust_proxy
+    }
+
+    /// 这台服务器**实际上**有没有公益档（`/health`、启动输出与凭据判定共用同一个判据）。
+    ///
+    /// 光配了密码还不算：名额为 0 时那一档一个人都进不来（`max_sessions_for` 会让每个
+    /// 公益连接拿到 `Capacity` → HTTP 503，客户端还会按退避一直重试）。所以「配了密码」
+    /// 与「开着」是两件事，`/health` 必须报后者——部署者就是拿这个接口确认自己装对了
+    /// 没有，报错方向的话他查的是一条不存在的故障。
+    pub fn has_public_tier(&self) -> bool {
+        self.options.public_verifier.is_some() && self.options.max_public_sessions > 0
+    }
+
+    /// 这一档能同时承载多少个会话。公益档的名额与部署者那一档**完全分开**：
+    /// 公益档再热闹也占不到部署者自己的名额，反之亦然。
+    fn max_sessions_for(&self, tier: Tier) -> usize {
+        match tier {
+            Tier::Full => self.options.max_sessions,
+            Tier::Public => self.options.max_public_sessions,
+        }
+    }
+
+    /// 这一档的额度（也是它每个连接的桶容量）
+    fn limits_for(&self, tier: Tier) -> Limits {
+        match tier {
+            Tier::Full => self.options.limits,
+            Tier::Public => self.options.public_limits,
+        }
+    }
+
+    /// 这次连接带来的服务器凭据算哪一档（R36 + 公益档）。`None` = 凭据不对，拒绝。
+    ///
+    /// 恒定时间比较、与长度无关的旁路不成立（两边都是 32 字节摘要）。**两次比较都要跑完
+    /// 再决定**：命中就提前返回会让「命中了哪一档」通过时间差漏出去。
+    ///
+    /// 公益档被关掉（名额 0）时**故意**不认那把钥匙：它就等于「这台服务器没有公益档」，
+    /// 于是那些人拿到的是 403「服务器密码不正确」，而不是一条会让客户端无限退避重试的
+    /// 503「会话已满」——后者说的是一件没发生的事（名额根本没被占满）。
+    pub fn classify_server_token(&self, token: &str) -> Option<Tier> {
+        let verifier = auth_verifier(token);
+        let full = constant_time_eq(&verifier, &self.options.server_verifier);
+        let public = self.has_public_tier()
+            && self
+                .options
+                .public_verifier
+                .is_some_and(|expected| constant_time_eq(&verifier, &expected));
+
+        if full {
+            Some(Tier::Full)
+        } else if public {
+            Some(Tier::Public)
+        } else {
+            None
+        }
     }
 
     /// 这次连接的 welcome 里该广告哪些 ICE 服务器。
@@ -215,12 +330,20 @@ impl Relay {
     /// 部署者配了 `PAIR_ICE_SERVERS` 就原样用它；否则有内置 STUN 时，用客户端连进来时的
     /// `Host` 拼出 `stun:<主机名>:<端口>`——客户端怎么找到这台服务器的，就怎么找到它的
     /// STUN，部署者什么都不用填。`Host` 缺失或形状不对时不广告（P2P 退回只有内网地址）。
-    pub fn ice_servers_for(&self, host: Option<&str>) -> Option<serde_json::Value> {
-        if let Some(servers) = &self.ice_servers {
-            return Some(servers.clone());
+    ///
+    /// **公益档只拿 `stun:`**：`turn:` 的条目（连带按流量计费的凭据）一个都不给，而且
+    /// 顺手把 `username` / `credential` 字段从留下的小条目里摘掉（纵深防御）。STUN 本身
+    /// 就不做鉴权（谁问都答，见 `stun.rs`），所以给公益档不新增任何暴露；不给的话公益档
+    /// 只剩内网地址，跨网络一定打不通，那一档等于没有。
+    pub fn ice_servers_for(&self, host: Option<&str>, tier: Tier) -> Option<serde_json::Value> {
+        if let Some(servers) = &self.options.ice_servers {
+            return match tier {
+                Tier::Full => Some(servers.clone()),
+                Tier::Public => stun_only(servers),
+            };
         }
 
-        let port = self.stun_port?;
+        let port = self.options.stun_port?;
         let name = crate::stun::host_without_port(host?)?;
 
         Some(serde_json::json!([{ "urls": [format!("stun:{name}:{port}")] }]))
@@ -232,6 +355,8 @@ impl Relay {
         &self,
         room_id: &str,
         auth_hash: [u8; 32],
+        tier: Tier,
+        ip: IpKey,
     ) -> Result<Reservation, RoomRejection> {
         let mut state = self.state.lock().await;
         let now = Instant::now();
@@ -242,18 +367,51 @@ impl Relay {
                     return Err(RoomRejection::AuthMismatch);
                 }
 
+                // 档位定在 Room 上（见 `PairRoom::tier`）：两边必须填同一类密码。填错了
+                // 这里挡住并给出指向，比「一个人有中继兜底、另一个人什么都没有」好。
+                if room.tier != tier {
+                    return Err(RoomRejection::TierMismatch);
+                }
+
                 room.pending += 1;
             }
             None => {
-                // 满了只挡**新建**会话；已经在跑的 Room 走上面那一支，不受影响（§8）
-                if state.rooms.len() >= self.max_sessions {
+                // 满了只挡**新建**会话；已经在跑的 Room 走上面那一支，不受影响（§8）。
+                // 两档各算各的名额：公益档再多也占不到部署者自己的名额（反之亦然）。
+                let used = state
+                    .rooms
+                    .values()
+                    .filter(|room| room.tier == tier)
+                    .count();
+
+                if used >= self.max_sessions_for(tier) {
                     return Err(RoomRejection::Capacity);
+                }
+
+                // 同一个 IP 最多开几组公益会话。只挡新建：同一对用户的第二个人照旧进得来
+                // （不然同一个 NAT 下面的一对人会被自己挡住）。
+                if tier == Tier::Public
+                    && self.options.max_public_per_ip > 0
+                    && state
+                        .public_rooms_per_ip
+                        .get(&ip)
+                        .copied()
+                        .unwrap_or_default()
+                        >= self.options.max_public_per_ip
+                {
+                    return Err(RoomRejection::PublicIpLimit);
+                }
+
+                if tier == Tier::Public {
+                    *state.public_rooms_per_ip.entry(ip).or_default() += 1;
                 }
 
                 state.rooms.insert(
                     room_id.to_string(),
                     PairRoom {
                         auth_hash,
+                        tier,
+                        ip,
                         clients: HashMap::new(),
                         pending: 1,
                         created_at: now,
@@ -266,6 +424,8 @@ impl Relay {
         Ok(Reservation {
             room_id: room_id.to_string(),
             auth_hash,
+            tier,
+            ip,
         })
     }
 
@@ -289,6 +449,7 @@ impl Relay {
         reservation: Reservation,
     ) -> Result<(), String> {
         let room_id = reservation.room_id.clone();
+        let tier = reservation.tier;
 
         let Some(key) = head.header("sec-websocket-key") else {
             self.release(reservation).await;
@@ -350,8 +511,9 @@ impl Relay {
                 let welcome = ServerFrame::Welcome {
                     protocol: protocol::PROTOCOL_VERSION,
                     peer_online,
-                    limits: self.limits,
-                    ice_servers: self.ice_servers_for(head.header("host")),
+                    limits: self.limits_for(tier),
+                    ice_servers: self.ice_servers_for(head.header("host"), tier),
+                    tier,
                 }
                 .to_json();
 
@@ -381,15 +543,48 @@ impl Relay {
             let _ = sink.close().await;
         });
 
+        // 公益档的空闲回收（见 `protocol.rs` 的 `DEFAULT_PUBLIC_WINDOW_SECS`）。
+        //
+        // 它是**空闲回收器**，不是「打洞截止时间」：中继看不到 DataChannel 有没有建立
+        // 成功（信令是密文），所以任何「到点硬断」都会掐断已经直连成功、正在正常使用的
+        // 会话——而中继一断，客户端是整条会话重启、直连也跟着重来。判据是「多久没收到
+        // **任何**入站消息」，诚实客户端每 60 秒发一次 WebSocket Ping。
+        let window = self.options.public_window.filter(|_| tier == Tier::Public);
+        let mut idle_deadline = window.map(|window| tokio::time::Instant::now() + window);
+
         loop {
+            // 把截止时刻拷出来（`Option<Instant>` 是 `Copy`）：`select!` 那一支要借它，
+            // 另一支要可变借 `idle_deadline`，同一个变量同时借两次过不了借用检查
+            let idle_at = idle_deadline;
+            let idle = async {
+                match idle_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+
             let item = tokio::select! {
                 // 注册表里已经没有这条连接了：读循环必须跟着结束，否则 socket 会一直
                 // 挂着（见 `Peer::ejected`）。
                 _ = &mut ejected => break,
+                _ = idle => {
+                    let _ = sender.try_send(Message::Close(Some(close_frame(
+                        close_code::PUBLIC_WINDOW,
+                        "public window idle",
+                    ))));
+
+                    break;
+                }
                 item = stream_half.next() => item,
             };
 
             let Some(item) = item else { break };
+
+            // 任何入站消息都续期——包括下面那条会被忽略的 WS Ping/Pong：那是诚实客户端
+            // 的节拍，正是「这条连接还活着」的证据。
+            if let (Some(window), Some(deadline)) = (window, idle_deadline.as_mut()) {
+                *deadline = tokio::time::Instant::now() + window;
+            }
 
             let message = match item {
                 Ok(message) => message,
@@ -435,6 +630,39 @@ impl Relay {
                         ))));
 
                         break;
+                    }
+
+                    // 公益档只放行信令（kind 8：`pair.signal` 与 `pair.ping/pong`）。
+                    //
+                    // 这是**策略与额度边界，不是密码学边界**：中继只读 14 字节明文帧头，
+                    // 解不开载荷，所以它挡不住「把数据塞进 kind 8」，只能把量压成涓流
+                    // （配合公益档自己的小额度与 64 KiB 单帧上限）。
+                    //
+                    // 这里选择**如实拒绝**而不是静默丢：静默丢会让界面显示「已连接」，
+                    // 而对方猫不动、消息发不出去，会话还无限期占着一个公益名额。
+                    if tier == Tier::Public {
+                        if bytes.len() > MAX_PUBLIC_FRAME_SIZE {
+                            let _ = sender.try_send(Message::Close(Some(close_frame(
+                                close_code::TOO_LARGE,
+                                "frame too large for the public tier",
+                            ))));
+
+                            break;
+                        }
+
+                        if kind != FRAME_KIND_SIGNAL {
+                            println!(
+                                "[{}] 公益档拒绝了数据帧（kind {kind}，device {device_id}）",
+                                room_fingerprint(&room_id)
+                            );
+
+                            let _ = sender.try_send(Message::Close(Some(close_frame(
+                                close_code::PROTOCOL_ERROR,
+                                "public tier carries signaling only",
+                            ))));
+
+                            break;
+                        }
                     }
 
                     let chunks = if kind == FRAME_KIND_TRANSFER_CHUNK {
@@ -507,6 +735,8 @@ impl Relay {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         let room_id = reservation.room_id.as_str();
+        let tier = reservation.tier;
+        let ip = reservation.ip;
 
         // 预留一定要在这里减掉：漏一次这个 Room 就永远清不掉（容量泄漏）。
         match state.rooms.get_mut(room_id) {
@@ -518,6 +748,8 @@ impl Relay {
                     room_id.to_string(),
                     PairRoom {
                         auth_hash: reservation.auth_hash,
+                        tier,
+                        ip,
                         clients: HashMap::new(),
                         pending: 0,
                         created_at: now,
@@ -543,7 +775,8 @@ impl Relay {
                 others
                     .iter()
                     .filter(|other| {
-                        now.duration_since(room.clients[*other].last_seen) > self.stale_after
+                        now.duration_since(room.clients[*other].last_seen)
+                            > self.options.stale_after
                     })
                     // 顶替「先连进来的那一个」：CF 版按 Durable Object 的 WebSocket 插入
                     // 顺序找第一个陈旧的连接，而每条连接的 id 正是按到达顺序单调发下去的，
@@ -595,7 +828,7 @@ impl Relay {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (ejected, ejected_receiver) = oneshot::channel();
 
-        state.buckets.insert(id, Bucket::full(self.limits, now));
+        state.buckets.insert(id, Bucket::full(self.limits_for(tier), now));
 
         {
             let room = state
@@ -697,7 +930,7 @@ impl Relay {
             return false;
         };
 
-        bucket.take(self.limits, now, frames, chunks, bytes)
+        bucket.take(now, frames, chunks, bytes)
     }
 
     /// 只转发给**同一个 Room** 的对端，不回发给发送者，也不遍历别的 Room（§15）。
@@ -729,6 +962,108 @@ impl Relay {
                 }
             }
         }
+    }
+}
+
+/// 一个 IP 的归并键。
+///
+/// IPv4 按 /32（就是一个地址）；**IPv6 按 /64** 归并：一台机器随手就能换出同一段 /64
+/// 里的地址，只按 /32 记等于没限额。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IpKey([u8; 16]);
+
+impl IpKey {
+    fn from_addr(address: IpAddr) -> Self {
+        // 双栈 socket 上 IPv4 客户端会以 `::ffff:a.b.c.d` 出现，先归一：不归一的话同一个
+        // 客户端在两种写法下会被算成两个 IP，限额就漏了
+        let address = match address {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            other => other,
+        };
+
+        match address {
+            IpAddr::V4(v4) => {
+                let mut bytes = [0u8; 16];
+                bytes[..4].copy_from_slice(&v4.octets());
+
+                Self(bytes)
+            }
+            IpAddr::V6(v6) => {
+                let mut bytes = v6.octets();
+                bytes[8..].fill(0);
+
+                Self(bytes)
+            }
+        }
+    }
+}
+
+/// 这次连接该按哪个 IP 记额度。
+///
+/// `X-Forwarded-For` 只在**开了 `PAIR_TRUST_PROXY`** 且**对端本身是内网 / 回环地址**时
+/// 才认：域名模式里中继只 `expose` 给 Docker 内网、前面站着 Caddy，那一跳可信；direct
+/// 模式把端口发布到公网，那时对端是公网地址、整条头都不看——伪造不进来。
+///
+/// 取**最后一个**条目：那是我们信任的这一跳自己追加的（Caddy 是 append 而不是
+/// replace），客户端伪造的前缀赢不了。
+pub fn client_ip(peer: SocketAddr, forwarded_for: Option<&str>, trust_proxy: bool) -> IpKey {
+    if trust_proxy && is_private_or_loopback(peer.ip()) {
+        if let Some(address) = forwarded_for
+            .and_then(|value| value.split(',').next_back())
+            .and_then(|last| last.trim().parse::<IpAddr>().ok())
+        {
+            return IpKey::from_addr(address);
+        }
+    }
+
+    IpKey::from_addr(peer.ip())
+}
+
+/// 私网 / 回环 / 链路本地。站在这些地址后面的一定是我们自己人（反代容器、docker 网桥、
+/// 本机），所以只有那时才肯信它转发的头。
+fn is_private_or_loopback(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_private() || v4.is_loopback())
+        }
+    }
+}
+
+/// 把 `iceServers` 过滤成「只剩 STUN」。
+///
+/// 公益档绝不能拿到 `turn:`（它按流量计费，比带宽贵得多），顺带把 `username` /
+/// `credential` 也摘掉（纵深防御：TURN 凭据只对 TURN 条目有意义）。过滤完一条都不剩
+/// 就返回 `None`——宁可不广告，也不要给出一份只有 TURN 的清单。
+fn stun_only(servers: &serde_json::Value) -> Option<serde_json::Value> {
+    let kept: Vec<serde_json::Value> = servers
+        .as_array()?
+        .iter()
+        .filter(|entry| {
+            urls_of(entry.get("urls").unwrap_or(&serde_json::Value::Null)).is_some_and(|urls| {
+                !urls.is_empty() && urls.iter().all(|url| url.starts_with("stun:"))
+            })
+        })
+        .map(|entry| serde_json::json!({ "urls": entry.get("urls").cloned().unwrap_or_default() }))
+        .collect();
+
+    (!kept.is_empty()).then_some(serde_json::Value::Array(kept))
+}
+
+/// `urls` 可以是单个字符串，也可以是字符串数组（与 WebRTC 的 `RTCIceServer` 一致）
+fn urls_of(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(url) => Some(vec![url.clone()]),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => None,
     }
 }
 
@@ -864,12 +1199,26 @@ fn sweep(state: &mut State, room_id: &str) {
 
     let created_at = room.created_at;
     let last_active = room.last_active;
+    let tier = room.tier;
+    let ip = room.ip;
 
     state.rooms.remove(room_id);
 
+    // 公益档的每 IP 名额跟着房间走：房间空了就还回去，别让「开一组、马上退」把配额用光
+    if tier == Tier::Public {
+        if let Some(count) = state.public_rooms_per_ip.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+
+            if *count == 0 {
+                state.public_rooms_per_ip.remove(&ip);
+            }
+        }
+    }
+
     println!(
-        "[{}] 双人会话已释放（存活 {:.0}s，最后活动在 {:.0}s 前）",
+        "[{}] 双人会话已释放（{} 档，存活 {:.0}s，最后活动在 {:.0}s 前）",
         room_fingerprint(room_id),
+        tier.as_str(),
         created_at.elapsed().as_secs_f64(),
         last_active.elapsed().as_secs_f64()
     );
@@ -890,30 +1239,124 @@ mod tests {
     const ROOM_B: &str = "room-b";
     const ROOM_C: &str = "room-c";
 
+    /// 部署者那一档的服务器密码（会话层的默认档位）
+    const SERVER_PASSWORD: &str = "relay-unit-tests-server-password";
+    /// 公益档的服务器密码
+    const PUBLIC_PASSWORD: &str = "relay-unit-tests-public-password";
+
     fn relay(max_sessions: usize, stale_after: Duration) -> Arc<Relay> {
-        Relay::new(
-            Limits::default(),
+        relay_with(Options {
             max_sessions,
             stale_after,
-            None,
-            None,
+            ..Options::default()
+        })
+    }
+
+    /// 只写出用例关心的那几项，其余走缺省——公益档一加，`RelayOptions` 就有十来项了
+    #[derive(Default)]
+    struct Options {
+        max_sessions: usize,
+        max_public_sessions: usize,
+        max_public_per_ip: usize,
+        public_window: Option<Duration>,
+        stale_after: Duration,
+        ice_servers: Option<serde_json::Value>,
+        stun_port: Option<u16>,
+        public_verifier: Option<[u8; 32]>,
+        trust_proxy: bool,
+    }
+
+    fn relay_with(options: Options) -> Arc<Relay> {
+        Relay::new(RelayOptions {
+            limits: Limits::default(),
+            public_limits: RelayOptions::default().public_limits,
+            max_sessions: options.max_sessions,
+            max_public_sessions: options.max_public_sessions,
+            max_public_per_ip: options.max_public_per_ip,
+            public_window: options.public_window,
+            stale_after: options.stale_after,
+            ice_servers: options.ice_servers,
+            stun_port: options.stun_port,
             // 会话层用不到服务器密码（那是 `server.rs` 在升级之前判的），给一个固定摘要
-            auth::server_verifier("relay-unit-tests-server-password"),
-        )
+            server_verifier: auth::server_verifier(SERVER_PASSWORD),
+            public_verifier: options.public_verifier,
+            trust_proxy: options.trust_proxy,
+        })
+    }
+
+    /// 一个固定的来源 IP（IPv4）。同一个用例里所有连接默认都从它来。
+    fn ip(last: u8) -> IpKey {
+        IpKey::from_addr(IpAddr::from([10, 0, 0, last]))
     }
 
     /// R36：会话层不该认错的服务器凭据
     #[test]
     fn the_relay_only_accepts_its_own_server_password() {
         let relay = relay(20, Duration::from_secs(120));
-        let token = auth::derive_server_token("relay-unit-tests-server-password");
+        let token = auth::derive_server_token(SERVER_PASSWORD);
 
-        assert!(relay.accepts_server_token(&token));
-        assert!(!relay.accepts_server_token(""));
-        assert!(!relay.accepts_server_token("relay-unit-tests-server-password"));
-        assert!(!relay.accepts_server_token(&auth::derive_server_token(
-            "relay-unit-tests-server-password2"
-        )));
+        assert_eq!(relay.classify_server_token(&token), Some(Tier::Full));
+        assert_eq!(relay.classify_server_token(""), None);
+        // 密码原文不是凭据：凭据是它派生出的一串
+        assert_eq!(relay.classify_server_token(SERVER_PASSWORD), None);
+        assert_eq!(
+            relay.classify_server_token(&auth::derive_server_token("relay-unit-tests-server-password2")),
+            None
+        );
+    }
+
+    /// 两把钥匙各归各的档：这是「谁能用多少」的唯一判据
+    #[test]
+    fn the_two_server_passwords_map_to_their_own_tier() {
+        let open = relay_with(Options {
+            max_sessions: 20,
+            max_public_sessions: 10,
+            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            ..Options::default()
+        });
+
+        assert_eq!(
+            open.classify_server_token(&auth::derive_server_token(SERVER_PASSWORD)),
+            Some(Tier::Full)
+        );
+        assert_eq!(
+            open.classify_server_token(&auth::derive_server_token(PUBLIC_PASSWORD)),
+            Some(Tier::Public)
+        );
+        assert_eq!(
+            open.classify_server_token(&auth::derive_server_token("someone-else")),
+            None
+        );
+        // 没配公益密码的部署：那把钥匙什么也不是，绝不能掉回部署者那一档
+        let closed = relay(20, Duration::from_secs(120));
+
+        assert_eq!(
+            closed.classify_server_token(&auth::derive_server_token(PUBLIC_PASSWORD)),
+            None
+        );
+        assert!(!closed.has_public_tier());
+        assert!(open.has_public_tier());
+
+        // 配了密码、但名额 0 = 这一档**实际关掉**（`PAIR_MAX_PUBLIC_SESSIONS=0`）。
+        // 这时它必须表现得像「没有公益档」：那把钥匙进不来（403），而不是让每个连接
+        // 拿到 503「会话已满」——那说的是一件没发生的事，客户端还会按退避一直重试。
+        let off = relay_with(Options {
+            max_sessions: 20,
+            max_public_sessions: 0,
+            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            ..Options::default()
+        });
+
+        assert_eq!(
+            off.classify_server_token(&auth::derive_server_token(PUBLIC_PASSWORD)),
+            None
+        );
+        assert!(!off.has_public_tier());
+        // 部署者那一档不受影响
+        assert_eq!(
+            off.classify_server_token(&auth::derive_server_token(SERVER_PASSWORD)),
+            Some(Tier::Full)
+        );
     }
 
     /// 走完 `reserve` + `admit` 的正常路径（不 panic，拒绝的情况也返回给用例断言）
@@ -924,8 +1367,39 @@ mod tests {
         device_id: &str,
         sender: &mpsc::Sender<Message>,
     ) -> Admit {
+        join_as(relay, room_id, token, device_id, sender, Tier::Full, ip(1)).await
+    }
+
+    /// 指定档位与来源 IP 的 `join`：公益档那几条用例要它（默认那条永远是部署者档）
+    async fn join_tier(
+        relay: &Arc<Relay>,
+        room_id: &str,
+        token: &str,
+        device_id: &str,
+        sender: &mpsc::Sender<Message>,
+        tier: Tier,
+        source: IpKey,
+    ) -> Result<Admit, RoomRejection> {
         let reservation = relay
-            .reserve(room_id, auth::auth_verifier(token))
+            .reserve(room_id, auth::auth_verifier(token), tier, source)
+            .await?;
+
+        Ok(relay.admit(reservation, device_id, sender).await)
+    }
+
+    /// 走完 `reserve` + `admit` 的正常路径，`reserve` 被拒时 panic（返回拒绝原因的路走
+    /// [`join_tier`]）
+    async fn join_as(
+        relay: &Arc<Relay>,
+        room_id: &str,
+        token: &str,
+        device_id: &str,
+        sender: &mpsc::Sender<Message>,
+        tier: Tier,
+        source: IpKey,
+    ) -> Admit {
+        let reservation = relay
+            .reserve(room_id, auth::auth_verifier(token), tier, source)
             .await
             .unwrap_or_else(|rejection| panic!("预留 {room_id} 不该被拒：{rejection:?}"));
 
@@ -1013,7 +1487,7 @@ mod tests {
         let mut admitted = 0;
 
         // 容量就是「每秒上限」：一直发到被拒为止，正好 30 帧
-        while bucket.take(limits, start, 1.0, 0.0, frame) {
+        while bucket.take(start, 1.0, 0.0, frame) {
             admitted += 1;
         }
 
@@ -1024,7 +1498,7 @@ mod tests {
         let later = start + Duration::from_secs(1);
         let mut admitted_after_refill = 0;
 
-        while bucket.take(limits, later, 1.0, 0.0, frame) {
+        while bucket.take(later, 1.0, 0.0, frame) {
             admitted_after_refill += 1;
         }
 
@@ -1041,11 +1515,11 @@ mod tests {
         let chunk = 512.0 * 1024.0 + FRAME_HEADER_SIZE as f64 + 24.0 + 16.0;
 
         for _ in 0..20 {
-            assert!(bucket.take(limits, start, 1.0, 1.0, chunk));
+            assert!(bucket.take(start, 1.0, 1.0, chunk));
         }
 
         // 第 21 个 chunk 会被分片额度拦住
-        assert!(!bucket.take(limits, start, 1.0, 1.0, chunk));
+        assert!(!bucket.take(start, 1.0, 1.0, chunk));
     }
 
     #[test]
@@ -1055,9 +1529,9 @@ mod tests {
         let mut bucket = Bucket::full(limits, start);
         let half = limits.bytes_per_second / 2.0;
 
-        assert!(bucket.take(limits, start, 0.0, 0.0, half));
-        assert!(bucket.take(limits, start, 0.0, 0.0, half));
-        assert!(!bucket.take(limits, start, 0.0, 0.0, 1.0));
+        assert!(bucket.take(start, 0.0, 0.0, half));
+        assert!(bucket.take(start, 0.0, 0.0, half));
+        assert!(!bucket.take(start, 0.0, 0.0, 1.0));
     }
 
     /// §30「Room 创建」：第一个人进来就把会话建起来，另一个人还没在
@@ -1137,7 +1611,7 @@ mod tests {
 
         assert_eq!(
             relay
-                .reserve(ROOM_A, auth::auth_verifier("token-wrong"))
+                .reserve(ROOM_A, auth::auth_verifier("token-wrong"), Tier::Full, ip(1))
                 .await
                 .unwrap_err(),
             RoomRejection::AuthMismatch
@@ -1310,7 +1784,7 @@ mod tests {
         // 新的会话被拒（就是 server.rs 翻成 HTTP 503 的那条路径）
         assert_eq!(
             relay
-                .reserve(ROOM_C, auth::auth_verifier("token-c"))
+                .reserve(ROOM_C, auth::auth_verifier("token-c"), Tier::Full, ip(1))
                 .await
                 .unwrap_err(),
             RoomRejection::Capacity
@@ -1335,7 +1809,7 @@ mod tests {
 
         assert_eq!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"))
+                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Full, ip(1))
                 .await
                 .unwrap_err(),
             RoomRejection::Capacity
@@ -1345,7 +1819,7 @@ mod tests {
 
         assert!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"))
+                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Full, ip(1))
                 .await
                 .is_ok(),
             "会话空了就该把名额还回来"
@@ -1388,7 +1862,7 @@ mod tests {
     async fn a_reservation_that_never_reaches_admit_is_given_back() {
         let relay = relay(1, Duration::from_secs(120));
         let reservation = relay
-            .reserve(ROOM_A, auth::auth_verifier("token-a"))
+            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
             .await
             .unwrap();
 
@@ -1396,7 +1870,7 @@ mod tests {
 
         assert!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"))
+                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Full, ip(1))
                 .await
                 .is_ok(),
             "没用掉的预留必须把名额还回来"
@@ -1408,11 +1882,11 @@ mod tests {
     async fn a_room_with_a_handshake_in_flight_is_not_swept() {
         let relay = relay(1, Duration::from_secs(120));
         let first = relay
-            .reserve(ROOM_A, auth::auth_verifier("token-a"))
+            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
             .await
             .unwrap();
         let second = relay
-            .reserve(ROOM_A, auth::auth_verifier("token-a"))
+            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
             .await
             .unwrap();
 
@@ -1421,7 +1895,7 @@ mod tests {
         // 房间还在，而且仍然认同一份密钥（没有被清掉再重建）
         assert_eq!(
             relay
-                .reserve(ROOM_A, auth::auth_verifier("wrong"))
+                .reserve(ROOM_A, auth::auth_verifier("wrong"), Tier::Full, ip(1))
                 .await
                 .unwrap_err(),
             RoomRejection::AuthMismatch
@@ -1554,5 +2028,357 @@ mod tests {
 
         // 而且 B 收到了「A 离线」，不会一直以为对方在线
         assert!(announced_offline(&mut b_rx, "a"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 公益档：名额 / 档位 / 每 IP 限额 / 只给 STUN
+    // -----------------------------------------------------------------------
+
+    fn public_relay(
+        max_sessions: usize,
+        max_public_sessions: usize,
+        max_public_per_ip: usize,
+    ) -> Arc<Relay> {
+        relay_with(Options {
+            max_sessions,
+            max_public_sessions,
+            max_public_per_ip,
+            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            ..Options::default()
+        })
+    }
+
+    /// 两档各算各的名额：公益档再热闹也占不到部署者自己的位置，反之亦然
+    #[tokio::test]
+    async fn the_public_tier_has_its_own_capacity() {
+        let relay = public_relay(1, 1, 0);
+        let (public_tx, _public_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (full_tx, _full_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        // 公益档占掉它那唯一一个位置
+        join_as(
+            &relay,
+            ROOM_A,
+            "token-a",
+            "a1",
+            &public_tx,
+            Tier::Public,
+            ip(1),
+        )
+        .await;
+
+        // 公益档满了，但它占**不到**部署者那一档的位置
+        join_as(
+            &relay,
+            ROOM_B,
+            "token-b",
+            "b1",
+            &full_tx,
+            Tier::Full,
+            ip(1),
+        )
+        .await;
+
+        // 于是两档各拒各的：两边都是「自己那一档满了」
+        assert_eq!(
+            relay
+                .reserve(
+                    &room_id_of('c'),
+                    auth::auth_verifier("token-c"),
+                    Tier::Public,
+                    ip(1)
+                )
+                .await
+                .unwrap_err(),
+            RoomRejection::Capacity
+        );
+        assert_eq!(
+            relay
+                .reserve(
+                    &room_id_of('d'),
+                    auth::auth_verifier("token-d"),
+                    Tier::Full,
+                    ip(2)
+                )
+                .await
+                .unwrap_err(),
+            RoomRejection::Capacity
+        );
+    }
+
+    /// 一个合法的 Room 名字（`reserve` 只把它当分组键，不校验格式）
+    fn room_id_of(seed: char) -> String {
+        format!("room-{seed}{seed}{seed}")
+    }
+
+    /// 档位定在 Room 上：同一个会话的两个人必须填同一类密码
+    #[tokio::test]
+    async fn a_room_keeps_the_tier_it_was_created_with() {
+        let relay = public_relay(20, 20, 0);
+        let (public_tx, _public_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (full_tx, _full_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        join_as(
+            &relay,
+            ROOM_A,
+            "token-a",
+            "a1",
+            &public_tx,
+            Tier::Public,
+            ip(1),
+        )
+        .await;
+
+        // 同一个人第二个连接、拿另一类密码：拒（填错密码的人不该进来，
+        // 而不是「一个人有中继兜底、另一个人什么都没有」）
+        assert_eq!(
+            relay
+                .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
+                .await
+                .unwrap_err(),
+            RoomRejection::TierMismatch
+        );
+
+        // 而同一类密码的第二个人照旧进得来
+        assert!(matches!(
+            join_as(
+                &relay,
+                ROOM_A,
+                "token-a",
+                "a2",
+                &full_tx,
+                Tier::Public,
+                ip(1)
+            )
+            .await,
+            Admit::Accepted { peer_online: true, .. }
+        ));
+    }
+
+    /// 公益档的每 IP 限额只挡**新建会话**，而且会话空了就把账还回去
+    #[tokio::test]
+    async fn the_public_per_ip_limit_counts_rooms_and_gives_them_back() {
+        let relay = public_relay(20, 20, 1);
+        let (a1_tx, _a1_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (a2_tx, _a2_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, _b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (c_tx, _c_rx) = mpsc::channel(OUTBOUND_QUEUE);
+
+        let (a1_id, _, _) =
+            join_ok_tier(&relay, ROOM_A, "token-a", "a1", &a1_tx, Tier::Public).await;
+
+        // 同一个会话的第二个人不受影响（同一个 NAT 下面的一对用户不能被自己挡住）
+        let (a2_id, peer_online, _) =
+            join_ok_tier(&relay, ROOM_A, "token-a", "a2", &a2_tx, Tier::Public).await;
+
+        assert!(peer_online);
+
+        // 第二个**会话**来自同一个 IP：拒
+        assert_eq!(
+            relay
+                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Public, ip(1))
+                .await
+                .unwrap_err(),
+            RoomRejection::PublicIpLimit
+        );
+
+        // 另一个 IP 不受影响
+        assert!(
+            join_tier(&relay, ROOM_B, "token-b", "b1", &b_tx, Tier::Public, ip(2))
+                .await
+                .is_ok()
+        );
+
+        // 第一个会话空了之后，同一个 IP 又能开一个（账要还回去）
+        relay.drop_peer(ROOM_A, "a1", a1_id).await;
+        relay.drop_peer(ROOM_A, "a2", a2_id).await;
+
+        let room_a = state_rooms(&relay).await;
+
+        assert!(!room_a.contains(&ROOM_A.to_string()), "会话空了就该被清掉");
+        assert!(
+            join_tier(&relay, ROOM_C, "token-c", "c1", &c_tx, Tier::Public, ip(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// `join` 的档位版成功路径
+    async fn join_ok_tier(
+        relay: &Arc<Relay>,
+        room_id: &str,
+        token: &str,
+        device_id: &str,
+        sender: &mpsc::Sender<Message>,
+        source_tier: Tier,
+    ) -> (u64, bool, oneshot::Receiver<()>) {
+        match join_as(
+            relay,
+            room_id,
+            token,
+            device_id,
+            sender,
+            source_tier,
+            ip(1),
+        )
+        .await
+        {
+            Admit::Accepted {
+                id,
+                peer_online,
+                ejected,
+            } => (id, peer_online, ejected),
+            Admit::Full => panic!("{device_id} 不该被拒绝"),
+        }
+    }
+
+    /// 当前活着的会话名（只给用例断言用）
+    async fn state_rooms(relay: &Arc<Relay>) -> Vec<String> {
+        relay
+            .state
+            .lock()
+            .await
+            .rooms
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// IPv6 按 /64 归并：同一段里的地址算同一个 IP，别的段算另一个
+    #[test]
+    fn ip_keys_fold_ipv6_by_slash_64() {
+        let first: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        let same_prefix: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        assert_eq!(IpKey::from_addr(first), IpKey::from_addr(same_prefix));
+        assert_ne!(IpKey::from_addr(first), IpKey::from_addr(other_prefix));
+
+        // IPv4 按 /32：同一段的邻居是**另一个** IP
+        assert_ne!(
+            IpKey::from_addr("10.0.0.1".parse().unwrap()),
+            IpKey::from_addr("10.0.0.2".parse().unwrap())
+        );
+
+        // 双栈 socket 上的 IPv4 客户端以 `::ffff:a.b.c.d` 出现，要和纯 IPv4 算成同一个
+        assert_eq!(
+            IpKey::from_addr("::ffff:10.0.0.1".parse().unwrap()),
+            IpKey::from_addr("10.0.0.1".parse().unwrap())
+        );
+    }
+
+    /// `X-Forwarded-For` 只在「开了开关」且「对端本身是自己人」时才认
+    #[test]
+    fn client_ip_only_trusts_forwarded_for_from_a_private_peer() {
+        let private_peer: SocketAddr = "172.18.0.5:5000".parse().unwrap();
+        let public_peer: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+
+        // 不开开关：永远看 peer
+        assert_eq!(
+            client_ip(private_peer, Some("198.51.100.7"), false),
+            IpKey::from_addr("172.18.0.5".parse().unwrap())
+        );
+
+        // 开了开关 + 私网 peer：取**最后一个**（可信那一跳自己追加的）
+        assert_eq!(
+            client_ip(private_peer, Some("198.51.100.7, 203.0.113.9"), true),
+            IpKey::from_addr("203.0.113.9".parse().unwrap())
+        );
+
+        // 公网 peer 伪造 XFF：整条头都不看
+        assert_eq!(
+            client_ip(public_peer, Some("198.51.100.7"), true),
+            IpKey::from_addr("203.0.113.9".parse().unwrap())
+        );
+
+        // 畸形 / 缺失：退回 peer，绝不能因此少算一个 IP（限额会漏）
+        assert_eq!(
+            client_ip(private_peer, Some("not-an-ip"), true),
+            IpKey::from_addr("172.18.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            client_ip(private_peer, None, true),
+            IpKey::from_addr("172.18.0.5".parse().unwrap())
+        );
+    }
+
+    /// 公益档只拿 `stun:`：`turn:` 条目与凭据一个都不给
+    #[test]
+    fn the_public_tier_only_gets_stun_servers() {
+        let servers = serde_json::json!([
+            { "urls": ["stun:cat.example.com:3478"] },
+            {
+                "urls": ["turn:cat.example.com:3478"],
+                "username": "coturn-user",
+                "credential": "coturn-pass"
+            },
+            { "urls": ["turn:cat.example.com:3478?transport=tcp"] }
+        ]);
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            ice_servers: Some(servers.clone()),
+            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            ..Options::default()
+        });
+
+        assert_eq!(
+            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Full),
+            Some(servers)
+        );
+        assert_eq!(
+            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Public),
+            Some(serde_json::json!([{ "urls": ["stun:cat.example.com:3478"] }]))
+        );
+
+        // 只有 TURN 的部署配置：公益档宁可不广告，也不给一份带凭据的清单
+        let turn_only = relay_with(Options {
+            max_sessions: 20,
+            ice_servers: Some(serde_json::json!([{
+                "urls": ["turn:cat.example.com:3478"],
+                "username": "u",
+                "credential": "p"
+            }])),
+            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            ..Options::default()
+        });
+
+        assert!(turn_only
+            .ice_servers_for(Some("cat.example.com:8080"), Tier::Public)
+            .is_none());
+
+        // 内置 STUN 那一条路两档一样（STUN 本来就不鉴权）
+        let builtin = relay_with(Options {
+            max_sessions: 20,
+            stun_port: Some(3479),
+            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            ..Options::default()
+        });
+
+        assert_eq!(
+            builtin.ice_servers_for(Some("cat.example.com:8080"), Tier::Public),
+            Some(serde_json::json!([{ "urls": ["stun:cat.example.com:3479"] }]))
+        );
+    }
+
+    /// 公益档的额度是另一份（默认 10 帧/秒 / 256 KiB/秒），桶按档位取
+    #[test]
+    fn the_public_tier_uses_its_own_limits() {
+        let relay = public_relay(20, 20, 0);
+        let start = Instant::now();
+        let public = Bucket::full(relay.limits_for(Tier::Public), start);
+        let full = Bucket::full(relay.limits_for(Tier::Full), start);
+
+        assert_eq!(
+            public.limits.frames_per_second,
+            protocol::DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND
+        );
+        assert_eq!(
+            public.limits.bytes_per_second,
+            protocol::DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND
+        );
+        assert!(
+            public.limits.frames_per_second < full.limits.frames_per_second,
+            "公益档的额度必须比部署者那一档小"
+        );
     }
 }

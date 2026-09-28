@@ -31,6 +31,18 @@ services:
       # 那行 udp，否则 `0:0/udp` 会让 compose 起不来
       PAIR_STUN_PORT: ${PAIR_STUN_PORT:-3479}
       PAIR_ICE_SERVERS: ${PAIR_ICE_SERVERS:-}
+      # 公益档（可选）：同 docker-compose.yml。direct 模式下对端就是客户端本身，
+      # 所以 PAIR_TRUST_PROXY 默认**关闭**（这里没有反代，开了只会让任何人伪造 XFF）
+      PAIR_PUBLIC_SERVER_PASSWORD: ${PAIR_PUBLIC_SERVER_PASSWORD:-}
+      PAIR_MAX_PUBLIC_SESSIONS: ${PAIR_MAX_PUBLIC_SESSIONS:-}
+      PAIR_MAX_PUBLIC_PER_IP: ${PAIR_MAX_PUBLIC_PER_IP:-}
+      PAIR_PUBLIC_MAX_FRAMES_PER_SECOND: ${PAIR_PUBLIC_MAX_FRAMES_PER_SECOND:-}
+      PAIR_PUBLIC_MAX_BYTES_PER_SECOND: ${PAIR_PUBLIC_MAX_BYTES_PER_SECOND:-}
+      PAIR_PUBLIC_WINDOW_SECS: ${PAIR_PUBLIC_WINDOW_SECS:-}
+      # 这里**写死 0**（不用 `${...:-0}`）：两种模式常常共用一份 `.env`，而域名模式那一份
+      # 建议打开它（`PAIR_TRUST_PROXY=1`）。direct 模式把 8080 直接发布到公网，没有反代，
+      # 打开就等于让**私网**对端伪造 `X-Forwarded-For` 绕过公益档的「每 IP 几组」限额。
+      PAIR_TRUST_PROXY: 0
     ports:
       - '8080:8080'
       - '${PAIR_STUN_PORT:-3479}:${PAIR_STUN_PORT:-3479}/udp'

@@ -12,12 +12,14 @@ use crate::auth;
 use crate::http::{read_request_head, write_response, write_response_with_headers};
 use crate::protocol::{
     is_valid_device_id, is_valid_room_id, Limits, DEFAULT_MAX_BYTES_PER_SECOND,
-    DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND, DEFAULT_MAX_SESSIONS,
-    DEFAULT_STALE_AFTER_MS, HEADER_AUTHORIZATION, HEADER_CLIENT, HEADER_PROTOCOL, HEADER_ROOM,
-    HEADER_SERVER, HEALTH_PATH, MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, WEBSOCKET_VERSION,
-    WS_PATH,
+    DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND, DEFAULT_MAX_PUBLIC_PER_IP,
+    DEFAULT_MAX_PUBLIC_SESSIONS, DEFAULT_MAX_SESSIONS, DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+    DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND, DEFAULT_PUBLIC_WINDOW_SECS, DEFAULT_STALE_AFTER_MS,
+    HEADER_AUTHORIZATION, HEADER_CLIENT, HEADER_PROTOCOL, HEADER_ROOM, HEADER_SERVER, HEADER_TIER,
+    HEALTH_PATH, MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, Tier,
+    WEBSOCKET_VERSION, WS_PATH,
 };
-use crate::relay::{Relay, RoomRejection};
+use crate::relay::{self, Relay, RelayOptions, RoomRejection};
 
 /// 请求头必须在这个时间内读完：只发一个连接、永远不发请求头的客户端不该占住一个任务
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,6 +52,19 @@ pub struct Config {
     /// R36：服务器密码的 verifier（`SHA256(derive_server_token(密码))`）。
     /// 配置里**没有**密码原文，也没有它的任何可逆形态。
     pub server_verifier: [u8; 32],
+    /// 公益档（public tier）的额度。它只放行信令，所以比 `limits` 小得多。
+    pub public_limits: Limits,
+    /// 公益档同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。与 `max_sessions` 分开算：
+    /// 公益档占不到部署者自己的名额
+    pub max_public_sessions: usize,
+    /// 同一个 IP 最多几组公益会话（`PAIR_MAX_PUBLIC_PER_IP`）。0 = 不限
+    pub max_public_per_ip: usize,
+    /// 公益档的空闲回收窗口。`None` = 不回收
+    pub public_window: Option<Duration>,
+    /// 公益密码的 verifier（`PAIR_PUBLIC_SERVER_PASSWORD`）。`None` = 这台服务器没有公益档
+    pub public_verifier: Option<[u8; 32]>,
+    /// 信不信 `X-Forwarded-For`（`PAIR_TRUST_PROXY`）：只有前面站着可信反代时才打开
+    pub trust_proxy: bool,
 }
 
 fn env_non_empty(name: &str) -> Option<String> {
@@ -76,6 +91,19 @@ fn env_u64(name: &str, default: u64) -> Result<u64, String> {
         Some(text) => text
             .parse::<u64>()
             .map_err(|_| format!("{name} 必须是非负整数，实际是 {text:?}")),
+    }
+}
+
+/// 布尔开关（`PAIR_TRUST_PROXY`）。只认常见的几种真值，别的写法一律报错——
+/// 一个「看着像开了其实没开」的部署，比启动失败更难查。
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    match env_non_empty(name) {
+        None => Ok(default),
+        Some(text) => match text.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!("{name} 只能是 1/0（或 true/false），实际是 {text:?}")),
+        },
     }
 }
 
@@ -142,6 +170,46 @@ pub fn load_config() -> Result<Config, String> {
         ));
     }
 
+    // 公益档（可选）。设了它，拿到这个密码的人就借这台服务器打洞：只转发信令、只广告
+    // STUN、占自己的名额，占不到部署者那一档的任何东西。
+    let public_password = env_non_empty("PAIR_PUBLIC_SERVER_PASSWORD");
+
+    if let Some(password) = &public_password {
+        if password.chars().count() < MIN_SERVER_PASSWORD_LENGTH {
+            return Err(format!(
+                "PAIR_PUBLIC_SERVER_PASSWORD 太短：至少要 {MIN_SERVER_PASSWORD_LENGTH} 个字符\
+                 （公益密码是**公开**的，长度是唯一的在线爆破阻力）"
+            ));
+        }
+
+        // 两个密码相同会让「这次算哪一档」变成二义，也等于把公益那套限制绕过去了
+        if password == &server_password {
+            return Err(
+                "PAIR_PUBLIC_SERVER_PASSWORD 不能和 PAIR_SERVER_PASSWORD 相同：公益档\
+                 与你自己那一档必须是两把不同的钥匙"
+                    .to_string(),
+            );
+        }
+    }
+
+    // 这里**不用** `env_positive_usize`：公益档的 0 有正当含义（关掉这一档，但把密码留着
+    // 免得以后又要重新分发），不像 `PAIR_MAX_SESSIONS` 那样一定是配置事故——0 会让它
+    // 整台服务器一个人都进不来。所以 0 照收，只在下面打一条提醒。
+    let max_public_sessions = env_u64(
+        "PAIR_MAX_PUBLIC_SESSIONS",
+        DEFAULT_MAX_PUBLIC_SESSIONS as u64,
+    )? as usize;
+
+    // 0 只打警告、不报错：部署者可能只是暂时关掉公益档，没道理把整套服务器拖死
+    if public_password.is_some() && max_public_sessions == 0 {
+        eprintln!(
+            "提醒：PAIR_PUBLIC_SERVER_PASSWORD 已设置，但 PAIR_MAX_PUBLIC_SESSIONS=0，\
+             公益档实际上一个人都进不来"
+        );
+    }
+
+    let public_window_secs = env_u64("PAIR_PUBLIC_WINDOW_SECS", DEFAULT_PUBLIC_WINDOW_SECS)?;
+
     Ok(Config {
         limits,
         max_sessions: env_positive_usize("PAIR_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?,
@@ -149,11 +217,54 @@ pub fn load_config() -> Result<Config, String> {
         ice_servers,
         stun_port,
         server_verifier: auth::server_verifier(&server_password),
+        public_limits: Limits {
+            frames_per_second: env_f64(
+                "PAIR_PUBLIC_MAX_FRAMES_PER_SECOND",
+                DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND,
+            )?,
+            // 公益档一个分片都不转发（帧白名单只有 kind 8），这一维只是 `Limits` 的形状
+            // 要求：沿用部署者那一档的分片值，免得广告一个「被当成没广告」的 0
+            chunks_per_second: limits.chunks_per_second,
+            bytes_per_second: env_f64(
+                "PAIR_PUBLIC_MAX_BYTES_PER_SECOND",
+                DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+            )?,
+        },
+        max_public_sessions,
+        max_public_per_ip: env_u64("PAIR_MAX_PUBLIC_PER_IP", DEFAULT_MAX_PUBLIC_PER_IP as u64)?
+            as usize,
+        public_window: (public_window_secs > 0)
+            .then(|| Duration::from_secs(public_window_secs)),
+        public_verifier: public_password.as_deref().map(auth::server_verifier),
+        trust_proxy: env_bool("PAIR_TRUST_PROXY", false)?,
     })
 }
 
 pub async fn listen_address() -> Result<String, String> {
     Ok(env_non_empty("PAIR_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".to_string()))
+}
+
+impl Config {
+    /// 把配置折进会话层。
+    ///
+    /// 单独抽出来是为了让「配置项 → 会话层字段」只映射一次：`main.rs` 与集成测试都调它，
+    /// 以后再加一项也不会出现「主程序填了、测试没填」那种分叉。
+    pub fn relay_options(&self, stun_port: Option<u16>) -> RelayOptions {
+        RelayOptions {
+            limits: self.limits,
+            public_limits: self.public_limits,
+            max_sessions: self.max_sessions,
+            max_public_sessions: self.max_public_sessions,
+            max_public_per_ip: self.max_public_per_ip,
+            public_window: self.public_window,
+            stale_after: self.stale_after,
+            ice_servers: self.ice_servers.clone(),
+            stun_port,
+            server_verifier: self.server_verifier,
+            public_verifier: self.public_verifier,
+            trust_proxy: self.trust_proxy,
+        }
+    }
 }
 
 /// 接受连接，直到监听器出错。
@@ -197,9 +308,11 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     if head.path() == HEALTH_PATH {
         // §28：只说「我活着、协议是 1、需要服务器密码」。**不暴露**任何 Room、deviceId
         // 或密钥信息；`passwordRequired` 是常量，用来让部署者一条 curl 就确认自己装对了
+        // `publicTier` 同理（有没有配公益密码），也是常量
         let body = format!(
             "{{\"ok\":true,\"protocol\":{PROTOCOL_VERSION},\"mode\":\"multi-pair\",\
-             \"passwordRequired\":true}}"
+             \"passwordRequired\":true,\"publicTier\":{}}}",
+            relay.has_public_tier()
         );
 
         return write_response(&mut stream, 200, "OK", "application/json", &body)
@@ -307,7 +420,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         .map_err(|error| error.to_string());
     }
 
-    if !relay.accepts_server_token(&server_token) {
+    let Some(tier) = relay.classify_server_token(&server_token) else {
         reject(peer, "服务器密码不正确", 403);
 
         return write_response(
@@ -316,6 +429,29 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             "Forbidden",
             "text/plain; charset=utf-8",
             "server password incorrect",
+        )
+        .await
+        .map_err(|error| error.to_string());
+    };
+
+    // 公益档要求客户端**认得这一档**（`X-Bongo-Tier`）。它换来一条明确的兼容边界：
+    // 老客户端拿着公益密码会在这里拿到 426（「你这版客户端还不认公益档，请升级」），
+    // 而不是「连上之后被踢」或者「界面显示已连接、其实什么都通不了」。
+    //
+    // 用 426 而不是 403：客户端已经把 426 显示成「两边版本不一致：请把它们都升级到
+    // 最新版」，那正是这种情况该说的话；而 403 会被显示成「服务器密码不对」，把人
+    // 引向完全错误的方向。
+    if tier == Tier::Public
+        && head.header(HEADER_TIER) != Some(TIER_HEADER_VALUE)
+    {
+        reject(peer, "公益档需要新客户端", 426);
+
+        return write_response(
+            &mut stream,
+            426,
+            "Upgrade Required",
+            "text/plain; charset=utf-8",
+            "public tier requires a tier aware client",
         )
         .await
         .map_err(|error| error.to_string());
@@ -362,7 +498,19 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
 
     // §8 / §9 / §27：容量与密钥判定都在升级之前完成，客户端才能按状态码区分
     // 「配对密码不正确」（401）与「服务器会话已满」（503）。
-    let reservation = match relay.reserve(&room_id, auth::auth_verifier(&token)).await {
+    // 公益档的每 IP 限额按哪个 IP 算。Caddy 那一跳只在内网，所以域名模式下要靠
+    // `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`，compose 已默认打开）；direct 模式对端
+    // 就是客户端本身，不需要它。
+    let client = relay::client_ip(
+        peer,
+        head.header("x-forwarded-for"),
+        relay.trust_proxy(),
+    );
+
+    let reservation = match relay
+        .reserve(&room_id, auth::auth_verifier(&token), tier, client)
+        .await
+    {
         Ok(reservation) => reservation,
         Err(RoomRejection::AuthMismatch) => {
             reject(peer, "配对密码与这个会话不一致", 401);
@@ -386,6 +534,32 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
                 "Service Unavailable",
                 "text/plain; charset=utf-8",
                 "server capacity reached",
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
+        Err(RoomRejection::TierMismatch) => {
+            reject(peer, "会话档位与这次凭据不一致", 409);
+
+            return write_response(
+                &mut stream,
+                409,
+                "Conflict",
+                "text/plain; charset=utf-8",
+                "server tier mismatch",
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
+        Err(RoomRejection::PublicIpLimit) => {
+            reject(peer, "这个 IP 的公益会话已满", 429);
+
+            return write_response(
+                &mut stream,
+                429,
+                "Too Many Requests",
+                "text/plain; charset=utf-8",
+                "too many public sessions from this address",
             )
             .await
             .map_err(|error| error.to_string());

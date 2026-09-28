@@ -42,6 +42,18 @@ services:
       # 自建 coturn 后把地址填在 .env 的 PAIR_ICE_SERVERS 里（coturn 本体见
       # docker-compose.coturn.yml）。填了它就以它为准，内置 STUN 不启动；空值时用内置的
       PAIR_ICE_SERVERS: ${PAIR_ICE_SERVERS:-}
+      # 公益档（可选）：设了公益密码，别人就能拿它借这台服务器打洞（只转发信令、
+      # 不中继数据、不广告 TURN），名额与额度都算自己的、占不到上面那一档。
+      # 留空 = 没有公益档。密码 ≥ 16 字符，且**不能**和 PAIR_SERVER_PASSWORD 相同。
+      PAIR_PUBLIC_SERVER_PASSWORD: ${PAIR_PUBLIC_SERVER_PASSWORD:-}
+      PAIR_MAX_PUBLIC_SESSIONS: ${PAIR_MAX_PUBLIC_SESSIONS:-}
+      PAIR_MAX_PUBLIC_PER_IP: ${PAIR_MAX_PUBLIC_PER_IP:-}
+      PAIR_PUBLIC_MAX_FRAMES_PER_SECOND: ${PAIR_PUBLIC_MAX_FRAMES_PER_SECOND:-}
+      PAIR_PUBLIC_MAX_BYTES_PER_SECOND: ${PAIR_PUBLIC_MAX_BYTES_PER_SECOND:-}
+      PAIR_PUBLIC_WINDOW_SECS: ${PAIR_PUBLIC_WINDOW_SECS:-}
+      # 只在前面站着可信反代（这一份就是 Caddy）时打开，否则每 IP 限额会把所有公益
+      # 连接算成同一个 IP（127.0.0.1）。direct 模式对端就是客户端本身，不要开
+      PAIR_TRUST_PROXY: ${PAIR_TRUST_PROXY:-1}
     expose:
       - '8080'
     # 内置 STUN 直接对外（Caddy 只管 HTTP，不转 UDP）。宿主端口与容器端口必须一样：

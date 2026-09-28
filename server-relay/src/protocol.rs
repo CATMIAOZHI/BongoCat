@@ -34,6 +34,19 @@ pub const HEADER_ROOM: &str = "x-bongo-room";
 /// 连旧自建中继与 Cloudflare 版都照旧可用（那边忽略未知头）。
 pub const HEADER_SERVER: &str = "x-bongo-server";
 
+/// 「我认得档位」这个能力标记（公益档用）。
+///
+/// 客户端**永远**带上它（值固定 `1`）：它自己也不知道用户填的是部署者密码还是公益密码
+/// ——同一个输入框。部署者那一档完全无视这个头，Cloudflare 版与旧自建版忽略未知头。
+///
+/// 它换来的是一条**明确的兼容边界**：老客户端拿着公益密码会在握手时拿到 426（「你这版
+/// 客户端还不认公益档，请升级」），而不是「连上之后被踢」或者「界面显示已连接、其实
+/// 什么都通不了」。
+pub const HEADER_TIER: &str = "x-bongo-tier";
+
+/// 认得档位的客户端发过来的取值
+pub const TIER_HEADER_VALUE: &str = "1";
+
 /// 服务器密码的最小长度（部署者在 `.env` 里设置）。
 ///
 /// 太短的密码会让「门槛」变成摆设：它保护的是「别人能不能白用你的服务器与 TURN」，
@@ -47,6 +60,20 @@ pub const FRAME_HEADER_SIZE: usize = 14;
 pub const FRAME_KIND_TRANSFER_CHUNK: u8 = 6;
 pub const MAX_FRAME_KIND: u8 = 8;
 
+/// 公益档唯一放行的 kind：`pair.signal`（打洞信令）与 `pair.ping/pong`（保活）都走它。
+///
+/// 这一档是**策略与额度边界，不是密码学边界**：中继只读 14 字节明文帧头，`kind` 之内
+/// 的一切（连载荷里的 `type` 字符串）都是 AEAD 密文，所以它无法区分「真信令」与「塞在
+/// kind 8 里的任意数据」。挡住的量由公益档自己的额度决定（见下面那几个缺省值），而
+/// TURN 凭据一个都不广告——那比带宽贵得多。
+pub const FRAME_KIND_SIGNAL: u8 = 8;
+
+/// 公益档的单帧上限（64 KiB）。
+///
+/// 打洞信令的报价含候选，量级是几 KB；给到 64 KiB 是留足余量，同时把「拿 kind 8 当
+/// 夹带通道」压成涓流。超过就 `1009` 关连接。
+pub const MAX_PUBLIC_FRAME_SIZE: usize = 64 * 1024;
+
 /// 单帧上限（整帧，含帧头与 nonce/tag）
 pub const MAX_BINARY_FRAME_SIZE: usize = 1024 * 1024;
 
@@ -56,6 +83,34 @@ pub const PAIR_SIZE: usize = 2;
 /// 一套服务器同时承载的双人会话数上限（§2）。超出的**新会话**会被拒（HTTP 503），
 /// 已经在跑的会话不受影响。
 pub const DEFAULT_MAX_SESSIONS: usize = 20;
+
+/// 公益档同时承载的会话数上限（`PAIR_MAX_PUBLIC_SESSIONS`）。
+///
+/// 与 `PAIR_MAX_SESSIONS` **完全分开**：公益档占不到部署者自己的名额，部署者那一档也
+/// 不会因为公益档满了而受影响。公益连接只放行小帧、几乎没有出站积压，所以一条连接的
+/// 实际开销远小于 44 MiB 那个最坏值，10 组在 1GB 机器上是安全的。
+pub const DEFAULT_MAX_PUBLIC_SESSIONS: usize = 10;
+
+/// 同一个 IP 最多同时开几条**公益**连接（`PAIR_MAX_PUBLIC_PER_IP`）。
+///
+/// 只挡**新建会话**，同一会话的第二个人照旧进得来（不然同一个 NAT 下面的一对人会被自己
+/// 挡住）。一条公益会话是两条连接，所以默认 4 = 两对。
+pub const DEFAULT_MAX_PUBLIC_PER_IP: usize = 4;
+
+/// 公益档的额度（`PAIR_PUBLIC_MAX_FRAMES_PER_SECOND` / `PAIR_PUBLIC_MAX_BYTES_PER_SECOND`）。
+///
+/// 信令一轮只有个位数帧、总共几 KB，10 帧/秒与 256 KiB/秒 都留了很大余量；它们的作用是
+/// 把「拿 kind 8 夹带数据」限制成涓流，同时保护部署者的带宽与 CPU。
+pub const DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND: f64 = 10.0;
+pub const DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND: f64 = 256.0 * 1024.0;
+
+/// 公益档的空闲回收窗口（`PAIR_PUBLIC_WINDOW_SECS`）。
+///
+/// **它是空闲回收器，不是「打洞截止时间」**：中继看不到 DataChannel 有没有建立成功
+/// （信令是密文），所以任何「到点硬断」都会掐断**已经直连成功、正在正常使用**的会话
+/// ——而中继一断，客户端是整条会话重启、直连也跟着重来。这里的判据是「多久没收到**任何**
+/// 入站消息」，诚实客户端每 60 秒发一次 WebSocket Ping，180 秒 = 三次漏拍。
+pub const DEFAULT_PUBLIC_WINDOW_SECS: u64 = 180;
 
 /// `ROOM_ID` 的长度上界。客户端派生出来的是 43 个字符（32 字节 base64url 无填充），
 /// 这里按上界校验：中继只需要「非空、够短、字符集合法」，不必钉死长度。
@@ -85,6 +140,8 @@ pub mod close_code {
     pub const PAIR_FULL: u16 = 4003;
     /// 顶替长时间无活动的连接
     pub const STALE: u16 = 4004;
+    /// 公益档：空闲太久被回收（**不是**「打洞失败」，见 `DEFAULT_PUBLIC_WINDOW_SECS`）
+    pub const PUBLIC_WINDOW: u16 = 4005;
     /// 协议 / 帧格式错误
     pub const PROTOCOL_ERROR: u16 = 1008;
     /// 帧过大
@@ -95,6 +152,29 @@ pub mod close_code {
 
 pub fn is_known_frame_kind(kind: u8) -> bool {
     (1..=MAX_FRAME_KIND).contains(&kind)
+}
+
+/// 这次连接算哪一档（`server.welcome` 的 `tier`，也是「能不能转发数据」的判据）。
+///
+/// 档位**跟着连接走**，不跟着 Room 走：拿公益密码的人**永远**只是公益档，即使他碰巧和
+/// 一个用部署者密码的人进了同一个会话（那说明两边填了不同的密码）。这条保证了
+/// 「公益密码只能用来打洞」是一件与别人无关的性质。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// 部署者那一档：打洞 + 中继兜底 + （配了才有的）TURN
+    Full,
+    /// 公益档：只转发信令、只广告 STUN、自己的名额与额度
+    Public,
+}
+
+impl Tier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Public => "public",
+        }
+    }
 }
 
 /// deviceId 规则与 CF 版一致：非空、≤ 64 字符、只允许 `[A-Za-z0-9-]`。
@@ -153,6 +233,10 @@ pub enum ServerFrame {
         limits: Limits,
         #[serde(rename = "iceServers", skip_serializing_if = "Option::is_none")]
         ice_servers: Option<serde_json::Value>,
+        /// 这一档的档位（自建版独有；Cloudflare 版不发，客户端缺失时按 `full` 处理）。
+        /// 老客户端不认识它——那是 serde 默认行为（忽略未知字段），所以加它不会让老
+        /// 客户端崩或错乱。
+        tier: Tier,
     },
     #[serde(rename = "server.peer")]
     Peer {
@@ -181,6 +265,7 @@ mod tests {
             peer_online: false,
             limits: Limits::default(),
             ice_servers: None,
+            tier: Tier::Full,
         };
         let json: serde_json::Value = serde_json::from_str(&frame.to_json()).unwrap();
 
@@ -190,6 +275,8 @@ mod tests {
         assert_eq!(json["limits"]["framesPerSecond"], 30.0);
         assert_eq!(json["limits"]["chunksPerSecond"], 20.0);
         assert_eq!(json["limits"]["bytesPerSecond"], 12.0 * 1024.0 * 1024.0);
+        // 档位跟连接走：部署者那一档也要明说，客户端才能把「公益档」当成一个可判定的值
+        assert_eq!(json["tier"], "full");
         // 没配 TURN 时整个字段都不出现
         assert!(json.get("iceServers").is_none());
     }
@@ -202,10 +289,32 @@ mod tests {
             peer_online: true,
             limits: Limits::default(),
             ice_servers: Some(servers.clone()),
+            tier: Tier::Full,
         };
         let json: serde_json::Value = serde_json::from_str(&frame.to_json()).unwrap();
 
         assert_eq!(json["iceServers"], servers);
+    }
+
+    /// 公益档的档位名是线上契约的一部分：客户端按它决定「只准发信令」那一套限制
+    #[test]
+    fn the_public_tier_is_announced_lowercase() {
+        let frame = ServerFrame::Welcome {
+            protocol: PROTOCOL_VERSION,
+            peer_online: false,
+            limits: Limits {
+                frames_per_second: DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND,
+                chunks_per_second: DEFAULT_MAX_CHUNKS_PER_SECOND,
+                bytes_per_second: DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+            },
+            ice_servers: None,
+            tier: Tier::Public,
+        };
+        let json: serde_json::Value = serde_json::from_str(&frame.to_json()).unwrap();
+
+        assert_eq!(json["tier"], "public");
+        assert_eq!(json["limits"]["framesPerSecond"], 10.0);
+        assert_eq!(json["limits"]["bytesPerSecond"], 256.0 * 1024.0);
     }
 
     #[test]
