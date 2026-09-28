@@ -605,9 +605,14 @@ mod tests {
     fn a_tampered_code_is_rejected() {
         let text = encode(&SECRET, &offer_code()).unwrap();
         let mut chars: Vec<char> = text.chars().collect();
-        // 改最后一位：只要它落在载荷里，AEAD 就会失败
-        let last = chars.len() - 1;
-        chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
+        // 改**倒数第 6 位**，不是最后一位。
+        //
+        // 码的载荷是压缩后再加密的，长度会随压缩结果变化，所以最后一位有相当一部分概率
+        // 只落在 base64 的填充位上——改它解码出来的字节一模一样，AEAD 当然不失败，这条
+        // 用例就会随机变红（实测约 1/6）。往回收 6 个字符一定落在密文里（后面还有 16 字节
+        // 的 tag），改动一定被 AEAD 抓出来。
+        let target = chars.len() - 6;
+        chars[target] = if chars[target] == 'A' { 'B' } else { 'A' };
         let tampered: String = chars.into_iter().collect();
 
         assert_eq!(decode(&SECRET, &tampered).unwrap_err(), CodeError::Decrypt);
