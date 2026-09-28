@@ -106,9 +106,21 @@ const draftBytes = computed(() => new TextEncoder().encode(draft.value).length)
 const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
 const showingLimit = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT * 0.8)
 
-/** R42：发送键能不能按——有内容、没超长、不在发送中 */
+/**
+ * 配对码模式下直连还没建立。
+ *
+ * 这条路没有服务器兜底：帧发出去只会掉进黑洞，而本地那条消息已经被标成「已发送」。
+ * 所以这里直接把发送键按死（Rust 侧也会拒），并说清楚要等什么。
+ */
+const manualBlocked = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  return Boolean(manual && manual.phase !== 'connected')
+})
+
+/** R42：发送键能不能按——有内容、没超长、不在发送中、没有「发不出去」的硬理由 */
 const sendReady = computed(() => {
-  return Boolean(draft.value.trim()) && !tooLong.value && !sending.value
+  return Boolean(draft.value.trim()) && !tooLong.value && !sending.value && !manualBlocked.value
 })
 
 /**
@@ -121,6 +133,20 @@ const pairState = computed(() => {
   const key = pairStateKey(pairStore.runtime.connection, pairStore.settings.enabled)
 
   return key ? t(key) : ''
+})
+
+/**
+ * 配对码模式要单独说一句。
+ *
+ * 下面那条「先排队、等连上再发」在配对码这条路上**不成立**：没有服务器兜底，排队就是永远
+ * 发不出去（Rust 侧也会直接拒）。所以这里换成实话——等直连建立再发。
+ */
+const manualState = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  if (!manual || manual.phase === 'connected') return ''
+
+  return t(`pages.preference.pair.manual.phase.${manual.phase}`)
 })
 
 /** 穿透开着时点不到窗口，提示一句，免得用户以为窗口坏了 */
@@ -511,7 +537,7 @@ onMounted(async () => {
           {{ pairStore.runtime.peerName || $t('pages.chat.labels.peer') }}
         </div>
         <div class="chat-presence mt-0.5 truncate text-[10px] color-[#c1bbc9]">
-          {{ pairState || $t('pages.chat.hints.connected') }}
+          {{ manualState || pairState || $t('pages.chat.hints.connected') }}
         </div>
       </div>
 
@@ -819,7 +845,14 @@ onMounted(async () => {
         而是「先排队、等连上再发」——以前这件事只写在标题栏里，用户不会往上看。
       -->
       <p
-        v-if="pairState"
+        v-if="manualState"
+        class="mt-1 break-all text-[9px] color-[#ffffff99]"
+      >
+        {{ $t('pages.chat.hints.manual', { state: manualState }) }}
+      </p>
+
+      <p
+        v-else-if="pairState"
         class="mt-1 break-all text-[9px] color-[#ffffff99]"
       >
         {{ $t('pages.chat.hints.queued', { state: pairState }) }}

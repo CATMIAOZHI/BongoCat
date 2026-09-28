@@ -3,8 +3,8 @@ import { emit } from '@tauri-apps/api/event'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { save } from '@tauri-apps/plugin-dialog'
 import { useDebounceFn } from '@vueuse/core'
-import { Alert, Badge, Button, Flex, Input, InputNumber, message, Modal, Select, Slider, Switch, Tag } from 'antdv-next'
-import { computed, onMounted, ref, watch } from 'vue'
+import { Alert, Badge, Button, Flex, Input, InputNumber, message, Modal, Select, Slider, Switch, Tag, TextArea } from 'antdv-next'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type { ExportFormat, HistoryStats } from '@/composables/usePair'
@@ -15,6 +15,7 @@ import {
   ATTACHMENT_MAX_MB,
   DISPLAY_NAME_LIMIT,
   pairConnect,
+  pairDefaultStun,
   pairDeleteSecret,
   pairDeleteServerPassword,
   pairDisconnect,
@@ -27,9 +28,13 @@ import {
   pairHistoryExport,
   pairHistoryStartNewEpoch,
   pairHistoryStats,
+  pairManualAnswer,
+  pairManualJoin,
+  pairManualOffer,
   pairSetMaxAttachmentMb,
   pairSetSecret,
   pairSetServerPassword,
+  pairValidateStun,
 } from '@/composables/usePair'
 import { chatExportFileName } from '@/composables/usePairChat'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
@@ -359,6 +364,15 @@ onMounted(async () => {
 
   // 重启后 Rust 侧回到默认上限，把用户设置补回去
   applyAttachmentLimit(pairStore.settings.chat.attachmentMaxMb)
+
+  // 内置默认的公益 STUN 清单：框里留空时，界面上要能看出实际在用什么
+  await pairDefaultStun()
+    .then((urls) => {
+      defaultStun.value = urls
+    })
+    .catch((reason) => {
+      message.error(String(reason))
+    })
 })
 
 const status = computed(() => {
@@ -737,6 +751,258 @@ async function handleDisconnect() {
   }
 }
 
+/* ─────────────────────────── 配对码（手工信令） ─────────────────────────── */
+
+/**
+ * 粘贴框是**组件本地**的 ref（R40/R45 那个坑）。
+ *
+ * 码是一次性的会话瞬时值：放进设置会被别的窗口用旧值整份盖回来，落盘更是毫无意义
+ * （重启后就过期了）。状态只在 Rust 侧权威持有，这里只读 `runtime.manual`。
+ */
+const manualCodeInput = ref('')
+const manualBusy = ref(false)
+/** 倒计时用的一秒一跳；只在有码（有 `expiresAt`）时才跑 */
+const manualNow = ref(Date.now())
+let manualTimer: ReturnType<typeof setInterval> | undefined
+
+watch(() => pairStore.runtime.manual?.expiresAt, (expiresAt) => {
+  if (manualTimer) {
+    clearInterval(manualTimer)
+    manualTimer = void 0
+  }
+
+  manualNow.value = Date.now()
+
+  if (!expiresAt) return
+
+  manualTimer = setInterval(() => {
+    manualNow.value = Date.now()
+  }, 1000)
+}, { immediate: true })
+
+onUnmounted(() => {
+  if (manualTimer) clearInterval(manualTimer)
+})
+
+/** 设置里那份公益 STUN；留空就交给 Rust 用内置默认清单 */
+function stunSetting() {
+  return pairStore.settings.relay.stunText.trim() || void 0
+}
+
+/** 界面上那块配对码面板要显示的东西 */
+const manualPanel = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  if (!manual) return void 0
+
+  return {
+    ...manual,
+    // 出码方在等回码、粘贴方在等对方把它贴过去 —— 两边都「在等一段码」
+    waitingForCode: manual.phase === 'offer-ready' || manual.phase === 'answer-ready',
+    busy: manual.phase === 'gathering' || manual.phase === 'joining',
+  }
+})
+
+const manualCountdown = computed(() => {
+  const expiresAt = pairStore.runtime.manual?.expiresAt
+
+  if (!expiresAt) return ''
+
+  const remaining = expiresAt - manualNow.value
+
+  if (remaining <= 0) return t('pages.preference.pair.manual.expired')
+
+  const seconds = Math.floor(remaining / 1000)
+  const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
+  const ss = String(seconds % 60).padStart(2, '0')
+
+  return t('pages.preference.pair.manual.expiresIn', { time: `${mm}:${ss}` })
+})
+
+/**
+ * 一条非 host 候选都没有时提醒一句。
+ *
+ * 候选里有 `srflx` 才说明 STUN 帮我们要到了外网地址；全是 host 候选时跨网络一定连不上，
+ * 而用户手里那串码看着完全正常。判据是「非 host 候选数」而不是候选总数：多网卡的机器上
+ * 没有 STUN 也会有好几条 host 候选。
+ */
+const manualFewCandidates = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  return Boolean(manual?.waitingForCode && manual.nonHostCandidates === 0)
+})
+
+/** 粘贴框那个按钮叫什么、点了做什么，取决于现在有没有一次配对在进行 */
+const manualPasteLabel = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  if (manual?.role === 'host') return 'pages.preference.pair.manual.answer'
+
+  return 'pages.preference.pair.manual.join'
+})
+
+/** 配对码还缺什么（缺了就别让人点——点了只会等一句 Rust 的报错） */
+const manualMissing = computed(() => {
+  if (!secretInput.value.trim() && !pairStore.hasSecret && !secretUnknown.value) {
+    return 'pages.preference.pair.hints.missingSecret'
+  }
+
+  return ''
+})
+
+/**
+ * 联机总开关没开时，这块点不动，得单独说一句。
+ *
+ * 不并进 `manualMissing`：那个值被 Alert 的 `v-if` 与「总开关开着」一起判，两件事放在
+ * 同一个变量里会互斥掉，结果就是「按钮灰着、旁边一句解释都没有」。同页「服务器连接」
+ * 那一块是这么分的（`disabled` 里带 `!enabled`，提示另算），这里保持一致。
+ */
+const manualDisabledHint = computed(() =>
+  pairStore.settings.enabled ? '' : 'pages.preference.pair.hints.notEnabled',
+)
+
+/** 配对码那块状态徽标的配色 */
+const manualBadge = computed(() => {
+  const colors: Record<string, 'success' | 'processing' | 'warning'> = {
+    gathering: 'processing',
+    joining: 'processing',
+    connected: 'success',
+    failed: 'warning',
+  }
+
+  const status = colors[pairStore.runtime.manual?.phase ?? ''] ?? 'default'
+
+  return { status } as { status: 'success' | 'processing' | 'warning' | 'default' }
+})
+
+async function handleManualOffer() {
+  if (manualBusy.value) return
+
+  manualBusy.value = true
+
+  try {
+    pairStore.runtime.lastError = void 0
+
+    // 配对密码与 STUN 都用框里 / 设置里的当前值：没点过保存也照样能用
+    await pairManualOffer(secretInput.value.trim() || void 0, stunSetting())
+  } catch (reason) {
+    message.error(String(reason))
+  } finally {
+    manualBusy.value = false
+  }
+}
+
+async function handleManualPaste() {
+  const code = manualCodeInput.value.trim()
+
+  if (!code || manualBusy.value) return
+
+  manualBusy.value = true
+
+  try {
+    pairStore.runtime.lastError = void 0
+
+    // 出码方手里已经有会话了：这一段就是对方交回来的码 2；其余情况都是「拿别人的码 1 加入」
+    if (pairStore.runtime.manual?.role === 'host') {
+      await pairManualAnswer(code)
+    } else {
+      await pairManualJoin(code, secretInput.value.trim() || void 0, stunSetting())
+    }
+
+    manualCodeInput.value = ''
+  } catch (reason) {
+    message.error(String(reason))
+  } finally {
+    manualBusy.value = false
+  }
+}
+
+async function handleCopyManualCode() {
+  const code = pairStore.runtime.manual?.code
+
+  if (!code) return
+
+  try {
+    await writeText(code)
+
+    message.success(t('pages.preference.pair.manual.codeCopied'))
+  } catch (reason) {
+    message.error(String(reason))
+  }
+}
+
+/** 取消配对：手工码没有「重连」这回事，重来就是重新出一段码（新的会话 id 让旧码作废） */
+async function handleManualCancel() {
+  manualCodeInput.value = ''
+
+  await handleDisconnect()
+}
+
+/* ─────────────────────────── 公益 STUN（配对码用） ─────────────────────────── */
+
+/**
+ * 与服务器地址同一套「草稿 + 保存」。
+ *
+ * 直接用 `v-model` 绑 store 会每敲一个字写一次设置并落盘，别的窗口带旧值的整份状态又会
+ * 盖回来——表现就是打字时闪、丢字（R40/R45）。
+ */
+const {
+  input: stunInput,
+  dirty: stunDirty,
+  save: saveStunDraft,
+} = usePairSettingDraft(
+  () => pairStore.settings.relay.stunText,
+  (value) => {
+    pairStore.settings.relay.stunText = value
+  },
+)
+
+const stunErrors = ref<string[]>([])
+const stunSaving = ref(false)
+/** 内置默认清单：留空时界面上要能看出「实际在用什么」 */
+const defaultStun = ref<string[]>([])
+
+/** 留空 = 用内置默认清单，这时框里是空的，得把真正生效的那几条摆出来 */
+const stunUsingDefault = computed(() => !pairStore.settings.relay.stunText.trim())
+
+async function handleSaveStun() {
+  if (stunSaving.value) return
+
+  stunSaving.value = true
+
+  try {
+    const checked = await pairValidateStun(stunInput.value.trim())
+
+    // 非法的行**不静默丢**：指出第几行、什么问题，让用户改完再保存
+    if (checked.errors.length) {
+      stunErrors.value = checked.errors
+
+      return
+    }
+
+    stunErrors.value = []
+    // 保存的是归一化之后的清单（`stun:` 开头、一行一条），框里看到的与真正生效的一致
+    stunInput.value = checked.urls.join('\n')
+    saveStunDraft()
+
+    message.success(t('pages.preference.pair.hints.stunSaved'))
+  } catch (reason) {
+    message.error(String(reason))
+  } finally {
+    stunSaving.value = false
+  }
+}
+
+async function handleUseDefaultStun() {
+  try {
+    stunInput.value = (await pairDefaultStun()).join('\n')
+
+    stunErrors.value = []
+  } catch (reason) {
+    message.error(String(reason))
+  }
+}
+
 function handlePresenceChange(away: boolean) {
   pairStore.settings.presence = away ? 'away' : 'active'
 }
@@ -1107,6 +1373,220 @@ const {
       <span class="w-full break-all text-3 color-text-tertiary">
         {{ $t('pages.preference.pair.hints.connectSteps') }}
       </span>
+    </ProListItem>
+
+    <!--
+      配对码（手工信令）：完全不经过任何服务器，两段码由用户自己转送。它与「服务器地址」
+      是二选一的两条路——所以这里既不做「缺地址」的校验，也不共用那三个凭据里的服务器地址
+      与服务器密码（只用配对密码当码的加解密密钥）。
+    -->
+    <ProListItem
+      :description="$t('pages.preference.pair.manual.hint')"
+      :title="$t('pages.preference.pair.manual.label')"
+      vertical
+    >
+      <Alert
+        class="w-full"
+        :message="$t('pages.preference.pair.manual.limits')"
+        show-icon
+        type="info"
+      />
+
+      <Flex
+        align="center"
+        class="mt-2 w-full"
+        gap="small"
+        wrap
+      >
+        <Button
+          :disabled="!pairStore.settings.enabled || Boolean(manualMissing) || manualBusy"
+          :loading="manualBusy && !pairStore.runtime.manual"
+          size="small"
+          @click="handleManualOffer"
+        >
+          {{ $t('pages.preference.pair.manual.offer') }}
+        </Button>
+
+        <Badge
+          v-if="manualPanel"
+          :status="manualBadge.status"
+          :text="$t(`pages.preference.pair.manual.phase.${manualPanel.phase}`)"
+        />
+
+        <!-- 倒计时：过期之后 Rust 那边也会拒绝粘贴，这里只是让用户看得见 -->
+        <span
+          v-if="manualCountdown"
+          class="text-3 color-text-tertiary"
+        >
+          {{ manualCountdown }}
+        </span>
+
+        <Button
+          v-if="pairStore.runtime.manual"
+          size="small"
+          @click="handleManualCancel"
+        >
+          {{ $t('pages.preference.pair.manual.cancel') }}
+        </Button>
+      </Flex>
+
+      <Alert
+        v-if="manualDisabledHint"
+        class="mt-2 w-full"
+        :message="$t(manualDisabledHint)"
+        show-icon
+        type="info"
+      />
+
+      <Alert
+        v-else-if="manualMissing"
+        class="mt-2 w-full"
+        :message="$t(manualMissing)"
+        show-icon
+        type="info"
+      />
+
+      <!-- 码 1 / 码 2：只读，复制出来发给对方 -->
+      <Flex
+        v-if="manualPanel?.code"
+        class="mt-2 w-full"
+        gap="small"
+        wrap
+      >
+        <TextArea
+          :auto-size="{ minRows: 3, maxRows: 6 }"
+          class="flex-1"
+          readonly
+          :value="manualPanel.code"
+        />
+
+        <Button
+          size="small"
+          @click="handleCopyManualCode"
+        >
+          {{ $t('pages.preference.pair.buttons.copy') }}
+        </Button>
+      </Flex>
+
+      <span
+        v-if="manualPanel?.code"
+        class="w-full break-all text-3 color-text-tertiary"
+      >
+        {{ manualPanel.role === 'host'
+          ? $t('pages.preference.pair.manual.sendToPeer')
+          : $t('pages.preference.pair.manual.sendBack') }}
+      </span>
+
+      <!--
+        只有一条候选 = 只有 host 候选，说明 STUN 没帮我们要到外网地址。跨网络连不上，
+        而用户从码本身看不出来。
+      -->
+      <Alert
+        v-if="manualFewCandidates"
+        class="mt-2 w-full"
+        :message="$t('pages.preference.pair.manual.fewCandidates')"
+        show-icon
+        type="warning"
+      />
+
+      <Alert
+        v-if="manualPanel?.error"
+        class="mt-2 w-full"
+        :message="manualPanel.error"
+        show-icon
+        type="warning"
+      />
+
+      <!-- 粘贴框：出码方用它交回码 2，其余情况都是「拿别人的码 1 加入」 -->
+      <Flex
+        class="mt-2 w-full"
+        gap="small"
+        wrap
+      >
+        <TextArea
+          v-model:value="manualCodeInput"
+          :auto-size="{ minRows: 2, maxRows: 5 }"
+          class="flex-1"
+          :placeholder="$t('pages.preference.pair.manual.pastePlaceholder')"
+        />
+
+        <Button
+          :disabled="!pairStore.settings.enabled || !manualCodeInput.trim() || manualBusy"
+          :loading="manualBusy"
+          size="small"
+          type="primary"
+          @click="handleManualPaste"
+        >
+          {{ $t(manualPasteLabel) }}
+        </Button>
+      </Flex>
+    </ProListItem>
+
+    <!--
+      公益 STUN：只有走配对码才用得上。用服务器连接时 STUN 由中继自己广告（它也是
+      `turn:` 的唯一来源），这一栏一字都不用。
+    -->
+    <ProListItem
+      :description="$t('pages.preference.pair.hints.stunUrls')"
+      :title="$t('pages.preference.pair.labels.stunUrls')"
+      vertical
+    >
+      <TextArea
+        v-model:value="stunInput"
+        :auto-size="{ minRows: 3, maxRows: 8 }"
+        class="w-full"
+        :placeholder="$t('pages.preference.pair.placeholders.stunUrls')"
+      />
+
+      <Flex
+        align="center"
+        class="mt-2 w-full"
+        gap="small"
+        wrap
+      >
+        <Button
+          :disabled="!stunDirty"
+          :loading="stunSaving"
+          size="small"
+          type="primary"
+          @click="handleSaveStun"
+        >
+          {{ $t('pages.preference.pair.buttons.save') }}
+        </Button>
+
+        <Button
+          size="small"
+          @click="handleUseDefaultStun"
+        >
+          {{ $t('pages.preference.pair.buttons.useDefaultStun') }}
+        </Button>
+      </Flex>
+
+      <!-- 留空 = 用内置默认：把真正生效的那几条摆出来，别让人以为「留空 = 没有 STUN」 -->
+      <span
+        v-if="stunUsingDefault && defaultStun.length"
+        class="mt-2 w-full break-all text-3 color-text-tertiary"
+      >
+        {{ $t('pages.preference.pair.hints.stunDefault', { list: defaultStun.join('、') }) }}
+      </span>
+
+      <Alert
+        v-if="stunDirty"
+        class="mt-2 w-full"
+        :message="$t('pages.preference.pair.hints.credentialUnsaved')"
+        show-icon
+        type="info"
+      />
+
+      <!-- 逐行指出问题：非法的行不静默丢，改完才能保存 -->
+      <Alert
+        v-for="error in stunErrors"
+        :key="error"
+        class="mt-2 w-full"
+        :message="error"
+        show-icon
+        type="error"
+      />
     </ProListItem>
 
     <ProListItem

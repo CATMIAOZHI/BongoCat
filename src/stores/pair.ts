@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { reactive, ref } from 'vue'
 
-import type { P2pState, PresenceState } from '@/composables/usePair'
+import type { ManualStatus, P2pState, PresenceState } from '@/composables/usePair'
 import type { PairModelIdentity } from '@/utils/pairModel'
 
 import { ATTACHMENT_MAX_MB } from '@/composables/usePair'
@@ -138,6 +138,12 @@ export interface PairSettings {
   relay: {
     url: string
     autoConnect: boolean
+    /**
+     * 公益 STUN 清单（一行一条，原样存文本）。**留空 = 用内置默认的那 6 条**。
+     *
+     * 只有走「配对码」连接时才发这些；用服务器连接时 STUN 由中继自己广告，这里一字不用。
+     */
+    stunText: string
   }
 
   identity: {
@@ -195,6 +201,13 @@ export interface PairRuntime {
   /** P2P 这条腿：`off` / `connecting` / `connected` / `failed`，纯显示用 */
   p2p: P2pState
   /**
+   * 配对码（手工信令）这条路的状态。`undefined` = 当前会话不是配对码。
+   *
+   * 它决定界面上一整块面板（生成 / 复制 / 粘贴 / 倒计时）与「现在能不能发消息」，
+   * 所以必须每个窗口都拿到——Rust 侧随 `pair-connection-changed` 一起推。
+   */
+  manual?: ManualStatus
+  /**
    * 桌宠快照的发送上限（Hz），由 Rust 按当前生效传输给出（§6 / R23）。
    * `0` = 还没拿到：发送侧按 v1 的 3Hz 兜底（见 `usePairState`）。
    */
@@ -223,6 +236,12 @@ export const usePairStore = defineStore('pair', () => {
     relay: {
       url: '',
       autoConnect: false,
+      /**
+       * 公益 STUN 清单（一行一条，原样存文本）。**留空 = 用内置默认的那 6 条**。
+       *
+       * 只有走「配对码」连接时才发这些；用服务器连接时 STUN 由中继自己广告，这里一字不用。
+       */
+      stunText: '',
     },
     identity: {
       displayName: '',
@@ -267,6 +286,7 @@ export const usePairStore = defineStore('pair', () => {
   const runtime = reactive<PairRuntime>({
     connection: 'disabled',
     p2p: 'off',
+    manual: void 0,
     petStateHz: 0,
     plaintext: false,
     relayUrl: void 0,

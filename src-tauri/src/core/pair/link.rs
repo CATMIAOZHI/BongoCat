@@ -105,12 +105,19 @@ impl ReliableLeg for P2pLink {
 /// 存在的意义只有一个——让 `manager.rs` 里 `live` 的调用点保持 cfg 中立。
 #[cfg(not(windows))]
 mod stub {
+    use super::super::manual::ManualCodeKind;
     use super::super::protocol::{IceServer, PairSignalPayload};
 
     /// 与 `p2p::P2pEvent` 同形。这个平台上不会产生任何事件。
     #[derive(Debug)]
     pub enum P2pEvent {
         Signal(PairSignalPayload),
+        Gathered {
+            kind: ManualCodeKind,
+            candidates: usize,
+            non_host: usize,
+            description: String,
+        },
         Negotiating,
         Inbound(super::Lane, Vec<u8>),
         ChannelOpen(super::Lane),
@@ -135,6 +142,8 @@ mod stub {
         }
 
         pub fn handle_signal(&self, _signal: PairSignalPayload) {}
+
+        pub fn begin(&self, _offerer: bool, _features: Vec<String>) {}
 
         pub fn send(&self, _lane: super::Lane, _frame: Vec<u8>) {}
 

@@ -130,6 +130,12 @@ pub const SIGNAL_VERSION: u8 = 1;
 /// 可选的，缺失就表示老客户端——它只会建 / 认领 `pet-state`。
 pub const FEATURE_RELIABLE_CHANNEL: &str = "reliable-channel";
 
+/// 本端支持的能力位。中继模式的 `hello` 与手工码（配对码）都从这里取，**不要在两处
+/// 各写一份**：漏掉一个能力位的后果是「对面按旧客户端处理」，聊天 / 附件 / 语音会整片失效。
+pub fn local_features() -> Vec<String> {
+    vec![FEATURE_RELIABLE_CHANNEL.to_string()]
+}
+
 /// `pair.signal` 的载荷（R21）。
 ///
 /// 走 `FrameKind::Ping`(8)：中继会校验帧 kind，未知值直接 `close 1008`，而 kind 8
@@ -500,10 +506,18 @@ pub fn sanitize_keys(keys: Vec<String>) -> Vec<String> {
 /// 形状跟 WebRTC 的 `RTCIceServer` 一致：`urls` 可以是单个字符串也可以是字符串数组，
 /// `username` / `credential` 是 TURN 的静态凭据。
 ///
-/// 客户端自己**不填**任何公共 STUN——STUN 必然让它所在的服务器看到公网 IP，而 README
-/// 承诺不收集任何用户数据。自建中继默认广告它**内置**的 STUN（`server-relay/src/stun.rs`），
-/// 公网 IP 只有部署者自己的服务器看得到；Cloudflare 版不广告，那时只有 host candidate
-/// （只在同一局域网内能直连）。
+/// 客户端能拿到的 ICE 条目有两处，口径不同，**不会同时生效**：
+///
+/// - 中继广告的（`server.welcome.iceServers`）：自建中继默认广告它**内置**的 STUN
+///   （`server-relay/src/stun.rs`），公网 IP 只有部署者自己的服务器看得到；它也是
+///   `turn:` 的**唯一**来源（中继配了 coturn 时）。
+/// - 用户在设置里自己填的公益 STUN（`manual.rs` 的 `DEFAULT_STUN_URLS` 与解析器）：
+///   只接受 `stun:`，**只在手工码模式使用**，中继模式一律以中继广告为准。默认清单是
+///   公开的第三方 STUN，用它们打洞时那些服务器会看到本机公网 IP——这是这条路的固有代价，
+///   所以它**只在用户主动走「配对码」时才发**，默认的中继模式一条都不发。
+///
+/// 中继模式拿到空广告时（Cloudflare 版不广告任何东西）只有 host candidate，那时只在同一
+/// 局域网内能直连。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IceServer {

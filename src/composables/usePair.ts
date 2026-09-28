@@ -31,9 +31,54 @@ export interface PairStatus {
   petStateHz?: number
   /** §23：这次连接的地址是不是明文（`http://` / `ws://` / 裸 IP），只用于界面提醒 */
   plaintext?: boolean
+  /**
+   * 配对码（手工信令）这条路的状态；`undefined` = 当前这条会话不是配对码。
+   *
+   * 它和 `state` / `p2p` 互补：配对码没有中继，对方在不在线只能由 DataChannel 的往返
+   * 决定，所以直连建立之前聊天 / 附件 / 语音都不可用，界面据此灰化。
+   */
+  manual?: ManualStatus
 }
 
 export type P2pState = 'off' | 'connecting' | 'connected' | 'failed'
+
+/** 配对码这条路走到了哪一步（Rust 侧 `ManualPhase`，serde 转成 kebab-case） */
+export type ManualPhase = 'gathering' | 'offer-ready' | 'answer-ready' | 'joining' | 'connected' | 'failed'
+
+/** 配对码里本端的角色：出码方固定当 offerer */
+export type ManualRole = 'host' | 'guest'
+
+/** Rust 侧 `ManualStatus` */
+export interface ManualStatus {
+  phase: ManualPhase
+  role: ManualRole
+  /** 要交给对方的那串码：`offer-ready` 是码 1，`answer-ready` 是码 2 */
+  code?: string
+  /** 这串码的过期时间（毫秒时间戳），界面据此倒计时 */
+  expiresAt?: number
+  /** 这次配对的随机 id（换码就换它） */
+  sessionId?: string
+  /** 自己那段 SDP 里带了几条候选。**0 说明只有本机可达 */
+  candidates: number
+  /**
+   * 其中几条不是 `host`（`srflx` / `relay`）。**0 = 全是本机地址，跨网络连不上**。
+   *
+   * 判据用它而不是用 `candidates === 1`：多网卡的机器（有线 + 无线 + 虚拟网卡 / VPN）
+   * 上没有 STUN 也会有好几条 host 候选。
+   */
+  nonHostCandidates: number
+  error?: string
+}
+
+/** Rust 侧 `StunList`：设置页那份公益 STUN 清单的校验结果 */
+export interface StunList {
+  /** 归一化后的地址（`stun:` 开头、去重、保序）；`errors` 非空时不要保存 */
+  urls: string[]
+  /** 逐行的问题（「第 2 行：…」），非空就挡下保存 */
+  errors: string[]
+  /** 输入是空的：真正生效的是内置默认清单 */
+  empty: boolean
+}
 
 export interface PairPresencePayload {
   state: PresenceState
@@ -121,6 +166,37 @@ export function pairConnect(relayUrl: string, secret?: string, serverPassword?: 
 
 export function pairDisconnect() {
   return invoke<void>(INVOKE_KEY.PAIR_DISCONNECT)
+}
+
+/**
+ * 配对码第一步：出一段码，自己用微信 / QQ 发给对方。
+ *
+ * 这条路不连任何服务器：两段码由用户自己转送，DataChannel 就是唯一的腿。
+ * `secret` / `stun` 与 `pairConnect` 一样是**这一次**要用的值，不传就回落到已保存的
+ * 配对密码与内置默认 STUN 清单。
+ */
+export function pairManualOffer(secret?: string, stun?: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_MANUAL_OFFER, { secret, stun })
+}
+
+/** 配对码第二步（粘贴方）：把对方发来的码 1 粘进来，本端会出码 2 交给对方 */
+export function pairManualJoin(code: string, secret?: string, stun?: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_MANUAL_JOIN, { code, secret, stun })
+}
+
+/** 配对码最后一步（出码方）：把对方发回来的码 2 粘进来 */
+export function pairManualAnswer(code: string) {
+  return invoke<void>(INVOKE_KEY.PAIR_MANUAL_ANSWER, { code })
+}
+
+/** 校验设置页里那份公益 STUN 清单：非法的行会指出第几行，不静默丢掉 */
+export function pairValidateStun(text: string) {
+  return invoke<StunList>(INVOKE_KEY.PAIR_VALIDATE_STUN, { text })
+}
+
+/** 内置的公益 STUN 清单（设置页的「填入默认清单」用它） */
+export function pairDefaultStun() {
+  return invoke<string[]>(INVOKE_KEY.PAIR_DEFAULT_STUN)
 }
 
 export function pairSendPresence(presence: PresenceState, message?: string, displayName?: string, model?: PairModelIdentity) {

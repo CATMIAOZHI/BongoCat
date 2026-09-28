@@ -53,6 +53,18 @@ const sendError = ref('')
 
 const online = computed(() => pairStore.settings.enabled && pairStore.runtime.peerOnline)
 
+/**
+ * 配对码模式（手工信令）下直连还没建立。
+ *
+ * 这条路没有服务器兜底，语音也一样发不出去（Rust 侧同样会拒），所以麦克风要跟着一起按死，
+ * 不能让用户录完一分钟才发现发不出去。
+ */
+const manualBlocked = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  return Boolean(manual && manual.phase !== 'connected')
+})
+
 /** 同时显示的气泡数：与聊天窗口共用同一个设置 */
 const bubbleCount = computed(() => {
   const value = Math.round(Number(pairStore.settings.chat.bubbleCount))
@@ -77,7 +89,22 @@ const moreNote = computed(() => {
 const draftBytes = computed(() => new TextEncoder().encode(draft.value).length)
 const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
 const canSend = computed(() => {
-  return online.value && !sending.value && !tooLong.value && draft.value.trim().length > 0
+  return (
+    online.value
+    && !manualBlocked.value
+    && !sending.value
+    && !tooLong.value
+    && draft.value.trim().length > 0
+  )
+})
+
+/** 配对码模式要单独说一句：它连上之前「对方离线」这种说法会把人指错方向 */
+const manualState = computed(() => {
+  const manual = pairStore.runtime.manual
+
+  if (!manual || manual.phase === 'connected') return ''
+
+  return t(`pages.preference.pair.manual.phase.${manual.phase}`)
 })
 
 /**
@@ -116,6 +143,8 @@ const hint = computed(() => {
  */
 const blockNote = computed(() => {
   if (props.recording || props.pending) return ''
+
+  if (manualState.value) return t('pages.chat.hints.manual', { state: manualState.value })
 
   return pairState.value || sendError.value
 })
@@ -208,6 +237,8 @@ function handleKeydown(event: KeyboardEvent) {
  * 录音期间把焦点交还出去，免得打字又被当成按键。
  */
 function handleVoice() {
+  if (manualBlocked.value) return
+
   inputRef.value?.blur()
 
   if (props.recording) {
@@ -268,7 +299,9 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
     >
       <button
         :aria-label="props.recording ? $t('pages.main.hints.stopRecording') : $t('pages.main.hints.voice')"
-        class="voice-button size-[28px] flex shrink-0 cursor-pointer items-center justify-center text-[16px] rounded-full"
+        class="voice-button size-[28px] flex shrink-0 items-center justify-center text-[16px] rounded-full"
+        :class="manualBlocked ? 'cursor-not-allowed' : 'cursor-pointer'"
+        :disabled="manualBlocked"
         :title="props.pending && !props.recording
           ? $t('pages.main.hints.reRecord')
           : $t('pages.main.hints.voice')"

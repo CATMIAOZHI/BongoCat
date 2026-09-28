@@ -30,11 +30,12 @@ use tokio::sync::mpsc;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceCandidateInit, RTCIceConnectionState, RTCIceServer, RTCPeerConnectionIceEvent,
-    RTCPeerConnectionState, RTCSessionDescription,
+    RTCIceCandidateInit, RTCIceConnectionState, RTCIceGatheringState, RTCIceServer,
+    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
 };
 
 use super::link::Lane;
+use super::manual::{CODE_GATHER_TIMEOUT, ManualCodeKind};
 use super::protocol::{FEATURE_RELIABLE_CHANNEL, IceServer, PairSignalPayload, SIGNAL_VERSION};
 
 /// 只跑可覆盖流（宠物快照、统计）的通道（§5.2）：`ordered = false, maxRetransmits = 0`。
@@ -66,11 +67,57 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// 退避的上限：网络恢复后最多等这么久就会再试（界面上没有手动重试入口）
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(120);
 
+/// 手工码模式下 ICE 的「多久没通就算失败」。
+///
+/// 默认是 `rtc-ice` 的 disconnected 5 秒 + failed 25 秒 = **30 秒**，而粘贴方的计时是从
+/// 它**生成回码**那一刻开始算的——回码要靠人转送给对方（微信 / QQ），30 秒太紧，对方慢
+/// 一点整次配对就作废。这里放宽到 2 分半，代价只是「真打不通时多等一会儿」。
+///
+/// **只放宽手工码这一轮的 PC**：中继模式的 P2P 是纯加速腿，失败判定越快越好（快失败才能
+/// 快退避重试），绝不能跟着变慢。
+const MANUAL_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(10);
+const MANUAL_FAILED_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 连续失败 `failures` 次之后该等多久：5 秒起、每次翻倍、封顶 2 分钟
 fn retry_delay(failures: u32) -> Duration {
     RETRY_DELAY
         .saturating_mul(1u32 << failures.min(10))
         .min(RETRY_DELAY_MAX)
+}
+
+/// 这段（JSON 形态的）SDP 里带了几条候选，其中几条不是 `host`。返回（总数，非 host 数）。
+///
+/// 手工码模式用它区分「跨网络大概能连」与「只有本机可达」：候选一条都没有时码是废的
+/// （调用方不出码、直接报错）；而**全是 `host`** 时跨网络一定连不上——`srflx` 才是 STUN
+/// 帮我们要到的外网映射。
+///
+/// 这里数「非 host」而不是只看总数：多网卡（有线 + 无线 + 虚拟网卡 / VPN）的机器上没有
+/// STUN 也会有 2~3 条 host 候选，只看总数会把一段跨网络连不上的码判成正常。
+fn candidate_stats(description: &str) -> (usize, usize) {
+    let Ok(parsed) = serde_json::from_str::<RTCSessionDescription>(description) else {
+        return (0, 0);
+    };
+
+    let mut total = 0;
+    let mut non_host = 0;
+
+    for line in parsed
+        .sdp
+        .lines()
+        .filter(|line| line.starts_with("a=candidate"))
+    {
+        total += 1;
+
+        // `a=candidate:... typ host` / `typ srflx`：`typ` 后面那个词就是类型
+        let kind = line.split_whitespace().skip_while(|word| *word != "typ").nth(1);
+
+        // 认不出来的行按 host 算：宁可少报「能连」，不要给出一段其实连不上的码
+        if matches!(kind, Some(kind) if kind != "host") {
+            non_host += 1;
+        }
+    }
+
+    (total, non_host)
 }
 
 /// 协商现场写进日志时用的 ICE 服务器描述：只写地址，凭据一律不进日志。
@@ -121,6 +168,13 @@ enum Input {
     Peer(PairSignalPayload),
     /// 本层要送出去的信号（PC 回调产生的 candidate）
     Signal(PairSignalPayload),
+    /// 手工码模式：不等 `hello` 就直接开一轮（角色与能力位都随码带过来）
+    Begin {
+        offerer: bool,
+        features: Vec<String>,
+    },
+    /// 本端的候选已经收集完了（ICE gathering = `Complete`）
+    GatheringComplete,
     /// DataChannel 收到的字节
     Inbound(Lane, Vec<u8>),
     /// 在指定的 DataChannel 上发一帧
@@ -140,6 +194,16 @@ enum Input {
 pub enum P2pEvent {
     /// 要经中继送出去的信令
     Signal(PairSignalPayload),
+    /// 手工码模式：这一轮的本地描述（含已收集候选）已经可以打成一串码了。
+    /// 与 `Signal(Offer/Answer)` 互斥——手工模式不发那两类信令。
+    Gathered {
+        kind: ManualCodeKind,
+        /// 这段描述里带了几条候选。0 = 只有本机可达（调用方要如实告诉用户）
+        candidates: usize,
+        /// 其中几条不是 `host`（`srflx` / `relay`）。0 = 全是本机地址，跨网络连不上
+        non_host: usize,
+        description: String,
+    },
     /// 收到对端的 hello，开始协商（UI 用；对端不支持 P2P 时永远收不到）
     Negotiating,
     /// 某条 DataChannel 收到的原始字节，交给 `manager.rs` 的 `handle_binary`
@@ -184,7 +248,8 @@ impl P2pLink {
     /// 起一条腿，并立刻向对端宣告自己支持 P2P（R21：能力门控只看对端）。
     ///
     /// `ice_servers` 来自 `server.welcome` 的广告（R21）：自建中继默认给它内置的 STUN；
-    /// 空表示只有 host candidate（客户端自己从不填任何公共 STUN）。
+    /// 空表示只有 host candidate（Cloudflare 版不广告任何东西）。手工码模式没有中继，
+    /// 传进来的是用户在设置里自己填的那份公益 STUN（见 `manual.rs`）。
     pub fn spawn(device_id: String, ice_servers: Vec<IceServer>) -> (Self, P2pEvents) {
         let (input, incoming) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
@@ -207,6 +272,14 @@ impl P2pLink {
     /// 丢了不影响中继上的功能。
     pub fn handle_signal(&self, signal: PairSignalPayload) {
         let _ = self.input.send(Input::Peer(signal));
+    }
+
+    /// 手工码模式的开场：不等 `hello` 直接开一轮，角色与能力位都由码决定。
+    ///
+    /// `features` 必须带上对方码里的能力位：能力门控只看对端（R32），缺了它
+    /// `acceptable_lane("reliable")` 会返回 `None`，聊天 / 附件 / 语音就全废。
+    pub fn begin(&self, offerer: bool, features: Vec<String>) {
+        let _ = self.input.send(Input::Begin { offerer, features });
     }
 
     /// 在指定的 DataChannel 上发一帧。通道没开就丢掉（同上，尽力而为）。
@@ -248,6 +321,11 @@ async fn drive(
         pet_state: None,
         reliable: None,
         peer_features: Vec::new(),
+        manual: false,
+        gathering_complete: false,
+        code_pending: None,
+        code_sent: false,
+        code_deadline: None,
         writable,
         remote_ready: false,
         buffered_candidates: Vec::new(),
@@ -269,6 +347,15 @@ async fn drive(
                 None => std::future::pending().await,
             }
         };
+        // 手工码模式「等候选收集完成」的兜底（见 `Leg::emit_code`）：`Complete` 可能永远
+        // 不来。先把时限拷出来，`select!` 里才不用同时借 `leg`（另一支要可变借它）
+        let code_wait_at = leg.code_deadline;
+        let code_wait = async move {
+            match code_wait_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
 
         tokio::select! {
             next = incoming.recv() => {
@@ -281,7 +368,15 @@ async fn drive(
                             failures = 0;
                         }
                     }
+                    // 手工码模式：candidate 不走信令（它们随 SDP 一起进码），
+                    // 由 `Gathered` 那一条带出去
+                    Input::Signal(_signal) if leg.manual => {}
                     Input::Signal(signal) => leg.emit_signal(signal),
+                    Input::Begin { offerer, features } => leg.begin(offerer, features).await,
+                    Input::GatheringComplete => {
+                        leg.gathering_complete = true;
+                        leg.emit_code(false).await;
+                    }
                     Input::Inbound(lane, bytes) => {
                         let _ = leg.events.send(P2pEvent::Inbound(lane, bytes));
                     }
@@ -324,7 +419,11 @@ async fn drive(
                         // 只有发起方能重开一轮：被动一方等对方的 offer，自己重试没意义。
                         // 同一轮会连着收到好几次 `Failed`（两条通道各一次 + 连接状态），
                         // 已经排了下一轮就别再改时间，也别重复计数。
-                        if leg.offerer && leg.peer_ready {
+                        //
+                        // 手工码模式**不重试**：重开一轮就是新的 offer，那串码对方手里没有，
+                        // 而对方已经交回来的回码也随之作废——静默换码只会让人更糊涂。
+                        // 这一轮废了就停在 `failed`，让用户重新出一次码。
+                        if !leg.manual && leg.offerer && leg.peer_ready {
                             if retry_at.is_none() {
                                 let delay = retry_delay(failures);
 
@@ -343,6 +442,10 @@ async fn drive(
             _ = retry => {
                 retry_at = None;
                 leg.start().await;
+            }
+            _ = code_wait => {
+                leg.code_deadline = None;
+                leg.emit_code(true).await;
             }
         }
     }
@@ -370,6 +473,17 @@ struct Leg {
     reliable: Option<Arc<dyn DataChannel>>,
     /// 对端在 `hello` 里声明过的能力（R32）
     peer_features: Vec<String>,
+    /// 手工码模式：不走中继信令，offer / answer 收集完之后打成一串码由用户转送
+    manual: bool,
+    /// 手工码模式：本端候选已经收集完（`Complete`）
+    gathering_complete: bool,
+    /// 手工码模式：这一轮欠一个码，且还没交出去
+    code_pending: Option<ManualCodeKind>,
+    /// 手工码模式：码已经交过一次（时限兜底不能重复发）
+    code_sent: bool,
+    /// 手工码模式：等候选收集完成的兜底时限（`Complete` 可能永远不来，见
+    /// [`CODE_GATHER_TIMEOUT`]）
+    code_deadline: Option<tokio::time::Instant>,
     /// 与 [`P2pLink`] 共享的「可靠通道还能不能收帧」标志（高 / 低水位事件在维护它）
     writable: Arc<AtomicBool>,
     /// 远端描述已经设好，candidate 可以立刻加了
@@ -379,11 +493,72 @@ struct Leg {
 }
 
 impl Leg {
+    /// 手工码模式的开场：角色与能力位由码决定，不等 `hello`。
+    async fn begin(&mut self, offerer: bool, features: Vec<String>) {
+        self.manual = true;
+        self.peer_ready = true;
+        self.peer_features = features;
+        self.offerer = offerer;
+
+        let _ = self.events.send(P2pEvent::Negotiating);
+
+        self.reset().await;
+        self.start().await;
+    }
+
+    /// 手工码模式：把这一轮的本地描述（含已收集候选）交出去打码。
+    ///
+    /// `force = false` 要等 `Complete`，等不到就排一条 [`CODE_GATHER_TIMEOUT`] 的兜底；
+    /// `force = true` 就是那条兜底到点了（带上那时候已有的候选，有多少算多少）。
+    async fn emit_code(&mut self, force: bool) {
+        if !self.manual || self.code_sent || self.code_pending.is_none() {
+            return;
+        }
+
+        if !force && !self.gathering_complete {
+            // 「收集完成」**不一定来**：STUN 完全不响应时底层 gatherer 不会把没响应的
+            // client 摘表，`Complete` 就永远不来（见 `docs/pair-plan-manual-code.md`）。
+            // 这里排一条按时限主动取快照的兜底，`emit_code(true)` 会带上当时已有的候选。
+            self.code_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + CODE_GATHER_TIMEOUT);
+
+            return;
+        }
+
+        let Some(kind) = self.code_pending else {
+            return;
+        };
+
+        let Some(peer) = self.peer.clone() else {
+            return;
+        };
+
+        let Some(description) = peer.local_description().await else {
+            return;
+        };
+
+        let Some(description) = encode_description(&description) else {
+            return;
+        };
+
+        self.code_sent = true;
+        self.code_deadline = None;
+
+        let (candidates, non_host) = candidate_stats(&description);
+
+        let _ = self.events.send(P2pEvent::Gathered {
+            kind,
+            candidates,
+            non_host,
+            description,
+        });
+    }
+
     fn announce(&self) {
         self.emit_signal(PairSignalPayload::Hello {
             version: SIGNAL_VERSION,
             device_id: self.device_id.clone(),
-            features: vec![FEATURE_RELIABLE_CHANNEL.to_string()],
+            features: super::protocol::local_features(),
         });
     }
 
@@ -480,7 +655,11 @@ impl Leg {
                     return false;
                 }
 
-                if let Some(description) = encode_description(&answer) {
+                if self.manual {
+                    // 手工码模式：回码同样等候选收集完（对方粘贴它之后 ICE 才开始）
+                    self.code_pending = Some(ManualCodeKind::Answer);
+                    self.emit_code(false).await;
+                } else if let Some(description) = encode_description(&answer) {
                     self.emit_signal(PairSignalPayload::Answer { description });
                 }
 
@@ -562,17 +741,31 @@ impl Leg {
         // 是因为 `PeerConnectionBuilder<A>` 的 `A` 留空会推不出类型。
         let wildcard = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
 
-        let peer: Arc<dyn PeerConnection> =
-            match PeerConnectionBuilder::<std::net::SocketAddr>::new()
-                .with_configuration(configuration)
-                .with_handler(handler)
-                .with_udp_addrs(vec![wildcard])
-                // R32：不配上限时 `send` 永不阻塞，慢链路下就是内存无界增长。
-                // 配了之后 `send` 会等到缓冲低于上限，配合 `writable` 标志在源头挡住注入。
-                .with_data_channel_send_buffer_limit(SEND_BUFFER_LIMIT)
-                .build()
-                .await
-            {
+        // R32：不配上限时 `send` 永不阻塞，慢链路下就是内存无界增长。配了之后 `send` 会
+        // 等到缓冲低于上限，配合 `writable` 标志在源头挡住注入。
+        let builder = PeerConnectionBuilder::<std::net::SocketAddr>::new()
+            .with_configuration(configuration)
+            .with_handler(handler)
+            .with_udp_addrs(vec![wildcard])
+            .with_data_channel_send_buffer_limit(SEND_BUFFER_LIMIT);
+
+        // 手工码模式放宽 ICE 的失败时限（见上面那两个常量）：粘贴方的 30 秒窗口太紧，
+        // 而这一段码要靠人转送。中继模式不动——那条腿越快判失败越好。
+        let builder = if self.manual {
+            builder.with_setting_engine(
+                SettingEngineBuilder::new()
+                    .with_ice_timeouts(
+                        Some(MANUAL_DISCONNECTED_TIMEOUT),
+                        Some(MANUAL_FAILED_TIMEOUT),
+                        None,
+                    )
+                    .build(),
+            )
+        } else {
+            builder
+        };
+
+        let peer: Arc<dyn PeerConnection> = match builder.build().await {
                 Ok(peer) => Arc::new(peer),
                 Err(error) => {
                     warn!("P2P 建连失败: {error}");
@@ -619,7 +812,12 @@ impl Leg {
 
         // 第二条通道（Phase 10）。**只在对面声明过能力时才建**：对端是旧客户端时多建一条
         // 会让它的 `on_data_channel` 无条件认领、抢走 `pet-state` 的出站方向（R32）。
-        if self.peer_supports_reliable() {
+        //
+        // 手工码模式是例外：出码方建 offer 的时候**还不知道**对方的能力位（那要等对方交回
+        // 码 2，而 offer 已经在码 1 里发出去了），只能无条件建。这不违反 R32 的本意——配对
+        // 码自带版本号，能出码 / 能解开的必然是同一版客户端，不存在「旧客户端那一侧」；
+        // 真不认领时这条通道只是不开，可覆盖流照旧。
+        if self.peer_supports_reliable() || self.manual {
             // 有序 + 不限重传次数 = 可靠。crate 的 `Default` 已经是这个形状，这里显式写
             // 出来是为了抗上游改默认值（与依赖显式写 `features` 同一个理由）。
             let init = RTCDataChannelInit {
@@ -654,6 +852,14 @@ impl Leg {
                     return;
                 }
 
+                // 手工码模式不进信令：这一轮的码等候选收集完（或时限到了）再交出去
+                if self.manual {
+                    self.code_pending = Some(ManualCodeKind::Offer);
+                    self.emit_code(false).await;
+
+                    return;
+                }
+
                 // 不等 ICE 收完：candidate 单独 trickle 过去（信令只有个位数帧，见 R26-3）
                 match encode_description(&offer) {
                     Some(description) => self.emit_signal(PairSignalPayload::Offer { description }),
@@ -671,6 +877,10 @@ impl Leg {
     async fn reset(&mut self) {
         self.remote_ready = false;
         self.buffered_candidates.clear();
+        self.gathering_complete = false;
+        self.code_pending = None;
+        self.code_sent = false;
+        self.code_deadline = None;
         self.pet_state = None;
         self.reliable = None;
         // 背压标志是**这一轮**的：新通道的 SCTP 发送缓冲从 0 开始只增不减，而 High / Low
@@ -739,6 +949,16 @@ impl PeerConnectionEventHandler for Handler {
                 sdp_mid: init.sdp_mid,
                 sdp_mline_index: init.sdp_mline_index,
             }));
+    }
+
+    /// 手工码模式靠它决定「什么时候可以把 SDP 打成码」。**它不一定来**：STUN 完全不响应
+    /// 时 gathering 会一直停在 `InProgress`（见 `docs/pair-plan-manual-code.md`），所以
+    /// 驱动循环里还排了一条 [`CODE_GATHER_TIMEOUT`] 的兜底：到点直接走 `emit_code(true)`,
+    /// 带上那时候已经收集到的候选。
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if matches!(state, RTCIceGatheringState::Complete) {
+            let _ = self.driver.send(Input::GatheringComplete);
+        }
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
@@ -885,6 +1105,52 @@ mod tests {
             "relay udp 203.0.113.7"
         );
         assert_eq!(describe_candidate("   "), "候选收集结束");
+    }
+
+    /// 手工码那句「大概率只有同一个网络里能连」全靠它：数的是**非 host** 候选。
+    ///
+    /// 这里只能靠猜 SDP 行的形状（`Typ` 后面那个词），所以钉一条纯函数用例：上游哪天改了
+    /// marshal 写法，或者有人把判据改回「候选总数」，这条会先红。
+    #[test]
+    fn candidate_stats_counts_the_non_host_candidates() {
+        fn description(sdp: &str) -> String {
+            serde_json::json!({ "type": "offer", "sdp": sdp }).to_string()
+        }
+
+        // 一条 host + 一条 srflx：STUN 帮我们要到了外网映射
+        assert_eq!(
+            candidate_stats(&description(
+                "v=0\r\n\
+                 a=candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host\r\n\
+                 a=candidate:2 1 udp 1694498815 203.0.113.7 54321 typ srflx \
+                 raddr 192.168.1.5 rport 54321\r\n\
+                 a=end-of-candidates\r\n"
+            )),
+            (2, 1)
+        );
+
+        // 多网卡（有线 + 无线 + 虚拟网卡）没有 STUN：候选好几条，非 host 一条都没有。
+        // 判据要是用候选总数，这段跨网络连不上的码就会被当成正常。
+        assert_eq!(
+            candidate_stats(&description(
+                "a=candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host\r\n\
+                 a=candidate:3 1 udp 2130706431 10.0.0.2 54322 typ host\r\n\
+                 a=candidate:4 1 udp 2130706431 172.17.0.1 54323 typ host\r\n"
+            )),
+            (3, 0)
+        );
+
+        // 认不出来的行按 host 算：宁可少报「能连」，也不要给出一段其实连不上的码
+        assert_eq!(
+            candidate_stats(&description("a=candidate:9 1 udp 1 192.168.1.9 1\r\n")),
+            (1, 0)
+        );
+
+        // 没有候选的 SDP、不是 JSON、以及只有 end-of-candidates：都算 0
+        assert_eq!(candidate_stats(&description("v=0\r\n")), (0, 0));
+        assert_eq!(candidate_stats(&description("a=end-of-candidates\r\n")), (0, 0));
+        assert_eq!(candidate_stats(""), (0, 0));
+        assert_eq!(candidate_stats("not json"), (0, 0));
     }
 
     /// 这一层用的 transfer id（值本身不重要，帧头里带上它只是为了让「错帧」看得出来）

@@ -25,12 +25,14 @@ use super::history::{
     NewMessage, PairHistory,
 };
 use super::link;
+// 配对码（手工信令）：编解码与 STUN 清单解析都是纯函数，见 `manual.rs`
+use super::manual::{self, ManualCodeKind};
 use super::protocol::{
     AppEnvelope, ChatAckPayload, ChatTextPayload, FrameHeader, FrameKind, InputStats,
-    MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PairSignalPayload, PetSnapshot, PresencePayload,
-    PresenceState, RecentMessageIds, RelayConfig, RelayLimits, ServerFrame, TransferIdPayload,
-    TransferKind, TransferOfferPayload, TransferRejectPayload, TransferVerifiedPayload,
-    message_type, now_millis,
+    IceServer, MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PairSignalPayload, PetSnapshot,
+    PresencePayload, PresenceState, RecentMessageIds, RelayConfig, RelayLimits, ServerFrame,
+    TransferIdPayload, TransferKind, TransferOfferPayload, TransferRejectPayload,
+    TransferVerifiedPayload, local_features, message_type, now_millis,
 };
 use super::secret;
 use super::transfer::{
@@ -148,6 +150,82 @@ pub struct PairStatus {
     /// 只用来在界面上给一条非阻塞提醒——握手与信令没有 TLS 保护——**绝不阻止连接**。
     /// 它只在 `start()` 里按**当次**地址算，界面对应地还要比对 `relay_url` 才显示。
     pub plaintext: bool,
+    /// 配对码（手工信令）这条路的状态。`None` = 当前这条会话不是手工码。
+    ///
+    /// 它和 `state` / `p2p` 是**互补**的：手工码模式没有中继，所以「对方是否在线」只能由
+    /// DataChannel 的探针决定，界面也据此把聊天 / 附件 / 语音灰化到直连建立为止。
+    pub manual: Option<ManualStatus>,
+}
+
+/// 配对码（手工信令）这条路走到了哪一步。
+///
+/// 两段码的流程：出码方 `Gathering → OfferReady`（等对方交回码 2）→ `Joining` →
+/// `Connected`；粘贴方 `Gathering → AnswerReady`（把码 2 交回去）→ `Joining` → `Connected`。
+/// 任一环节没打通都是 `Failed`（手工模式不自动重试，重新出码就是重来）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManualPhase {
+    /// 正在建 PeerConnection / 收集候选（最多 5 秒）
+    Gathering,
+    /// 码 1 已经出来了，等对方把它贴回来
+    OfferReady,
+    /// 码 2 已经出来了，把它发给对方
+    AnswerReady,
+    /// 两段码都齐了，正在打洞
+    Joining,
+    /// 通了：DataChannel 真的过过数据
+    Connected,
+    /// 这一轮没打通
+    Failed,
+}
+
+/// 手工码里本端的角色。**出码方固定当 offerer**——码路径不能用 deviceId 字典序裁决
+/// （那要求双方都知道对方，而这里在出码时还不知道对面是谁），所以角色必须由「谁出码 1」
+/// 定死。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManualRole {
+    /// 本端出码 1，等对方交回码 2
+    Host,
+    /// 本端粘贴码 1，出码 2 交回去
+    Guest,
+}
+
+/// 手工码这条路的对外状态（`PairStatus::manual`）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualStatus {
+    pub phase: ManualPhase,
+    pub role: ManualRole,
+    /// 要交给对方的那串码（`offerReady` 是码 1，`answerReady` 是码 2）
+    pub code: Option<String>,
+    /// 这串码的过期时间（毫秒时间戳），界面据此倒计时
+    pub expires_at: Option<i64>,
+    /// 这次配对的随机 id：换码就换它，两段码必须属于同一个 id
+    pub session_id: Option<String>,
+    /// 自己那段 SDP 里带了几条候选。**0 说明只有本机可达**，界面要如实说
+    pub candidates: usize,
+    /// 其中几条不是 `host`（`srflx` / `relay`）。**0 = 全是本机地址，跨网络连不上**，
+    /// 界面据此提醒「大概率只有同一个网络里能连」。数非 host 而不是数总数：多网卡的机器
+    /// 上没有 STUN 也有好几条 host 候选。
+    pub non_host_candidates: usize,
+    /// 这一轮为什么停了（只有 `failed` 时才有）
+    pub error: Option<String>,
+}
+
+impl ManualStatus {
+    fn starting(role: ManualRole, session_id: String) -> Self {
+        Self {
+            phase: ManualPhase::Gathering,
+            role,
+            code: None,
+            expires_at: None,
+            session_id: Some(session_id),
+            candidates: 0,
+            non_host_candidates: 0,
+            error: None,
+        }
+    }
 }
 
 /// P2P 这条腿的状态
@@ -203,6 +281,45 @@ struct SessionConfig {
     server_token: Option<String>,
     root_key: [u8; 32],
     device_id: String,
+    /// 这条会话的会合方式。手工码模式下 `relay_url` 与它那三个凭据都是空的：
+    /// 手工码不连任何服务器。
+    mode: SessionMode,
+    /// 手工码模式要用的 ICE 服务器（设置里那份公益 STUN）。中继模式是空的——那份
+    /// 只能来自 `server.welcome` 的广告。
+    manual_ice: Vec<IceServer>,
+}
+
+/// 一条会话怎么让两端遇上。
+#[derive(Clone, PartialEq, Eq)]
+enum SessionMode {
+    /// 经中继：信令走服务器，P2P 只是加速腿（默认）
+    Relay,
+    /// 配对码：没有服务器，信令由用户自己转送，DataChannel 是**唯一**的腿
+    Manual {
+        role: ManualRole,
+        /// 这次配对的随机 id，两段码必须一致
+        session_id: String,
+        /// 粘贴方：对方的 offer（`description` 原文），进 `live` 后立刻交给腿
+        peer_offer: Option<String>,
+        /// 对端码里声明的能力位
+        peer_features: Vec<String>,
+    },
+}
+
+impl SessionMode {
+    fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual { .. })
+    }
+}
+
+/// 手工码会话的瞬时状态。**不落盘**：码与会话 id 都是一次性的，重启后重来即可。
+struct ManualSession {
+    /// 这次配对的配对密码（码的加解密就是拿它派生的，见 `manual::code_key`）。
+    ///
+    /// 它只在这条手工会话活着的时候留在内存里：会话一结束（断开 / 换路 / 失败重建）
+    /// 就丢掉，不落盘、也不进状态里的任何字段。
+    secret: [u8; crypto::PAIR_SECRET_BYTES],
+    session_id: String,
 }
 
 enum Command {
@@ -220,6 +337,8 @@ enum Command {
     RejectTransfer { transfer_id: u64 },
     /// 任意一端取消
     CancelTransfer { transfer_id: u64 },
+    /// 手工码模式：收到的下一段码（出码方交回码 2 时用）
+    ManualSignal(Box<PairSignalPayload>),
     Disconnect,
 }
 
@@ -341,6 +460,8 @@ pub struct PairManager {
     /// 聊天 UI 手里只有消息 id，所以接受 / 拒绝 / 取消都用消息 id 定位，
     /// 不用把 transferId 存进数据库（那需要一次表结构迁移）。
     transfers: Mutex<HashMap<String, u64>>,
+    /// 手工码这条路的瞬时状态（码的密钥与会话 id）。不落盘，会话结束就丢掉。
+    manual: Mutex<Option<ManualSession>>,
     history: Arc<PairHistory>,
     sink: Arc<dyn PairEventSink>,
     store: TransferStore,
@@ -373,6 +494,7 @@ impl PairManager {
                 p2p: P2pState::Off,
                 pet_state_hz: DEFAULT_PET_STATE_HZ,
                 plaintext: false,
+                manual: None,
             }),
             sender: Mutex::new(None),
             pending: Mutex::new(PendingReplaceable::default()),
@@ -383,6 +505,7 @@ impl PairManager {
             sink,
             store,
             transfers: Mutex::new(HashMap::new()),
+            manual: Mutex::new(None),
         }
     }
 
@@ -483,9 +606,14 @@ impl PairManager {
             server_token,
             root_key: crypto::derive_root_key(&secret_bytes),
             device_id: self.device_id(),
+            mode: SessionMode::Relay,
+            manual_ice: Vec::new(),
         };
 
         self.cancel_current();
+        // 换到中继这条路：手工码那份瞬时状态与界面上的手工码面板都要清掉，
+        // 否则「配对码」那一块会挂在一条已经不存在的手工会话上
+        *Self::lock(&self.manual) = None;
 
         let (sender, receiver) = mpsc::unbounded_channel();
 
@@ -505,6 +633,7 @@ impl PairManager {
             status.p2p = P2pState::Off;
             // 同理，快照上限也回到缺省：新会话还没读到中继广告的额度
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
+            status.manual = None;
         });
 
         tauri::async_runtime::spawn(async move {
@@ -516,6 +645,7 @@ impl PairManager {
 
     pub fn disconnect(self: &Arc<Self>) {
         self.cancel_current();
+        *Self::lock(&self.manual) = None;
 
         let generation = self.generation();
 
@@ -530,11 +660,227 @@ impl PairManager {
             status.p2p = P2pState::Off;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             status.plaintext = false;
+            status.manual = None;
         });
+    }
+
+    /// 手工码模式要用的配对密码。`secret` 是**这一次**要用的值（界面上还没点保存也照样
+    /// 能用），为空则回落到凭据库里存着的那个。
+    ///
+    /// 与中继那条路不同，这里**读不到就直接失败**：配对码本身是加密的，没有配对密码连
+    /// 码都打不开，没有可以降级的余地（中继那条路还能靠「不带服务器密码头」退到官方中继）。
+    fn manual_secret(secret: Option<&str>) -> Result<[u8; crypto::PAIR_SECRET_BYTES], String> {
+        let text = match secret.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(secret) => secret.to_string(),
+            None => secret::load_secret()?.ok_or_else(|| {
+                "还没有配置配对密码：配对码要用它加密，两台电脑必须填同一个".to_string()
+            })?,
+        };
+
+        crypto::decode_pair_secret(&text)
+    }
+
+    /// 这条手工会话的（配对密码，会话 id）。没有手工会话时是 `None`。
+    fn manual_state(&self) -> Option<([u8; crypto::PAIR_SECRET_BYTES], String)> {
+        Self::lock(&self.manual)
+            .as_ref()
+            .map(|session| (session.secret, session.session_id.clone()))
+    }
+
+    /// 手工码这条路走到了哪一步。不是手工码会话时是 `None`。
+    fn manual_phase(&self) -> Option<ManualPhase> {
+        Self::lock(&self.status)
+            .manual
+            .as_ref()
+            .map(|manual| manual.phase)
+    }
+
+    /// 手工码第一步（出码方）：建一条**没有中继**的会话，出码 1 等对方贴回来。
+    ///
+    /// 出码方固定当 offerer——码路径不能用 deviceId 字典序裁决角色（出码时还不知道对面是
+    /// 谁），所以角色在这里就定死。
+    pub fn start_manual_offer(
+        self: &Arc<Self>,
+        secret: Option<&str>,
+        stun: Option<&str>,
+    ) -> Result<(), String> {
+        self.spawn_manual(
+            secret,
+            stun,
+            ManualRole::Host,
+            manual::new_session_id(),
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// 手工码第二步（粘贴方）：解开码 1 并起会话，接着出码 2。
+    ///
+    /// 会话 id 用**对端码里那个**：两段码必须属于同一次配对，出码方交回码 2 时会核对。
+    pub fn join_manual(
+        self: &Arc<Self>,
+        code_text: &str,
+        secret: Option<&str>,
+        stun: Option<&str>,
+    ) -> Result<(), String> {
+        let secret_bytes = Self::manual_secret(secret)?;
+        let code = manual::decode(&secret_bytes, code_text)
+            .map_err(|error| error.user_message().to_string())?;
+
+        if code.kind != ManualCodeKind::Offer {
+            return Err("这是一段回码，要交给出码的那台电脑".to_string());
+        }
+
+        self.spawn_manual(
+            secret,
+            stun,
+            ManualRole::Guest,
+            code.session_id,
+            Some(code.description),
+            code.features,
+        )
+    }
+
+    /// 手工码最后一步（出码方）：把对方交回来的码 2 交进会话，ICE 从这一刻开始。
+    pub fn apply_manual_answer(&self, code_text: &str) -> Result<(), String> {
+        let Some((secret, session_id)) = self.manual_state() else {
+            return Err("现在没有正在进行的配对：请先点「生成配对码」".to_string());
+        };
+
+        let code = manual::decode(&secret, code_text)
+            .map_err(|error| error.user_message().to_string())?;
+
+        if code.kind != ManualCodeKind::Answer {
+            return Err("这是一段出码，应该交给另一台电脑".to_string());
+        }
+
+        if code.session_id != session_id {
+            return Err("这段码不是这次配对生成的（会话对不上），请让对方重新出码".to_string());
+        }
+
+        // 只有还在「等回码」这一步才收得下。其余每一步都要分开说，因为「该怎么办」正好
+        // 各不相同，而粘贴框在连上之后仍然摆在那儿、按钮也仍然能点：
+        //
+        // - 这一轮已经废了（腿判死、或用户点过取消）时腿那边的 `peer` 已经置空，回码交给它
+        //   只会被直接丢掉——既不设远端描述、也不报错，面板就永远停在「正在打洞连接」；
+        // - 反过来，已经连上 / 正在打洞时那句「重新出码」是有害的：照着点会掐断一条正在用
+        //   的会话。
+        match self.manual_phase() {
+            Some(ManualPhase::OfferReady) => {}
+            Some(ManualPhase::Gathering) => {
+                return Err("配对码还在生成，稍等一下再贴回码".to_string());
+            }
+            Some(ManualPhase::AnswerReady) => {
+                return Err("本机是粘贴的一方：该把码 2 发给对方，而不是再贴回来".to_string());
+            }
+            Some(ManualPhase::Joining) => {
+                return Err("正在打洞连接，稍等一下：回码已经收下了".to_string());
+            }
+            Some(ManualPhase::Connected) => {
+                return Err("已经连上了，不用再贴码".to_string());
+            }
+            Some(ManualPhase::Failed) | None => {
+                return Err(
+                    "这次配对已经结束了：请重新点「生成配对码」，让对方用新码重连".to_string(),
+                );
+            }
+        }
+
+        self.sender()?
+            .send(Command::ManualSignal(Box::new(PairSignalPayload::Answer {
+                description: code.description,
+            })))
+            .map_err(|_| "连接任务已结束".to_string())
+    }
+
+    /// 手工码会话的公共部分：拼配置、起会话任务。
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_manual(
+        self: &Arc<Self>,
+        secret: Option<&str>,
+        stun: Option<&str>,
+        role: ManualRole,
+        session_id: String,
+        peer_offer: Option<String>,
+        peer_features: Vec<String>,
+    ) -> Result<(), String> {
+        let secret_bytes = Self::manual_secret(secret)?;
+        let manual_ice = manual_ice_servers(stun)?;
+
+        let config = SessionConfig {
+            // 手工码不连任何服务器：这四项只是 `SessionConfig` 的形状要求，全程没人读
+            relay_url: String::new(),
+            room_id: String::new(),
+            auth_token: String::new(),
+            server_token: None,
+            // 应用层的 E2EE 根密钥照旧从配对密码派生：手工码只是换了个会合方式，
+            // 帧的加密一字不变
+            root_key: crypto::derive_root_key(&secret_bytes),
+            device_id: self.device_id(),
+            mode: SessionMode::Manual {
+                role,
+                session_id: session_id.clone(),
+                peer_offer,
+                peer_features,
+            },
+            manual_ice,
+        };
+
+        self.cancel_current();
+        *Self::lock(&self.manual) = Some(ManualSession {
+            secret: secret_bytes,
+            session_id: session_id.clone(),
+        });
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+
+        *Self::lock(&self.sender) = Some(sender);
+
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let manager = Arc::clone(self);
+
+        self.publish(generation, |status| {
+            status.state = PairConnectionState::Connecting;
+            status.peer_online = false;
+            status.peer_name = None;
+            status.peer_model = None;
+            status.remote_presence = None;
+            status.remote_stats = None;
+            status.last_error = None;
+            status.p2p = P2pState::Off;
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
+            // §23 的明文提醒说的是「服务器地址」，手工码没有服务器
+            status.plaintext = false;
+            status.relay_url = None;
+            status.manual = Some(ManualStatus::starting(role, session_id.clone()));
+        });
+
+        tauri::async_runtime::spawn(async move {
+            run_session(manager, generation, config, receiver).await;
+        });
+
+        Ok(())
     }
 
     pub fn send(&self, kind: FrameKind, message_type: &str, payload: Value) -> Result<(), String> {
         self.enqueue(kind, message_type, payload)
+    }
+
+    /// 手工码模式下「现在还不能发」的原因。中继模式永远是 `None`。
+    ///
+    /// 手工码没有服务器可以兜底：DataChannel 没建立之前，聊天与附件发出去只会掉进黑洞，
+    /// 而本地记录会被标成「已发送」。**如实报错比静默丢好**——界面也据此把输入框灰掉。
+    pub fn manual_blocked(&self) -> Option<String> {
+        let status = Self::lock(&self.status);
+        let manual = status.manual.as_ref()?;
+
+        if manual.phase == ManualPhase::Connected {
+            return None;
+        }
+
+        Some(
+            "直连还没建立：配对码这条路没有服务器兜底，等对方猫出现在桌面上再发".to_string(),
+        )
     }
 
     /// 可覆盖的实时状态（宠物快照、统计）：拥塞时新数据直接覆盖旧数据
@@ -595,6 +941,12 @@ impl PairManager {
 
         if text.len() > MESSAGE_TEXT_LIMIT {
             return Err(format!("单条消息最多 {} KiB", MESSAGE_TEXT_LIMIT / 1024));
+        }
+
+        // 手工码模式下直连还没建立时**先挡住**：手工码没有中继可以兜底，帧发出去只会掉进
+        // 黑洞，消息却已经被标成「已发送」——用户看到的就是「发出去了、对面没收到」。
+        if let Some(reason) = self.manual_blocked() {
+            return Err(reason);
         }
 
         let epoch = self.history.epoch()?;
@@ -1232,6 +1584,12 @@ async fn run_session(
     config: SessionConfig,
     mut receiver: mpsc::UnboundedReceiver<Command>,
 ) {
+    if config.mode.is_manual() {
+        run_manual_session(manager, generation, config, receiver).await;
+
+        return;
+    }
+
     let mut state = SessionState::new(&config.root_key);
     let mut backoff = Backoff::new();
 
@@ -1266,7 +1624,7 @@ async fn run_session(
                     status.last_error = None;
                 });
 
-                match live(&manager, generation, &mut state, socket, &mut receiver).await {
+                match live(&manager, generation, &mut state, &config, socket, &mut receiver).await {
                     Outcome::Stopped => {
                         abort_transfers(&manager, &mut state);
 
@@ -1350,7 +1708,9 @@ async fn run_session(
                     }
                     Some(Command::AcceptTransfer { .. })
                     | Some(Command::RejectTransfer { .. })
-                    | Some(Command::CancelTransfer { .. }) => {
+                    | Some(Command::CancelTransfer { .. })
+                    // 手工码模式的码只在 `live` 里收（退避期间压根没有手工码会话）
+                    | Some(Command::ManualSignal(_)) => {
                         // 退避期间没有会话可操作：offer 还没收到，或者传输已经随连接结束被收尾
                     }
                 },
@@ -1362,6 +1722,80 @@ async fn run_session(
         status.state = PairConnectionState::Disconnected;
         status.peer_online = false;
     });
+}
+
+/// 把设置里那份公益 STUN 清单变成 ICE 条目。
+///
+/// 填错的行**不静默丢**：界面在保存时已经校验过一次，正常到不了这里；真到了就把问题原样
+/// 报出来，比用一个少了一条的清单去连线好（用户会以为「填了六个」，实际只有五个）。
+fn manual_ice_servers(stun: Option<&str>) -> Result<Vec<IceServer>, String> {
+    let parsed = manual::parse_stun_urls(stun.unwrap_or_default());
+
+    if !parsed.errors.is_empty() {
+        return Err(format!(
+            "公益 STUN 填得不对：{}",
+            parsed.errors.join("；")
+        ));
+    }
+
+    Ok(manual::stun_ice_servers(&parsed.effective()))
+}
+
+/// 手工码的一条会话：没有中继、没有重连，一轮到底。
+///
+/// 与中继那条路的三个不同点，全在 `live` 里按 `SessionMode` 分叉：跳过 `read_welcome`、
+/// ICE 条目改用设置里的公益 STUN、信令的出口改成「用户转送」而不是发进 socket。
+///
+/// **不重试**：手工码没有可以退回的服务器，重试也还是得让用户再贴一次码。一轮结束就停在
+/// 结果上；要重来就重新出码（新的会话 id 让旧码自然作废）。
+async fn run_manual_session(
+    manager: Arc<PairManager>,
+    generation: u64,
+    config: SessionConfig,
+    mut receiver: mpsc::UnboundedReceiver<Command>,
+) {
+    let mut state = SessionState::new(&config.root_key);
+
+    let outcome = live(
+        &manager,
+        generation,
+        &mut state,
+        &config,
+        BlackHole,
+        &mut receiver,
+    )
+    .await;
+
+    // 手工码也会带货（附件分片走 `reliable` 通道）：会话一结束就按 §43 收尾
+    abort_transfers(&manager, &mut state);
+
+    if generation != manager.generation() {
+        return;
+    }
+
+    match outcome {
+        // 用户主动断开：`disconnect()` 已经把手工码那块一起清了，这里只补连接状态
+        Outcome::Stopped => manager.publish(generation, |status| {
+            status.state = PairConnectionState::Disconnected;
+            status.peer_online = false;
+            status.p2p = P2pState::Off;
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
+            status.manual = None;
+        }),
+        Outcome::Lost(failure) => manager.publish(generation, |status| {
+            status.state = PairConnectionState::Error;
+            status.peer_online = false;
+            status.p2p = P2pState::Failed;
+            status.pet_state_hz = DEFAULT_PET_STATE_HZ;
+            status.last_error = Some(failure.message.clone());
+
+            // 手工码面板停在「没打通」并写明原因：**不自动重来**，要重来就重新出码
+            if let Some(manual) = status.manual.as_mut() {
+                manual.phase = ManualPhase::Failed;
+                manual.error = Some(failure.message.clone());
+            }
+        }),
+    }
 }
 
 /// 等中继握手后的第一帧：`server.welcome`（CF 版与自建版都保证它最先发）。
@@ -1437,6 +1871,7 @@ async fn live<T, E>(
     manager: &Arc<PairManager>,
     generation: u64,
     state: &mut SessionState,
+    config: &SessionConfig,
     transport: T,
     receiver: &mut mpsc::UnboundedReceiver<Command>,
 ) -> Outcome
@@ -1446,6 +1881,9 @@ where
         + Unpin,
     E: std::fmt::Display,
 {
+    // 手工码模式与中继模式的差别只有四处，都在下面按这个标志分叉：跳过 `read_welcome`、
+    // ICE 条目改用设置里的公益 STUN、跳过中继探针（WS Ping 也一样）、信令出口改成 UI。
+    let manual = config.mode.is_manual();
     let (mut sink, mut stream) = transport.split();
     let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
     // 附件分片另有一层额度（R18）：两套都放行才发一块
@@ -1458,12 +1896,22 @@ where
     // 那条既跑聊天又跑控制的通道，也不能去蹭 60Hz 那个桶（会把快照饿死）。
     let mut direct_chunk_pacer = Pacer::new(DIRECT_CHUNKS_PER_SECOND, DIRECT_CHUNK_BURST);
 
-    // R20：先读掉 `server.welcome` 再开始补发（额度与 ICE 广告都在它里面）
-    let config = match read_welcome(&mut stream, manager, generation).await {
-        Ok(config) => config,
-        Err(error) => return Outcome::Lost(error),
+    // R20：先读掉 `server.welcome` 再开始补发（额度与 ICE 广告都在它里面）。
+    //
+    // 手工码模式没有中继，也就没有这一帧：额度按 Cloudflare 的缺省推导（这个额度只影响
+    // 那个黑洞 sink 的节奏，真正的限额是 DC 自己那两套），ICE 条目来自设置里的公益 STUN。
+    let welcome = if manual {
+        RelayConfig {
+            limits: RelayLimits::cloudflare(),
+            ice_servers: config.manual_ice.clone(),
+        }
+    } else {
+        match read_welcome(&mut stream, manager, generation).await {
+            Ok(welcome) => welcome,
+            Err(error) => return Outcome::Lost(error),
+        }
     };
-    let outbound = config.limits.outbound();
+    let outbound = welcome.limits.outbound();
 
     pacer.retune(outbound.frames_per_second, outbound.frames_burst);
     chunk_pacer.retune(outbound.chunks_per_second, outbound.chunks_burst);
@@ -1494,9 +1942,26 @@ where
     // R21：P2P 那条腿。能力门控只看对端——腿一起来就先发 hello，只有收到对端的 hello
     // 才会开始 ICE。信令永远钉在中继上，所以这条腿只做出站 sink 与一条额外的入站分支。
     let (link, link_events) =
-        link::P2pLink::spawn(manager.device_id().to_string(), config.ice_servers);
+        link::P2pLink::spawn(manager.device_id().to_string(), welcome.ice_servers);
     // `None` = 这条腿结束了，那一支要停掉（`recv()` 会立刻返回 `None`，否则是忙循环）
     let mut link_events = Some(link_events);
+
+    // 手工码模式的开场：角色与**对端的能力位**都从码里来（手工模式没有 `hello`，不给
+    // 它喂这些，对方会被当成旧客户端，聊天 / 附件 / 语音整片失效）。粘贴方再把码 1 里的
+    // offer 交进去——两条 `Input` 靠同一条 channel 保序，所以腿一定先开场再收 offer。
+    if let SessionMode::Manual {
+        role,
+        peer_offer,
+        peer_features,
+        ..
+    } = &config.mode
+    {
+        link.begin(*role == ManualRole::Host, peer_features.clone());
+
+        if let Some(description) = peer_offer.clone() {
+            link.handle_signal(PairSignalPayload::Offer { description });
+        }
+    }
 
     // 每次（重）连都从 `Off` 开始：上一轮留下的 `Connected` 在腿重新协商成功之前都是假的
     publish_route(
@@ -1769,6 +2234,18 @@ where
                         return Outcome::Lost(PairFailure { message: error, fatal: false });
                     }
                 }
+                Some(Command::ManualSignal(signal)) => {
+                    // 手工码的最后一步：出码方把对方交回来的码 2 交给这条腿，ICE 从这一刻
+                    // 开始。中继模式不会收到这一类命令（状态机只从手工码那几个命令里发）。
+                    link.handle_signal(*signal);
+
+                    manager.publish(generation, |status| {
+                        if let Some(manual) = status.manual.as_mut() {
+                            manual.phase = ManualPhase::Joining;
+                            manual.error = None;
+                        }
+                    });
+                }
             },
             incoming = stream.next() => {
                 let Some(incoming) = incoming else {
@@ -1858,20 +2335,27 @@ where
             _ = ticker.tick() => {
                 // 中继腿的探针**保持不动**：WS Ping 由中继自己回 Pong，与对端在线与否
                 // 无关（R28 推翻了 R21 的初版写法）。超时就是整条会话的失败。
-                if relay_awaiting_pong && relay_last_inbound.elapsed() >= heartbeat * 2 {
-                    return Outcome::Lost(PairFailure {
-                        message: "心跳超时".into(),
-                        fatal: false,
-                    });
-                }
+                //
+                // 手工码模式**整段跳过**：那两条都打给一个黑洞（手工模式没有 WS 连接），
+                // 探针标志永远不会被入站清掉，2×心跳之后会把整条会话判死——而这时 DataChannel
+                // 可能正连着。
+                if !manual {
+                    if relay_awaiting_pong && relay_last_inbound.elapsed() >= heartbeat * 2 {
+                        return Outcome::Lost(PairFailure {
+                            message: "心跳超时".into(),
+                            fatal: false,
+                        });
+                    }
 
-                relay_awaiting_pong = true;
+                    relay_awaiting_pong = true;
 
-                if let Err(error) = send_frame(&mut sink, Message::Ping(Vec::new().into())).await {
-                    return Outcome::Lost(PairFailure {
-                        message: error,
-                        fatal: false,
-                    });
+                    if let Err(error) = send_frame(&mut sink, Message::Ping(Vec::new().into())).await
+                    {
+                        return Outcome::Lost(PairFailure {
+                            message: error,
+                            fatal: false,
+                        });
+                    }
                 }
 
                 // DC 腿的探针：应用级 `pair.ping`、**独立标志**（R28）。它**不过中继的
@@ -1984,6 +2468,21 @@ where
                             outbound.frames_per_second,
                         );
                     }
+                    // 手工码模式：本地描述攒够了，打成一串码交给用户转送。中继模式永远
+                    // 收不到这一条（那条路走 `Signal`，trickle 发 candidate）。
+                    Some(link::P2pEvent::Gathered {
+                        kind,
+                        candidates,
+                        non_host,
+                        description,
+                    }) => publish_manual_code(
+                        manager,
+                        generation,
+                        kind,
+                        candidates,
+                        non_host,
+                        &description,
+                    ),
                     Some(link::P2pEvent::Unreachable) => {
                         // 紧跟在 `ChannelClosed` 之后到达：那两条已经把两条腿的标志复位、
                         // 选路回到中继，这里只改显示
@@ -1994,6 +2493,36 @@ where
                             false,
                             outbound.frames_per_second,
                         );
+
+                        // 手工码没有「正在重试」这个中间态：不重试，这一轮没打通就是没打通
+                        if manual {
+                            manager.publish(generation, |status| {
+                                let phase = status.manual.as_ref().map(|manual| manual.phase);
+
+                                status.peer_online = false;
+                                status.state = PairConnectionState::Error;
+                                status.p2p = P2pState::Failed;
+
+                                if let Some(manual) = status.manual.as_mut() {
+                                    manual.phase = ManualPhase::Failed;
+                                    manual.code = None;
+                                    manual.expires_at = None;
+                                    manual.error.get_or_insert_with(|| match phase {
+                                        // 码还在两个人手上传的时候失败：多半是「对方没在两
+                                        // 分钟内把码贴进来」，或者两边真的都在严 NAT 后面
+                                        Some(ManualPhase::OfferReady)
+                                        | Some(ManualPhase::AnswerReady) => {
+                                            "这次配对没能在时限内连上。重新生成一段配对码再试一次（对方粘进去要快一点）"
+                                                .to_string()
+                                        }
+                                        _ => {
+                                            "这一轮没能直连上：多半是两边都在严格的 NAT 后面。可以换个网络、或换一个公益 STUN，再重新出码"
+                                                .to_string()
+                                        }
+                                    });
+                                }
+                            });
+                        }
                     }
                     Some(link::P2pEvent::ChannelOpen(lane)) => match lane {
                         link::Lane::Replaceable => {
@@ -2103,6 +2632,20 @@ where
                                         true,
                                         outbound.frames_per_second,
                                     );
+
+                                    // 手工码模式没有中继的 `server.peer`，「对方在线」只能靠
+                                    // 这一条证据：DataChannel 真的过过数据。它同时是聊天 /
+                                    // 附件 / 语音的开关（前端按 `peerOnline` 判定）。
+                                    if manual {
+                                        publish_peer(manager, generation, true);
+
+                                        manager.publish(generation, |status| {
+                                            if let Some(manual) = status.manual.as_mut() {
+                                                manual.phase = ManualPhase::Connected;
+                                                manual.error = None;
+                                            }
+                                        });
+                                    }
                                 }
                             }
                             link::Lane::Reliable => {
@@ -2146,6 +2689,64 @@ where
     }
 }
 
+/// 手工码模式下的占位传输：没有中继连接，出站全部丢弃、入站永不产出。
+///
+/// `live` 的泛型只要求「能收发 [`Message`]」，所以手工码模式**不必**另写一条会话循环——
+/// 把它当传输传进去，那些中继专有的处理点（主动关闭、入站 Close、流结束、入站 Ping）就都
+/// 自然变成空操作。唯一必须显式跳过的只有 WS Ping 与中继探针：它们打给一个没人回应的
+/// 黑洞，2×心跳之后会把整条会话判死（见 `live` 里 `manual` 那几处）。
+struct BlackHole;
+
+/// 黑洞传输不会产生错误。`live` 要求 `Sink` 与 `Stream` 共用同一个 `Error` 类型。
+#[derive(Debug)]
+struct BlackHoleError;
+
+impl std::fmt::Display for BlackHoleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("手工码模式没有中继连接")
+    }
+}
+
+impl futures_util::Sink<Message> for BlackHole {
+    type Error = BlackHoleError;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl futures_util::Stream for BlackHole {
+    type Item = Result<Message, BlackHoleError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Pending
+    }
+}
+
 /// 前端该按多少 Hz 发桌宠快照（§6 / R23）。
 ///
 /// 只看**当前生效传输**的额度：DC 那条腿没有中继的令牌桶，直接用 60Hz 上限；中继腿用
@@ -2161,6 +2762,114 @@ fn pet_state_hz(direct: bool, relay_frames_per_second: f64) -> f64 {
     } else {
         DEFAULT_PET_STATE_HZ
     }
+}
+
+/// 手工码模式：把腿交出来的本地描述打成一串码，写进手工码状态。
+///
+/// 加密在这里做（`manual.rs` 只管编解码）：密钥由这次配对的配对密码派生。码**不落盘**、
+/// 也不进设置——它是会话瞬时值，走设置的整份跨窗口同步会被别的窗口用旧值盖掉（R40/R45）。
+///
+/// 一条候选都没有时**不出码**：那种码发出去对方也连不上（里面没有任何可用的地址），如实
+/// 报错比给出一串看着正常、其实没用的码好。候选**全是 `host`** 时照旧出码（同一个局域网
+/// 里能连上，这是合法用法），但把 `non_host_candidates = 0` 一起交出去，让界面提醒用户
+/// 「大概率只有同一个网络里能连」——从码本身看不出这件事。
+fn publish_manual_code(
+    manager: &Arc<PairManager>,
+    generation: u64,
+    kind: ManualCodeKind,
+    candidates: usize,
+    non_host: usize,
+    description: &str,
+) {
+    let Some((secret, session_id)) = manager.manual_state() else {
+        return;
+    };
+
+    if candidates == 0 {
+        let message =
+            "这台电脑没能拿到任何网络地址，配对码连不上；请检查网络（VPN、防火墙）后重试"
+                .to_string();
+
+        manager.publish(generation, |status| {
+            status.last_error = Some(message.clone());
+            status.p2p = P2pState::Failed;
+
+            if let Some(manual) = status.manual.as_mut() {
+                manual.phase = ManualPhase::Failed;
+                manual.candidates = 0;
+                manual.non_host_candidates = 0;
+                manual.error = Some(message);
+            }
+        });
+
+        return;
+    }
+
+    let device_id = manager.device_id();
+    let code = match kind {
+        ManualCodeKind::Offer => manual::ManualCode::offer(
+            &device_id,
+            &session_id,
+            local_features(),
+            description.to_string(),
+        ),
+        ManualCodeKind::Answer => manual::ManualCode::answer(
+            &device_id,
+            &session_id,
+            local_features(),
+            description.to_string(),
+        ),
+    };
+
+    let encoded = match manual::encode(&secret, &code) {
+        Ok(text) => text,
+        Err(error) => {
+            let message = error.user_message().to_string();
+
+            manager.publish(generation, |status| {
+                status.last_error = Some(message.clone());
+                status.p2p = P2pState::Failed;
+
+                if let Some(manual) = status.manual.as_mut() {
+                    manual.phase = ManualPhase::Failed;
+                    manual.error = Some(message);
+                }
+            });
+
+            return;
+        }
+    };
+
+    let expires_at = code.expires_at();
+    let length = encoded.len();
+
+    manager.publish(generation, |status| {
+        status.last_error = None;
+
+        if let Some(manual) = status.manual.as_mut() {
+            manual.phase = match kind {
+                ManualCodeKind::Offer => ManualPhase::OfferReady,
+                ManualCodeKind::Answer => ManualPhase::AnswerReady,
+            };
+            manual.code = Some(encoded);
+            manual.expires_at = Some(expires_at);
+            manual.candidates = candidates;
+            manual.non_host_candidates = non_host;
+            manual.error = None;
+        }
+    });
+
+    // 只记规模，不记码本身：码里带着本机的网络地址，日志是要发给别人看的
+    tauri_plugin_log::log::info!(
+        "配对码已生成（{}，{} 条候选（其中 {} 条非 host），{} 字符）",
+        match kind {
+            ManualCodeKind::Offer => "出码 1",
+            ManualCodeKind::Answer => "回码 2",
+        },
+        candidates,
+        non_host,
+        length,
+    );
 }
 
 /// 一起发布「当前生效传输」派生出来的两个字段（§6 / R23）。
@@ -6471,6 +7180,20 @@ mod tests {
         }
     }
 
+    /// 测试里的中继模式会话配置（`live` 需要它来判断走哪条会合方式）
+    fn relay_config() -> SessionConfig {
+        SessionConfig {
+            relay_url: "ws://127.0.0.1:1".to_string(),
+            room_id: String::new(),
+            auth_token: String::new(),
+            server_token: None,
+            root_key: ROOT_KEY,
+            device_id: "device-test".to_string(),
+            mode: SessionMode::Relay,
+            manual_ice: Vec::new(),
+        }
+    }
+
     /// 等一个条件成立；超时返回它最后一次的取值，方便断言里看到真实状态
     async fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6498,13 +7221,14 @@ mod tests {
         };
         let mut receiver = with_session(&manager);
         let mut state = SessionState::new(&ROOT_KEY);
+        let config = relay_config();
 
         let driver = {
             let manager = Arc::clone(&manager);
 
-            tokio::spawn(
-                async move { live(&manager, 0, &mut state, transport, &mut receiver).await },
-            )
+            tokio::spawn(async move {
+                live(&manager, 0, &mut state, &config, transport, &mut receiver).await
+            })
         };
 
         // 入站：中继握手帧（文本控制帧，和 WebSocket 无关）

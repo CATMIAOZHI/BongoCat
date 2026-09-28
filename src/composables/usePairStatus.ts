@@ -59,6 +59,9 @@ export function usePairStatus() {
   const applyStatus = (status: PairStatus) => {
     store.runtime.connection = store.settings.enabled ? translate(status.state) : 'disabled'
     store.runtime.p2p = store.settings.enabled ? (status.p2p ?? 'off') : 'off'
+    // 配对码面板不受总开关影响：它是「这次配对正在进行」这件事实，关掉联机总开关时
+    // Rust 那边也会把它清掉（`disconnect`），所以这里如实照搬
+    store.runtime.manual = status.manual ?? void 0
     store.runtime.petStateHz = store.settings.enabled ? (status.petStateHz ?? 0) : 0
     store.runtime.plaintext = store.settings.enabled && (status.plaintext ?? false)
     store.runtime.relayUrl = status.relayUrl ?? void 0

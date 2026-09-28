@@ -11,6 +11,9 @@ pub mod history;
 // 这样 `live` 的调用点不必散写 cfg。
 pub mod link;
 pub mod manager;
+// 配对码（手工信令）：不经过任何服务器，把信令压成一段文本由用户自己转送。
+// 纯逻辑（不碰 webrtc），所以不做 cfg 门控——非 Windows 目标也编、也跑单测。
+pub mod manual;
 // P2P（WebRTC）传输。只在 Windows 上编译：Phase 8 的范围就是 Windows 客户端，
 // 非 Windows 的 release 目标连 webrtc 那棵依赖树都不编译（见 src-tauri/Cargo.toml）。
 #[cfg(windows)]
@@ -224,6 +227,57 @@ pub async fn pair_disconnect(manager: State<'_, Arc<PairManager>>) -> Result<(),
     Arc::clone(&manager).disconnect();
 
     Ok(())
+}
+
+/// 手工码（配对码）第一步：出一段码，自己用微信 / QQ 发给对方。
+///
+/// 这条路不连任何服务器：两段码由用户自己转送，DataChannel 就是唯一的腿，所以直连建立
+/// 之前聊天 / 附件 / 语音都用不了——界面会如实说明，也不排队静默丢。
+#[command]
+pub async fn pair_manual_offer(
+    manager: State<'_, Arc<PairManager>>,
+    secret: Option<String>,
+    stun: Option<String>,
+) -> Result<(), String> {
+    Arc::clone(&manager).start_manual_offer(secret.as_deref(), stun.as_deref())
+}
+
+/// 手工码第二步（粘贴方）：把对方发来的码 1 粘进来，本端会出码 2 交给对方。
+#[command]
+pub async fn pair_manual_join(
+    manager: State<'_, Arc<PairManager>>,
+    code: String,
+    secret: Option<String>,
+    stun: Option<String>,
+) -> Result<(), String> {
+    Arc::clone(&manager).join_manual(&code, secret.as_deref(), stun.as_deref())
+}
+
+/// 手工码最后一步（出码方）：把对方发回来的码 2 粘进来，ICE 从这一刻开始。
+#[command]
+pub async fn pair_manual_answer(
+    manager: State<'_, Arc<PairManager>>,
+    code: String,
+) -> Result<(), String> {
+    manager.apply_manual_answer(&code)
+}
+
+/// 校验设置页里那份公益 STUN 清单。
+///
+/// 保存之前必须先过这一关：非法的行**不静默丢掉**，而是指出第几行、什么问题——静默丢一行
+/// 会让用户以为「填了六个」，实际只有五个。
+#[command]
+pub async fn pair_validate_stun(text: String) -> Result<manual::StunList, String> {
+    Ok(manual::parse_stun_urls(&text))
+}
+
+/// 内置的公益 STUN 清单（设置页的「恢复默认」用它）。
+#[command]
+pub async fn pair_default_stun() -> Result<Vec<String>, String> {
+    Ok(manual::DEFAULT_STUN_URLS
+        .iter()
+        .map(|url| url.to_string())
+        .collect())
 }
 
 /// 测试用往返消息：对端收到后会回一条 `pair.pong`
@@ -453,6 +507,13 @@ async fn stage_attachment(
     mime: Option<String>,
     stage: bool,
 ) -> Result<ChatMessage, String> {
+    // 手工码模式下直连还没建立时先挡住（和 `send_chat` 同一个理由）：这条路没有中继兜底，
+    // offer 发出去只会掉进黑洞，而本地已经多出一条「发送失败」的记录，用户还得手动删。
+    // 挡在 `stage_copy` 之前也顺带保住了临时 wav：`send_attachment` 的失败路径会删源文件。
+    if let Some(reason) = manager.manual_blocked() {
+        return Err(reason);
+    }
+
     let original_name = source
         .file_name()
         .and_then(|name| name.to_str())
