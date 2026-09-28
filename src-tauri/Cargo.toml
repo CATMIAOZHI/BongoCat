@@ -50,6 +50,11 @@ chacha20poly1305 = "0.11.0"
 base64 = "0.23.1"
 rand = "0.10.3"
 uuid = { version = "1.26.1", features = ["v4"] }
+# 配对码（手工信令）：先把 SDP 压一遍再加密。SDP 高度可压缩，而 base64 会膨胀 1/3，
+# 压完能把一段码从 1.2~1.5K 字符降到 400~650，微信长文本被折叠 / 转成文件的风险小很多。
+# 用默认后端（miniz_oxide，纯 Rust），不引入 C 工具链要求；这个 crate 本来就在依赖树里
+# （png / tiff 那几路在用），所以加直接依赖不新增任何编译单元。
+flate2 = "1.1.9"
 keyring = "4.2.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 cpal = "0.18.2"
