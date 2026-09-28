@@ -388,7 +388,12 @@ const status = computed(() => {
   return { key, color } as { key: ReturnType<typeof pairStatusKey>, color: 'success' | 'warning' | 'processing' | 'error' | 'default' }
 })
 
-/** P2P 这条腿只做显示（R28）：它掉了不影响聊天、附件、语音，所以这里没有按钮 */
+/**
+ * P2P 这条腿只做显示（R28）：在中继档下它掉了不影响聊天、附件、语音，所以这里没有按钮。
+ *
+ * **公益档是例外**：「已用服务器」这句话对它是错的——那台服务器只帮忙打洞，打不通就真的
+ * 什么都发不出去。所以档位是公益时换一份说明、换一句状态词（`failedPublic`）。
+ */
 const p2pStatus = computed(() => {
   const key = pairStore.runtime.p2p
 
@@ -398,7 +403,17 @@ const p2pStatus = computed(() => {
     failed: 'warning',
   }[key] ?? 'default'
 
-  return { key, color } as { key: typeof key, color: 'success' | 'processing' | 'warning' | 'default' }
+  // 公益档的「失败」含义不同：没有服务器兜底，所以不能照抄「已用服务器」
+  const text = pairStore.runtime.tier === 'public' && key === 'failed' ? 'failedPublic' : key
+
+  return { key, text, color } as { key: typeof key, text: string, color: 'success' | 'processing' | 'warning' | 'default' }
+})
+
+/** 公益档要说清「这台服务器只帮忙打洞」，默认那句兜底承诺在那儿是假的 */
+const p2pHint = computed(() => {
+  return pairStore.runtime.tier === 'public'
+    ? 'pages.preference.pair.p2p.hintPublic'
+    : 'pages.preference.pair.p2p.hint'
 })
 
 const modelOptions = computed(() => {
@@ -1591,13 +1606,21 @@ const {
 
     <ProListItem
       v-if="pairStore.settings.enabled"
-      :description="$t('pages.preference.pair.p2p.hint')"
+      :description="$t(p2pHint)"
       :title="$t('pages.preference.pair.p2p.label')"
     >
-      <Badge
-        :status="p2pStatus.color"
-        :text="$t(`pages.preference.pair.p2p.${p2pStatus.key}`)"
-      />
+      <Flex gap="small">
+        <!-- 公益档：先把「这台服务器是什么」摆出来，再看打洞到哪一步了 -->
+        <Badge
+          v-if="pairStore.runtime.tier === 'public'"
+          status="processing"
+          :text="$t('pages.preference.pair.p2p.publicTier')"
+        />
+        <Badge
+          :status="p2pStatus.color"
+          :text="$t(`pages.preference.pair.p2p.${p2pStatus.text}`)"
+        />
+      </Flex>
     </ProListItem>
 
     <ProListItem

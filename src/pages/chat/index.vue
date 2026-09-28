@@ -36,7 +36,7 @@ import { usePairVoicePlayback } from '@/composables/usePairVoicePlayback'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
-import { pairStateKey, usePairStore } from '@/stores/pair'
+import { outboundBlockKey, pairStateKey, usePairStore } from '@/stores/pair'
 
 /**
  * 桌面聊天气泡窗口（§29 - §32）。
@@ -107,20 +107,25 @@ const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
 const showingLimit = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT * 0.8)
 
 /**
- * 配对码模式下直连还没建立。
+ * 现在发不出去的原因（i18n key）；能发时是空串。
  *
- * 这条路没有服务器兜底：帧发出去只会掉进黑洞，而本地那条消息已经被标成「已发送」。
- * 所以这里直接把发送键按死（Rust 侧也会拒），并说清楚要等什么。
+ * 两条会合方式各有一条硬理由，都是「发出去只会掉进黑洞，而本地那条已经被标成已发送」：
+ * 配对码（没有服务器兜底）与**公益档**（那台服务器只帮忙打洞、不中继）。判据在 store 里
+ * （`outboundBlockKey`，有单测），Rust 侧 `outbound_blocked` 用的是同一套。
  */
-const manualBlocked = computed(() => {
-  const manual = pairStore.runtime.manual
-
-  return Boolean(manual && manual.phase !== 'connected')
+const blockKey = computed(() => {
+  return outboundBlockKey({
+    tier: pairStore.runtime.tier,
+    p2p: pairStore.runtime.p2p,
+    manual: pairStore.runtime.manual,
+  })
 })
+
+const blocked = computed(() => Boolean(blockKey.value))
 
 /** R42：发送键能不能按——有内容、没超长、不在发送中、没有「发不出去」的硬理由 */
 const sendReady = computed(() => {
-  return Boolean(draft.value.trim()) && !tooLong.value && !sending.value && !manualBlocked.value
+  return Boolean(draft.value.trim()) && !tooLong.value && !sending.value && !blocked.value
 })
 
 /**
@@ -849,6 +854,13 @@ onMounted(async () => {
         class="mt-1 break-all text-[9px] color-[#ffffff99]"
       >
         {{ $t('pages.chat.hints.manual', { state: manualState }) }}
+      </p>
+
+      <p
+        v-else-if="blockKey"
+        class="mt-1 break-all text-[9px] color-[#ffffff99]"
+      >
+        {{ $t(blockKey) }}
       </p>
 
       <p

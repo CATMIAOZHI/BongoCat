@@ -23,6 +23,14 @@ export interface PairStatus {
   /** P2P 这条腿的状态（R21 / R28）：只用于显示，掉线不影响中继上的任何功能 */
   p2p?: P2pState
   /**
+   * 这次连接算哪一档（Rust 侧 `RelayTier`，`server.welcome` 的 `tier`）。
+   *
+   * `full`（缺省）= 部署者那一档：中继会转发，聊天 / 附件 / 语音照旧有服务器兜底。
+   * `public` = **公益档**：那台服务器只帮忙打洞，**不中继**任何数据，所以这一切都得等
+   * 直连建立（见 `outboundBlockKey`）。旧中继与 Cloudflare 版不发这个字段，按 `full`。
+   */
+  tier?: PairTier
+  /**
    * 前端该按多少 Hz 发桌宠快照（§6 / R23）。
    *
    * 上限由 Rust 按**当前生效传输**的额度算好：P2P 与「额度够的自建中继」是 60，
@@ -41,6 +49,14 @@ export interface PairStatus {
 }
 
 export type P2pState = 'off' | 'connecting' | 'connected' | 'failed'
+
+/**
+ * 这次连接算哪一档（Rust 侧 `RelayTier`）。
+ *
+ * `full` 是部署者那一档（也是缺省）；`public` 是**公益档**——别人部署的服务器借我们
+ * 打洞，但不替我们转发数据。
+ */
+export type PairTier = 'full' | 'public'
 
 /** 配对码这条路走到了哪一步（Rust 侧 `ManualPhase`，serde 转成 kebab-case） */
 export type ManualPhase = 'gathering' | 'offer-ready' | 'answer-ready' | 'joining' | 'connected' | 'failed'

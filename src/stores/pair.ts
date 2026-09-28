@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { reactive, ref } from 'vue'
 
-import type { ManualStatus, P2pState, PresenceState } from '@/composables/usePair'
+import type { ManualStatus, P2pState, PairTier, PresenceState } from '@/composables/usePair'
 import type { PairModelIdentity } from '@/utils/pairModel'
 
 import { ATTACHMENT_MAX_MB } from '@/composables/usePair'
@@ -92,21 +92,64 @@ export function recordingBlockReasonKey(input: {
   connection: PairConnectionState
   peerOnline: boolean
   sending: boolean
+  /** 这次连接的档位（公益档要单独说一句，见 `outboundBlockKey`） */
+  tier?: PairTier
+  /** 直连那条腿的状态。公益档下「对方在线」不等于「发得出去」 */
+  p2p?: P2pState
 }): string {
   // 正在发送：界面上由「正在发送…」那一格接管。这里返回空串是兜住「发送途中对方掉线」
   // 那一格（那时 `peerOnline` 已经翻成 false），免得函数自己给出「对方不在线」这种
   // 和正在发生的事相反的话
   if (input.sending) return ''
 
-  if (input.enabled && input.peerOnline) return ''
-
+  // 「联机总开关关掉」压过其它状态（和 R44 的口径一致）：那会儿 `runtime.tier` 已经被
+  // `usePairStatus` 归一成 `full`，公益档那条本该到不了，但真到这儿也得说「没打开」
   if (!input.enabled) return 'pages.main.hints.sendRecordingDisabled'
+
+  // 公益档：对方在服务器上在线，但**这台服务器不转发数据**——录音发到服务器会被它用
+  // 1008 关掉整条连接。所以这一档的判据是「直连建立了没有」，而不是「对方在不在线」。
+  if (input.tier === 'public' && input.p2p !== 'connected') {
+    return 'pages.main.hints.sendRecordingPublicNotDirect'
+  }
+
+  if (input.peerOnline) return ''
 
   // 连上了服务器、对方没上线：这才是「等对方回来再发」
   if (input.connection === 'peer-offline') return 'pages.main.hints.sendRecordingOffline'
 
   // 正在连 / 还没连上 / 连不上：等对方解决不了，得看自己的地址与服务器
   return 'pages.main.hints.sendRecordingNotConnected'
+}
+
+/**
+ * 「现在发不出去」的原因（i18n key）；能发时是空串。
+ *
+ * 两条会合方式各有一条硬理由，形状一样：**发出去只会掉进黑洞，而本地那条记录已经被
+ * 标成「已发送」**。所以这两条都要在按下发送之前就挡住。
+ *
+ * - **配对码**（`manual`）：没有服务器兜底，DataChannel 建立之前什么都发不出去。
+ * - **公益档**（`tier === 'public'`）：那台服务器只帮忙打洞、**不中继**。它收到数据帧
+ *   会用 `1008` 关掉整条连接（信令也得跟着重来），所以数据必须等直连。
+ *
+ * Rust 侧 `PairManager::outbound_blocked` 是同一套判据（那里还会真的拒掉调用），
+ * 这里这一份只负责把界面按死并说清楚原因。放在 store 里是为了能被单测钉住
+ * （见 `pair.spec.ts`）。
+ */
+export function outboundBlockKey(input: {
+  tier: PairTier
+  p2p: P2pState
+  manual?: ManualStatus
+}): string {
+  // 配对码那条路先说：它连服务器都没有，公益档那句话在那儿是错的
+  if (input.manual && input.manual.phase !== 'connected') {
+    return 'pages.chat.hints.manualNotReady'
+  }
+
+  if (input.tier === 'public' && input.p2p !== 'connected') {
+    return 'pages.chat.hints.publicNotDirect'
+  }
+
+  return ''
 }
 
 /** 输入统计（§24 / §25）。只统计次数，不记录任何按键内容。 */
@@ -201,6 +244,11 @@ export interface PairRuntime {
   /** P2P 这条腿：`off` / `connecting` / `connected` / `failed`，纯显示用 */
   p2p: P2pState
   /**
+   * 这次连接算哪一档（Rust 侧 `RelayTier`）。`public` = 公益档：那台服务器只帮忙打洞，
+   * 不转发聊天与文件（见 `outboundBlockKey`）。
+   */
+  tier: PairTier
+  /**
    * 配对码（手工信令）这条路的状态。`undefined` = 当前会话不是配对码。
    *
    * 它决定界面上一整块面板（生成 / 复制 / 粘贴 / 倒计时）与「现在能不能发消息」，
@@ -286,6 +334,7 @@ export const usePairStore = defineStore('pair', () => {
   const runtime = reactive<PairRuntime>({
     connection: 'disabled',
     p2p: 'off',
+    tier: 'full',
     manual: void 0,
     petStateHz: 0,
     plaintext: false,

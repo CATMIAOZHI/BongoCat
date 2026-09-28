@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::crypto::ROOM_ID_LENGTH;
-use super::protocol::PROTOCOL_VERSION;
+use super::protocol::{PROTOCOL_VERSION, TIER_HEADER_VALUE};
 
 pub type PairSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -198,6 +198,16 @@ fn build_request(
         // §4：中继只按它分组，拿不到 Pair Secret，也拿不到 E2EE 根密钥
         headers.insert("x-bongo-room", room);
 
+        // 「我认得档位」这个能力标记（公益档用，值固定 1）。
+        //
+        // **永远带上**：客户端自己也不知道用户填的是部署者密码还是公益密码——那是同一个
+        // 输入框。部署者那一档完全无视它，Cloudflare 版与旧自建版忽略未知头。
+        //
+        // 它换来的是一条明确的兼容边界：老客户端拿着公益密码会在握手时被自建中继回
+        // 426（「你这版客户端还不认公益档，请升级」），而不是「连上之后被踢」或者
+        // 「界面显示已连接、其实什么都通不了」。
+        headers.insert("x-bongo-tier", HeaderValue::from_static(TIER_HEADER_VALUE));
+
         // R36：服务器密码的凭据。它是**服务器级**的（谁能用这台服务器），与上面那个
         // 配对凭据各管一段；没填就不带这个头。
         if let Some(token) = server_token.map(str::trim).filter(|value| !value.is_empty()) {
@@ -259,6 +269,23 @@ fn describe_connect_error(error: WsError, sent_server_password: bool) -> PairFai
                 // §27：容量按「双人联机会话数」算，满了不该显示成一串 HTTP 码；
                 // 也不该 fatal —— 「请稍后再试」意味着名额一被释放就该自己进去
                 503 => PairFailure::transient("服务器双人联机会话已满，请稍后再试".to_string()),
+                // 公益档的两条新拒绝，都是**这台服务器的配置**造成的，用户改不了，
+                // 所以文案要指向「找部署这台服务器的人」而不是「改你自己的设置」。
+                //
+                // 409：同一个会话里的两个人填了**不同类型**的密码（一个部署者密码、
+                // 一个公益密码）。这台中继不接受混着用：那一档决定了「谁占哪份名额」，
+                // 混着用会变成「一个人有中继兜底、另一个人什么都没有」。
+                409 => PairFailure::fatal(
+                    "两个人填的服务器密码不是同一类：一边是部署者的密码，一边是公益密码。\
+                     请与对方核对他填的那一串（要么都填部署者密码，要么都填公益密码）"
+                        .to_string(),
+                ),
+                // 429：公益档的「同一个 IP 最多几组会话」满了。可重试——别人断开就轮到了
+                429 => PairFailure::transient(
+                    "这台公益服务器的免费名额暂时满了（同一个网络的会话数已达上限），\
+                     请稍后再试"
+                        .to_string(),
+                ),
                 _ => PairFailure::transient(format!(
                     "服务器返回 HTTP {}，稍后自动重试",
                     status.as_u16()
@@ -428,6 +455,26 @@ mod tests {
         assert_eq!(full.message, "服务器双人联机会话已满，请稍后再试");
         assert!(!full.fatal, "名额会被释放，应当按退避自动重试");
 
+        // 公益档的两条新拒绝（`server-relay`）：两边填了不同类型的服务器密码（409），
+        // 或者这个 IP 的公益名额暂时满了（429）
+        let mismatch = describe_connect_error(http(409), true);
+
+        assert!(
+            mismatch.message.contains("不是同一类"),
+            "实际：{}",
+            mismatch.message
+        );
+        assert!(mismatch.fatal, "密码类型不统一，重试不会自己变对");
+
+        let limited = describe_connect_error(http(429), true);
+
+        assert!(
+            limited.message.contains("免费名额暂时满了"),
+            "实际：{}",
+            limited.message
+        );
+        assert!(!limited.fatal, "别人断开就轮到了，应当按退避自动重试");
+
         // 其余状态码也不能把裸 HTTP 码直接甩给用户
         assert_eq!(
             describe_connect_error(http(426), true).message,
@@ -477,6 +524,9 @@ mod tests {
         assert_eq!(headers["x-bongo-client"], "device-1");
         assert_eq!(headers["x-bongo-protocol"], "1");
         assert_eq!(request.uri().to_string(), "wss://cat.example.com/ws");
+        // 公益档的能力标记：**永远**带上（客户端不知道用户填的是哪一类密码）。
+        // 部署者那一档、Cloudflare 版、旧自建版都无视它。
+        assert_eq!(headers["x-bongo-tier"], "1");
         // R36：没填服务器密码就不带这个头——官方的 Cloudflare 中继与更旧的自建中继
         // 都靠这一点继续可用
         assert!(!headers.contains_key("x-bongo-server"));

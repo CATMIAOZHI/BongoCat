@@ -30,7 +30,8 @@ use super::manual::{self, ManualCodeKind};
 use super::protocol::{
     AppEnvelope, ChatAckPayload, ChatTextPayload, FrameHeader, FrameKind, InputStats,
     IceServer, MAX_BINARY_FRAME_SIZE, PROTOCOL_VERSION, PairSignalPayload, PetSnapshot,
-    PresencePayload, PresenceState, RecentMessageIds, RelayConfig, RelayLimits, ServerFrame,
+    PresencePayload, PresenceState, RecentMessageIds, RelayConfig, RelayLimits, RelayTier,
+    ServerFrame,
     TransferIdPayload, TransferKind, TransferOfferPayload, TransferRejectPayload,
     TransferVerifiedPayload, local_features, message_type, now_millis,
 };
@@ -56,6 +57,15 @@ pub const EVENT_MESSAGE_UPDATED: &str = "pair-message-updated";
 pub const EVENT_TRANSFER: &str = "pair-transfer";
 
 const RELIABLE_QUEUE_LIMIT: usize = 512;
+/// 公益档 + 直连还没建立时，所有数据发送统一用这一句拒绝（见
+/// [`PairManager::outbound_blocked`]）。写给用户看，所以要能说清「下一步做什么」。
+const PUBLIC_TIER_BLOCK_REASON: &str =
+    "这台服务器只帮忙打洞（公益档），不转发聊天与文件；等直连建立后再发";
+/// 可靠队列满了、最旧的一帧被挤掉时，附件那一单的失败原因（见 [`retry_dropped_chat`]）
+const RELIABLE_QUEUE_OVERFLOW_REASON: &str = "发送队列已满，附件没有发出去，可以重试";
+/// 公益档下这一帧**不能**落到中继上（那台服务器只承载信令）、直连又用不了时，
+/// 附件那一单的失败原因。与上面那条分开：用户要看到的下一步动作完全不同。
+const PUBLIC_TIER_LOST_REASON: &str = "这台服务器只帮忙打洞（公益档），不转发文件；附件没有发出去，可以重试";
 /// 一次重连最多补发多少条历史消息，避免对方一上线就被灌满
 const CHAT_RESEND_LIMIT: usize = 100;
 /// 每个 transfer 最多多久报一次进度（§40：进度要有，但别把事件刷爆）
@@ -150,6 +160,12 @@ pub struct PairStatus {
     /// 只用来在界面上给一条非阻塞提醒——握手与信令没有 TLS 保护——**绝不阻止连接**。
     /// 它只在 `start()` 里按**当次**地址算，界面对应地还要比对 `relay_url` 才显示。
     pub plaintext: bool,
+    /// 这次连接算哪一档（`server.welcome` 的 `tier`）。
+    ///
+    /// 公益档（`public`）是「别人部署的服务器只帮忙打洞、不中继」：中继不转发任何数据
+    /// 帧，聊天 / 附件 / 语音 / 快照全都只能在直连上跑。界面据此把发送口收到直连建立
+    /// 为止，并说清楚这台服务器是什么（前端的同一道闸见 `outboundBlockKey`）。
+    pub tier: RelayTier,
     /// 配对码（手工信令）这条路的状态。`None` = 当前这条会话不是手工码。
     ///
     /// 它和 `state` / `p2p` 是**互补**的：手工码模式没有中继，所以「对方是否在线」只能由
@@ -494,6 +510,8 @@ impl PairManager {
                 p2p: P2pState::Off,
                 pet_state_hz: DEFAULT_PET_STATE_HZ,
                 plaintext: false,
+                // 还没连过：按部署者那一档，连接建立后由 `server.welcome` 纠正
+                tier: RelayTier::Full,
                 manual: None,
             }),
             sender: Mutex::new(None),
@@ -631,6 +649,10 @@ impl PairManager {
             // 新会话还没起腿：上一轮的 `Connected` 必须立刻消失，否则「立即连接」
             // 之后的十几秒里偏好页会显示「正在连接」+「已直连」
             status.p2p = P2pState::Off;
+            // 档位也一样：它由这一次连接的 `server.welcome` 决定，读到之前不能沿用上一次
+            // 的（从公益服务器切到普通服务器时，旧值会让界面继续写着「只帮忙打洞」，
+            // 也会把数据帧提前放行到一条还不知道档位的连接上）
+            status.tier = RelayTier::Full;
             // 同理，快照上限也回到缺省：新会话还没读到中继广告的额度
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             status.manual = None;
@@ -658,6 +680,9 @@ impl PairManager {
             status.remote_stats = None;
             // 会话没了，P2P 那条腿也跟着没了：不复位的话 UI 会一直显示「已直连」
             status.p2p = P2pState::Off;
+            // 档位同样是这一次连接的事实：断开之后还挂着「公益档」的话，界面会说
+            // 「等直连建立就能发」，而真实情况是「还没连上服务器」
+            status.tier = RelayTier::Full;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             status.plaintext = false;
             status.manual = None;
@@ -848,6 +873,9 @@ impl PairManager {
             status.remote_stats = None;
             status.last_error = None;
             status.p2p = P2pState::Off;
+            // 手工码这条路没有服务器，也就没有档位这回事：不写的话上一次那台公益服务器
+            // 的档位会留在这里，界面会说「等直连建立就能发」，而这条路的理由是「配对码」
+            status.tier = RelayTier::Full;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             // §23 的明文提醒说的是「服务器地址」，手工码没有服务器
             status.plaintext = false;
@@ -866,21 +894,44 @@ impl PairManager {
         self.enqueue(kind, message_type, payload)
     }
 
-    /// 手工码模式下「现在还不能发」的原因。中继模式永远是 `None`。
+    /// 「现在还不能发数据」的原因；能发时返回 `None`。
     ///
-    /// 手工码没有服务器可以兜底：DataChannel 没建立之前，聊天与附件发出去只会掉进黑洞，
-    /// 而本地记录会被标成「已发送」。**如实报错比静默丢好**——界面也据此把输入框灰掉。
-    pub fn manual_blocked(&self) -> Option<String> {
+    /// 两条会合方式各有一条硬理由，形状是一样的：**发出去只会掉进黑洞，而本地那条记录
+    /// 已经被标成「已发送」**。
+    ///
+    /// - **配对码**（手工信令）：没有服务器兜底，DataChannel 建立之前只有一条黑洞 sink。
+    /// - **公益档**（`tier == public`）：那台服务器只帮忙打洞、**不中继**——它收到数据帧
+    ///   会用 `1008` 关掉整条连接（信令也得跟着重来），所以数据必须等直连。判据是
+    ///   `p2p == Connected`（DataChannel 真的往返过一次，R30）。
+    ///
+    /// **如实报错比静默丢好**：界面也据此把输入框、麦克风灰掉。
+    pub fn outbound_blocked(&self) -> Option<String> {
         let status = Self::lock(&self.status);
-        let manual = status.manual.as_ref()?;
 
-        if manual.phase == ManualPhase::Connected {
-            return None;
+        if let Some(manual) = status.manual.as_ref()
+            && manual.phase != ManualPhase::Connected
+        {
+            return Some(
+                "直连还没建立：配对码这条路没有服务器兜底，等对方猫出现在桌面上再发".to_string(),
+            );
         }
 
-        Some(
-            "直连还没建立：配对码这条路没有服务器兜底，等对方猫出现在桌面上再发".to_string(),
-        )
+        // 公益档：中继那条腿不承载任何数据，所以「能发」的唯一证据就是直连
+        if status.tier.is_public() && status.p2p != P2pState::Connected {
+            return Some(PUBLIC_TIER_BLOCK_REASON.to_string());
+        }
+
+        None
+    }
+
+    /// 公益档下「中继不肯转发数据、直连又还没建立」。
+    ///
+    /// 这是 [`Self::outbound_blocked`] 里那条公益档判定的复用点：`enqueue` 也要用它。
+    /// 单独抽出来是因为两处的**动作**不同（一个报错给用户，一个挡住帧），判据必须唯一。
+    fn public_tier_needs_direct(&self) -> bool {
+        let status = Self::lock(&self.status);
+
+        status.tier.is_public() && status.p2p != P2pState::Connected
     }
 
     /// 可覆盖的实时状态（宠物快照、统计）：拥塞时新数据直接覆盖旧数据
@@ -943,9 +994,10 @@ impl PairManager {
             return Err(format!("单条消息最多 {} KiB", MESSAGE_TEXT_LIMIT / 1024));
         }
 
-        // 手工码模式下直连还没建立时**先挡住**：手工码没有中继可以兜底，帧发出去只会掉进
-        // 黑洞，消息却已经被标成「已发送」——用户看到的就是「发出去了、对面没收到」。
-        if let Some(reason) = self.manual_blocked() {
+        // 直连还没建立、而这条会合方式又没有中继兜底时**先挡住**（配对码 / 公益档，见
+        // `outbound_blocked`）：帧发出去只会掉进黑洞，消息却已经被标成「已发送」——
+        // 用户看到的就是「发出去了、对面没收到」。
+        if let Some(reason) = self.outbound_blocked() {
             return Err(reason);
         }
 
@@ -1061,6 +1113,11 @@ impl PairManager {
     /// 只支持本机发出的附件：接收方的「重试」要请对方重发，协议里没有这条消息，
     /// 所以接收方只能显示失败原因。
     pub fn retry_attachment(self: &Arc<Self>, message_id: &str) -> Result<(), String> {
+        // 同一道闸：重试也是一次真的发送，公益档与配对码下同样得等直连
+        if let Some(reason) = self.outbound_blocked() {
+            return Err(reason);
+        }
+
         let message = self
             .history
             .find(message_id)?
@@ -1150,6 +1207,16 @@ impl PairManager {
     }
 
     fn enqueue(&self, kind: FrameKind, message_type: &str, payload: Value) -> Result<(), String> {
+        // 公益档 + 还没有直连：**数据帧绝不能落到中继上**（它会被服务器用 `1008` 关掉
+        // 整条连接）。信令那一类（kind 8）例外——它正是这一档唯一允许走服务器的东西。
+        //
+        // 挡住而不是放行，是为了让上层能按自己的语义收尾：聊天会退回 `pending`（对方
+        // 下次上线时再试），presence / 快照这类连续值本来就会重发，前端的 `.catch` 也
+        // 只丢一句日志。这与配对码那条路的处理方式一致，只是那条路走的是命令层。
+        if !kind.is_signal() && self.public_tier_needs_direct() {
+            return Err(PUBLIC_TIER_BLOCK_REASON.to_string());
+        }
+
         let sender = self.sender()?;
 
         let envelope = AppEnvelope::new(message_type, self.next_envelope_seq(), payload);
@@ -1278,13 +1345,31 @@ struct SessionState {
     /// 派生 per-transfer 密钥要用（R17）
     root_key: [u8; 32],
     /// 可靠队列：帧与它对应的信封一起存，队列满时才知道挤掉的是哪条消息
-    reliable: VecDeque<(Vec<u8>, AppEnvelope)>,
+    reliable: VecDeque<QueuedFrame>,
     /// 每种可覆盖类型各自最多留一帧（`BTreeMap` 同时保证发送顺序稳定）
     replaceable: BTreeMap<u8, Vec<u8>>,
     frame_seq: u32,
     recent: RecentMessageIds,
     /// 这一次连接里正在进行的附件传输，按 transferId 索引
     transfers: HashMap<u64, TransferSession>,
+    /// 这条连接是不是**公益档**（`server.welcome` 的 `tier`，见 [`RelayTier`]）。
+    ///
+    /// 公益档的中继只承载信令（kind 8）：别的帧发过去会被服务器用 `1008` 关掉整条
+    /// 连接，连正在跑的信令一起重来。所以客户端必须自己挡住——入队时挡一次
+    /// （[`PairManager::enqueue`]，那是用户能看见的那一层），发送前再挡一次
+    /// （[`flush`] / [`flush_replaceable`]），最后拿到 welcome 时还要把「档位还不知道」
+    /// 的那段时间里攒下的帧挑掉（[`SessionState::take_non_signal`]）。
+    public_tier: bool,
+}
+
+/// 可靠队列里的一帧。
+///
+/// 连 `kind` 一起存，是因为公益档要靠它区分信令与数据（见 [`SessionState::public_tier`]）：
+/// 队列里的帧可能是「档位还不知道」的时候排进来的，所以判定不能只在入队时做一次。
+struct QueuedFrame {
+    kind: FrameKind,
+    frame: Vec<u8>,
+    envelope: AppEnvelope,
 }
 
 impl SessionState {
@@ -1297,6 +1382,8 @@ impl SessionState {
             frame_seq: 0,
             recent: RecentMessageIds::new(RECENT_MESSAGE_LIMIT),
             transfers: HashMap::new(),
+            // 还没读到 `server.welcome`：按部署者那一档，读到之后由它纠正
+            public_tier: false,
         }
     }
 
@@ -1390,14 +1477,41 @@ impl SessionState {
 
         let dropped = if self.reliable.len() >= RELIABLE_QUEUE_LIMIT {
             // 队头是最旧的一帧，连它的信封一起拿出来，才能找回对应的消息
-            self.reliable.pop_front().map(|(_, dropped)| dropped)
+            self.reliable.pop_front().map(|dropped| dropped.envelope)
         } else {
             None
         };
 
-        self.reliable.push_back((frame, envelope.clone()));
+        self.reliable.push_back(QueuedFrame {
+            kind,
+            frame,
+            envelope: envelope.clone(),
+        });
 
         Ok(dropped)
+    }
+
+    /// 公益档下把队列里**不该走中继**的帧挑出来，返回它们的信封交回上层收尾。
+    ///
+    /// 只在拿到 `server.welcome` 之后调用一次：退避期间排进来的帧是在「档位还不知道」
+    /// 的时候攒下的，而它们里的第一条就会被服务器用 `1008` 关掉整条连接。
+    /// 可覆盖流（快照、统计）是绝对值快照，直接丢掉等下一帧盖掉即可。
+    fn take_non_signal(&mut self) -> Vec<AppEnvelope> {
+        let mut kept = VecDeque::with_capacity(self.reliable.len());
+        let mut dropped = Vec::new();
+
+        for queued in self.reliable.drain(..) {
+            if queued.kind.is_signal() {
+                kept.push_back(queued);
+            } else {
+                dropped.push(queued.envelope);
+            }
+        }
+
+        self.reliable = kept;
+        self.replaceable.clear();
+
+        dropped
     }
 }
 
@@ -1683,7 +1797,12 @@ async fn run_session(
                                     generation,
                                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                 );
-                                retry_dropped_chat(&manager, &mut state, &dropped);
+                                retry_dropped_chat(
+                                    &manager,
+                                    &mut state,
+                                    &dropped,
+                                    RELIABLE_QUEUE_OVERFLOW_REASON,
+                                );
                             }
                             Ok(None) => {}
                             Err(error) => manager.emit_error(generation, error),
@@ -1904,6 +2023,8 @@ where
         RelayConfig {
             limits: RelayLimits::cloudflare(),
             ice_servers: config.manual_ice.clone(),
+            // 配对码这条路没有服务器，也就没有档位这回事：它本来就是「全靠直连」
+            tier: RelayTier::Full,
         }
     } else {
         match read_welcome(&mut stream, manager, generation).await {
@@ -1913,16 +2034,41 @@ where
     };
     let outbound = welcome.limits.outbound();
 
+    // 公益档：中继只承载信令（见 `RelayTier` / `SessionState::public_tier`）。
+    //
+    // 拿到 welcome 之后先做两件事。第一件是把**退避期间攒下的**数据帧挑掉：它们是在
+    // 「档位还不知道」的时候排进来的，而第一条就会被服务器用 `1008` 关掉整条连接
+    // （那样连刚连上的信令一起重来，看起来就是「连上又断、连上又断」）。聊天要退回
+    // `pending`（对方下次上线时 `resend_pending_chat` 会再试），附件 offer 直接判失败。
+    //
+    // 第二件是让整条发送路径知道这件事：`flush` 与 `flush_replaceable` 都会用
+    // `public_tier` 决定「中继这条腿现在能不能碰」。
+    state.public_tier = welcome.tier.is_public();
+
+    if state.public_tier {
+        for envelope in state.take_non_signal() {
+            retry_dropped_chat(manager, state, &envelope, PUBLIC_TIER_LOST_REASON);
+        }
+    }
+
     pacer.retune(outbound.frames_per_second, outbound.frames_burst);
     chunk_pacer.retune(outbound.chunks_per_second, outbound.chunks_burst);
 
     // 退避期间攒下的聊天与附件控制帧还在这里，但那时腿还不存在，只能按中继发（`None`）
-    if let Err(error) = flush(&mut sink, state, &mut pacer, None, false).await {
-        return Outcome::Lost(PairFailure {
-            message: error,
-            fatal: false,
-        });
-    }
+    let dropped = match flush(&mut sink, state, &mut pacer, None, false).await {
+        Ok(dropped) => dropped,
+        Err(error) => {
+            return Outcome::Lost(PairFailure {
+                message: error,
+                fatal: false,
+            });
+        }
+    };
+
+    // 上面那次 `take_non_signal()` 刚把公益档的非信令帧清空过，所以这里返回的集合按构造
+    // 一定是空的——但**照样要收尾**：这条不变量一旦被将来的改动打破（比如在两者之间加
+    // 一帧开场控制帧），丢的就是用户的消息，而不是一行日志。
+    recover_dropped(manager, state, dropped);
 
     // 退避期间攒下的可覆盖帧在这里兜底：那时腿还不存在，所以按中继发（`None`）
     if let Err(error) =
@@ -2047,12 +2193,17 @@ where
                                     generation,
                                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                 );
-                                retry_dropped_chat(manager, state, &dropped);
+                                retry_dropped_chat(
+                                    manager,
+                                    state,
+                                    &dropped,
+                                    RELIABLE_QUEUE_OVERFLOW_REASON,
+                                );
                             }
 
                             // 聊天（与它的 ack）在可靠腿可用时走 DC（Phase 10）：这条腿有
                             // DB 的补发兜底，丢了不会进终态。
-                            if let Err(error) = flush(
+                            match flush(
                                 &mut sink,
                                 state,
                                 &mut pacer,
@@ -2061,7 +2212,10 @@ where
                             )
                             .await
                             {
-                                return Outcome::Lost(PairFailure { message: error, fatal: false });
+                                Err(error) => {
+                                    return Outcome::Lost(PairFailure { message: error, fatal: false });
+                                }
+                                Ok(dropped) => recover_dropped(manager, state, dropped),
                             }
                         }
                     }
@@ -2074,7 +2228,7 @@ where
                     }
 
                     // 顺序与拆分前一致：先可靠队列、后可覆盖队列
-                    if let Err(error) = flush(
+                    match flush(
                         &mut sink,
                         state,
                         &mut pacer,
@@ -2083,7 +2237,10 @@ where
                     )
                     .await
                     {
-                        return Outcome::Lost(PairFailure { message: error, fatal: false });
+                        Err(error) => {
+                            return Outcome::Lost(PairFailure { message: error, fatal: false });
+                        }
+                        Ok(dropped) => recover_dropped(manager, state, dropped),
                     }
 
                     let leg = coverable_leg(dc_open, dc_verified, &link);
@@ -2112,17 +2269,22 @@ where
 
                     if let Err(error) = start_outgoing_transfer(manager, state, *request, route) {
                         manager.emit_error(generation, error);
-                    } else if let Err(error) = flush(
-                        &mut sink,
-                        state,
-                        &mut pacer,
-                        leg,
-                        // offer 也要和这一单走同一条腿：接收侧正是按 offer 来的 lane 钉 route
-                        route == link::Route::Direct,
-                    )
-                    .await
-                    {
-                        return Outcome::Lost(PairFailure { message: error, fatal: false });
+                    } else {
+                        match flush(
+                            &mut sink,
+                            state,
+                            &mut pacer,
+                            leg,
+                            // offer 也要和这一单走同一条腿：接收侧正是按 offer 来的 lane 钉 route
+                            route == link::Route::Direct,
+                        )
+                        .await
+                        {
+                            Err(error) => {
+                                return Outcome::Lost(PairFailure { message: error, fatal: false });
+                            }
+                            Ok(dropped) => recover_dropped(manager, state, dropped),
+                        }
                     }
                 }
                 Some(Command::AcceptTransfer { transfer_id }) => {
@@ -2281,16 +2443,25 @@ where
                                                 generation,
                                                 "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                                             );
-                                            retry_dropped_chat(manager, state, &dropped);
+                                            retry_dropped_chat(
+                                                manager,
+                                                state,
+                                                &dropped,
+                                                RELIABLE_QUEUE_OVERFLOW_REASON,
+                                            );
                                         }
 
-                                        if let Err(error) =
-                                            flush(&mut sink, state, &mut pacer, None, false).await
-                                        {
-                                            return Outcome::Lost(PairFailure {
-                                                message: error,
-                                                fatal: false,
-                                            });
+                                        match flush(&mut sink, state, &mut pacer, None, false).await {
+                                            Err(error) => {
+                                                return Outcome::Lost(PairFailure {
+                                                    message: error,
+                                                    fatal: false,
+                                                });
+                                            }
+                                            // 回执必须原路回中继（探针那条腿不能替它背书），
+                                            // 所以这里的 `leg` 是 `None`。公益档下中继不承载
+                                            // 数据帧，能走到这里的只有信令（kind 8）
+                                            Ok(dropped) => recover_dropped(manager, state, dropped),
                                         }
                                     }
                                 }
@@ -2633,6 +2804,17 @@ where
                                         outbound.frames_per_second,
                                     );
 
+                                    // 公益档那道闸（`public_tier_needs_direct`）读的正是这一刻
+                                    // 发布的 `P2pState::Connected`，所以「直连刚刚能用」在这里才
+                                    // 真正成立：把退回「等待发送」的消息补发一次。
+                                    //
+                                    // 两条腿各自独立验证、谁先回来没有顺序保证，所以两处都要有
+                                    // 这一句（另一处在 `Lane::Reliable` 的跃迁上）：可靠腿先
+                                    // 验证时它会撞上还没打开的闸，那时只有这里能救回来。重复发
+                                    // 不会出事——`deliver_chat` 入队成功当场置 `Sent`，已经在途
+                                    // 的消息不再是 `pending`，接收侧还会按 `messageId` 去重。
+                                    manager.resend_pending_chat();
+
                                     // 手工码模式没有中继的 `server.peer`，「对方在线」只能靠
                                     // 这一条证据：DataChannel 真的过过数据。它同时是聊天 /
                                     // 附件 / 语音的开关（前端按 `peerOnline` 判定）。
@@ -2652,8 +2834,14 @@ where
                                 reliable_last_inbound = tokio::time::Instant::now();
                                 reliable_awaiting_pong = false;
 
-                                if reliable_open {
+                                if reliable_open && !reliable_verified {
                                     reliable_verified = true;
+
+                                    // 这条腿**刚刚**被证明能过数据（R30 的口径：一次真实的
+                                    // 往返，不是「open」）。公益档下退回「等待发送」的消息
+                                    // 正好在这一刻有地方可发（§32），所以顺手补发一次；
+                                    // 别的档位同样受益——同一条腿刚恢复，补发本来也该发生。
+                                    manager.resend_pending_chat();
                                 }
                             }
                         }
@@ -2903,6 +3091,9 @@ fn describe_close(code: Option<u16>) -> PairFailure {
         // §10：同一个配对密码最多两台设备，第三台在这里被挡下
         Some(4003) => "该联机会话已有两台设备在线".to_string(),
         Some(4004) => "旧连接因长时间没有活动被顶替".to_string(),
+        // 公益档的空闲回收（见 `server-relay` 的 `PAIR_PUBLIC_WINDOW_SECS`）。它不是故障，
+        // 也不是「打洞失败」：那台服务器只是把一直没动静的连接收回去，重连即可。
+        Some(4005) => "公益服务器的空闲时间到了，连接已自动重来".to_string(),
         Some(1008) => "服务器认为数据格式或发送频率异常".to_string(),
         Some(1009) => "一帧数据超过服务器允许的大小".to_string(),
         Some(1011) => "服务器内部错误".to_string(),
@@ -2935,42 +3126,75 @@ fn describe_close(code: Option<u16>) -> PairFailure {
 /// 传输走同一条 lane」时才用一次——`transfer.complete` 排在那条腿的分片后面，跨 lane 没有
 /// 顺序保证（见 `send_next_chunk`）。`leg.send` 只是往那条腿的队列里投一帧、不阻塞，
 /// 所以这里绕过的只是「源头拒绝注入」，不是「把 `live` 睡死」。
+///
+/// 返回值是**没发出去、要交回上层收尾**的信封（目前只有公益档会走到：见下面的分支）：
+/// 调用方拿它去 [`retry_dropped_chat`]，聊天退回「等待发送」、附件那一单判失败——与
+/// `take_non_signal` 一模一样。**绝不能只写一行日志就丢**：本地那条消息已经被标成
+/// 「已发送」，而中继那一侧根本不会替它兜底。
 async fn flush<S>(
     sink: &mut S,
     state: &mut SessionState,
     pacer: &mut Pacer,
     leg: Option<&dyn link::ReliableLeg>,
     force: bool,
-) -> Result<(), String>
+) -> Result<Vec<AppEnvelope>, String>
 where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    // 过滤掉「这条腿存在、但正被背压挡住」的那种：公益档要靠这个区别决定「等一等」
+    // 还是「交回上层」，两者对用户是两件事（见下面的分支）。
+    let leg_available = leg.is_some();
     let leg = if force {
         leg
     } else {
         leg.filter(|leg| leg.writable())
     };
+    let mut dropped = Vec::new();
 
-    while let Some((frame, envelope)) = state.reliable.pop_front() {
+    while let Some(queued) = state.reliable.pop_front() {
         if let Some(leg) = leg {
             // 失败即丢：这条腿上的帧丢了靠中继兜底——聊天有 DB 的补发
             // （`resend_pending_chat`），在传的附件由 `direct_lost()` 按 §43 判失败
-            leg.send(frame);
+            leg.send(queued.frame);
+
+            continue;
+        }
+
+        // 公益档：中继那条腿只承载信令（见 `SessionState::public_tier`）。DC 不可用时其余
+        // 帧**绝不能**落到中继上——服务器会用 `1008` 关掉整条连接，连信令一起重来。
+        if state.public_tier && !queued.kind.is_signal() {
+            // 只是**背压**（这条腿在、但它的发送缓冲满了）：等下一轮，别丢。这条腿马上
+            // 就会重新可写，而队列里排它前面的帧必须保持顺序，所以放回队头并结束这一轮。
+            if leg_available {
+                state.reliable.push_front(queued);
+
+                break;
+            }
+
+            // 这条腿**根本不可用**（没建立 / 没验过 / 已判定半死）：中继不承载数据，所以
+            // 这一帧无处可去。交回上层退回「等待发送」/判失败，而不是让它静默消失。
+            // 走到这里的有两类：拿到 `server.welcome` 之前攒下的（那时还不知道档位），
+            // 以及直连刚掉、数据帧还在队里的那一小段时间。
+            tauri_plugin_log::log::info!(
+                "公益档：这一帧 {:?} 没法走中继（直连不可用），交回上层重试",
+                queued.envelope.message_type
+            );
+            dropped.push(queued.envelope);
 
             continue;
         }
 
         pacer.acquire().await;
 
-        if let Err(error) = send_frame(sink, Message::Binary(frame.clone().into())).await {
-            state.reliable.push_front((frame, envelope));
+        if let Err(error) = send_frame(sink, Message::Binary(queued.frame.clone().into())).await {
+            state.reliable.push_front(queued);
 
             return Err(error);
         }
     }
 
-    Ok(())
+    Ok(dropped)
 }
 
 /// 可覆盖流（宠物快照、统计）能不能走 DC：两个条件都满足才算（R30）。
@@ -3077,6 +3301,15 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    // 公益档：中继不承载可覆盖流（宠物快照、输入统计）。DC 那条腿可用时照旧走它，
+    // 没有腿时这一批直接丢掉——发到中继上会被服务器用 `1008` 关掉整条连接，
+    // 而这些值每一帧都是绝对值快照，等下一帧即可（见 `SessionState::public_tier`）。
+    if leg.is_none() && state.public_tier {
+        state.replaceable.clear();
+
+        return Ok(());
+    }
+
     while let Some((key, frame)) = state.replaceable.pop_first() {
         if let Some(leg) = leg {
             // DC 那条腿有自己的额度（R23）。这里**不**吃中继的 pacer：DC 上的帧不经过
@@ -3128,20 +3361,28 @@ where
                     generation,
                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                 );
-                retry_dropped_chat(manager, state, &dropped);
+                retry_dropped_chat(manager, state, &dropped, RELIABLE_QUEUE_OVERFLOW_REASON);
             }
 
-            flush(sink, state, pacer, leg, false).await
+            let dropped = flush(sink, state, pacer, leg, false).await?;
+
+            recover_dropped(manager, state, dropped);
+
+            Ok(())
         }
     }
 }
 
 /// 队列满时被挤掉的聊天消息退回「等待发送」（§32）：下一次对端上线会重新补发，
 /// 既不假装「已发送」，也不会变成无法重试的终态。
+///
+/// 公益档下「这一帧不能落到中继上、直连又用不了」也是同一套收尾（原因那句话不同，
+/// 所以由调用方传 `reason`）：聊天退回「等待发送」、附件那一单判失败让用户重试。
 fn retry_dropped_chat(
     manager: &Arc<PairManager>,
     state: &mut SessionState,
     envelope: &AppEnvelope,
+    reason: &str,
 ) {
     let Some(id) = envelope.payload.get("messageId").and_then(Value::as_str) else {
         return;
@@ -3149,11 +3390,9 @@ fn retry_dropped_chat(
 
     match envelope.message_type.as_str() {
         message_type::CHAT_TEXT => manager.publish_message_status(id, MessageStatus::Pending),
-        // 附件 offer 被挤掉时对方永远等不到分片，只能标记失败让用户重试。会话要一起收掉，
+        // 附件 offer 被丢掉时对方永远等不到分片，只能标记失败让用户重试。会话要一起收掉，
         // 否则这个永远等不到 accept 的会话会一直占着 MAX_ACTIVE_TRANSFERS 的名额
         message_type::TRANSFER_OFFER => {
-            let reason = "发送队列已满，附件没有发出去，可以重试";
-
             match manager.transfer_of(id) {
                 Ok(transfer_id) => {
                     close_transfer(manager, state, transfer_id, TransferOutcome::Failed, reason)
@@ -3162,6 +3401,20 @@ fn retry_dropped_chat(
             }
         }
         _ => {}
+    }
+}
+
+/// 把 [`flush`] 交回来的信封逐个收尾（公益档下没处可去的那批，见 `flush` 的返回值说明）。
+///
+/// 原因那句话用 [`PUBLIC_TIER_LOST_REASON`]：它要告诉用户「这台服务器只帮忙打洞」，
+/// 而不是「队列满了」——后者会把人引向「等一会儿再试」这个错的下一步。
+fn recover_dropped(
+    manager: &Arc<PairManager>,
+    state: &mut SessionState,
+    dropped: Vec<AppEnvelope>,
+) {
+    for envelope in &dropped {
+        retry_dropped_chat(manager, state, envelope, PUBLIC_TIER_LOST_REASON);
     }
 }
 
@@ -3362,7 +3615,7 @@ where
                     generation,
                     "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                 );
-                retry_dropped_chat(manager, state, &dropped);
+                retry_dropped_chat(manager, state, &dropped, RELIABLE_QUEUE_OVERFLOW_REASON);
             }
             Ok(None) => {}
             Err(error) => manager.emit_error(generation, error),
@@ -3378,7 +3631,11 @@ where
     }
 
     // cancel 只能走中继腿：这条腿按定义已经不可用了（`None`）
-    flush(sink, state, pacer, None, false).await
+    let dropped = flush(sink, state, pacer, None, false).await?;
+
+    recover_dropped(manager, state, dropped);
+
+    Ok(())
 }
 
 /// 发送方：发起一次附件 offer（附件与消息行已经落库）
@@ -3462,7 +3719,7 @@ fn start_outgoing_transfer(
                 manager.generation(),
                 "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
             );
-            retry_dropped_chat(manager, state, &dropped);
+            retry_dropped_chat(manager, state, &dropped, RELIABLE_QUEUE_OVERFLOW_REASON);
         }
         Ok(None) => {}
         Err(error) => return Err(error),
@@ -3815,6 +4072,23 @@ where
     // 经过中继的计费点，拿中继额度去压它会把 60Hz 的可覆盖流一起压死。
     let direct_leg = match route {
         link::Route::Relay => {
+            // 公益档：中继**不承载分片**（它只放行 kind 8，别的 kind 一到就 `1008` 关连接）。
+            // 钉在中继上的那一单在公益档本来就走不到这一步——它的 offer 会被 `flush` 交回
+            // 上层判失败（见 `recover_dropped`）——这里再挡一次纯属保险：真让它发一块，
+            // 整条连接会被服务器关掉，连信令一起重来。挡住的同时把这一单收掉，别留一个
+            // 永远发不出分片的会话在表里转。
+            if state.public_tier {
+                close_transfer(
+                    manager,
+                    state,
+                    transfer_id,
+                    TransferOutcome::Failed,
+                    PUBLIC_TIER_LOST_REASON,
+                );
+
+                return Ok(false);
+            }
+
             // 两套额度都拿到才发（R18）：通用帧额度防止补发把中继扣穿，分片额度再留一层
             // 余量，否则 20/s 对 20/s 零余量，网络抖动一压缩到达间隔就会被 `close 1008` 打断
             if !Pacer::try_acquire_pair(pacer, chunk_pacer) {
@@ -3902,14 +4176,16 @@ where
                         manager.generation(),
                         "可靠发送队列已满，最旧的一条消息被丢弃".to_string(),
                     );
-                    retry_dropped_chat(manager, state, &dropped);
+                    retry_dropped_chat(manager, state, &dropped, RELIABLE_QUEUE_OVERFLOW_REASON);
                 }
 
                 // `transfer.complete` 必须走**同一单的**那条腿，而且要**绕过背压**：接收侧
                 // 先看「分片收齐了没」，而两条腿之间没有顺序保证——最后一块还在 DC 的缓冲里、
                 // 完成帧却从中继先到（背压在这几微秒里翻假就会这样），就会被判「缺分片」，
                 // 一单白废。一帧的量交给那条腿排队即可，绝不绕路。
-                flush(sink, state, pacer, direct_leg, direct_leg.is_some()).await?;
+                let dropped = flush(sink, state, pacer, direct_leg, direct_leg.is_some()).await?;
+
+                recover_dropped(manager, state, dropped);
             }
             Err(error) => manager.emit_error(manager.generation(), error),
         }
@@ -4309,6 +4585,7 @@ fn handle_server_frame(
             peer_online,
             limits,
             ice_servers,
+            tier,
         } => {
             if protocol != PROTOCOL_VERSION {
                 return Err(PairFailure {
@@ -4318,6 +4595,9 @@ fn handle_server_frame(
             }
 
             publish_peer(manager, generation, peer_online);
+            // 档位跟着连接走（见 `RelayTier`）：界面靠它把聊天 / 附件 / 语音收到直连上，
+            // 并说明「这台服务器只帮忙打洞」
+            manager.publish(generation, |status| status.tier = tier);
 
             // 中继没广告额度（旧中继）时就用 CF 的缺省推导，语义上「这次连接的有效配置」
             // 永远是确定的，会话层只管照着用
@@ -4325,6 +4605,7 @@ fn handle_server_frame(
                 limits: limits.unwrap_or_else(RelayLimits::cloudflare),
                 // R21：没广告就是「没有 STUN/TURN，只有 host candidate」，这是隐私缺省
                 ice_servers,
+                tier,
             }))
         }
         ServerFrame::Peer { online, device_id } => {
@@ -5272,6 +5553,7 @@ mod tests {
                 1,
                 json!({ "messageId": stored.id, "text": "你好" }),
             ),
+            RELIABLE_QUEUE_OVERFLOW_REASON,
         );
 
         assert_eq!(
@@ -5285,6 +5567,7 @@ mod tests {
             &manager,
             &mut SessionState::new(&[3u8; 32]),
             &AppEnvelope::new(message_type::CHAT_ACK, 2, json!({ "messageId": "m1" })),
+            RELIABLE_QUEUE_OVERFLOW_REASON,
         );
         assert_eq!(
             manager.history.find("m1").unwrap().unwrap().status,
@@ -5354,6 +5637,7 @@ mod tests {
                 1,
                 json!({ "messageId": "m-1" }),
             ),
+            RELIABLE_QUEUE_OVERFLOW_REASON,
         );
 
         assert!(
@@ -7275,5 +7559,312 @@ mod tests {
         }
 
         assert!(!sink.payloads(EVENT_CONNECTION_CHANGED).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // 公益档：中继只承载信令，数据全靠直连
+    // -----------------------------------------------------------------------
+
+    /// 公益档 + 还没直连 → 所有数据发送都必须被挡住；直连一建立就放行。
+    ///
+    /// 这是界面那半边所依赖的判据（前端用同一组输入算 `outboundBlockKey`），所以它自己
+    /// 的边界也要钉住：`Full` 不挡、`Public` 挡、`Connecting` 也挡（正在协商不等于能用）。
+    #[test]
+    fn the_public_tier_blocks_data_until_the_direct_link_is_up() {
+        let (manager, _sink) = test_manager();
+
+        // 部署者那一档：中继会转发，什么时候都能发
+        assert!(manager.outbound_blocked().is_none());
+
+        manager.publish(0, |status| status.tier = RelayTier::Public);
+
+        let reason = manager.outbound_blocked().expect("公益档没直连时必须挡住");
+
+        assert!(reason.contains("只帮忙打洞"), "实际文案：{reason}");
+
+        // 直连真的往返过一次才放行
+        manager.publish(0, |status| status.p2p = P2pState::Connected);
+        assert!(manager.outbound_blocked().is_none());
+
+        // 直连掉回「正在协商 / 这一轮没打通」：重新挡住
+        for state in [P2pState::Connecting, P2pState::Failed, P2pState::Off] {
+            manager.publish(0, |status| status.p2p = state);
+
+            assert!(
+                manager.outbound_blocked().is_some(),
+                "{state:?} 时也不该放行"
+            );
+        }
+
+        // 配对码那条路的理由不能被公益档盖掉（两句话说的是不同的事）
+        manager.publish(0, |status| {
+            status.tier = RelayTier::Public;
+            status.manual = Some(ManualStatus::starting(
+                ManualRole::Host,
+                "session-1".to_string(),
+            ));
+        });
+
+        let manual = manager.outbound_blocked().expect("配对码没连通时必须挡住");
+
+        assert!(manual.contains("配对码"), "实际文案：{manual}");
+    }
+
+    /// 公益档 + 没直连：**入队**这一层就挡住数据帧，而信令照旧能过。
+    ///
+    /// 挡住而不是放行，是为了让上层按自己的语义收尾：聊天会退回 `pending`（对方下次
+    /// 上线再试），而不是被标成「已发送」。
+    #[tokio::test]
+    async fn the_public_tier_refuses_data_frames_but_lets_the_signal_through() {
+        let (manager, _sink) = test_manager();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        *PairManager::lock(&manager.sender) = Some(sender);
+        manager.publish(0, |status| status.tier = RelayTier::Public);
+
+        let blocked = manager
+            .send(FrameKind::Presence, message_type::PRESENCE, json!({}))
+            .unwrap_err();
+
+        assert!(blocked.contains("只帮忙打洞"), "实际文案：{blocked}");
+        assert!(receiver.try_recv().is_err(), "被挡住时不该排进命令通道");
+
+        // 信令（kind 8）正是这一档唯一允许走服务器的东西
+        manager
+            .send(FrameKind::Ping, message_type::PING, json!({}))
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::Send {
+                kind: FrameKind::Ping,
+                ..
+            })
+        ));
+    }
+
+    /// 公益档下中继那条线上**只会**出现信令：数据帧（含可覆盖流）一律被挑掉，
+    /// 而且**要交回上层**（不是静默丢掉）——聊天退回「等待发送」、附件判失败。
+    ///
+    /// 这条负向断言只能在假的 sink 上做：真服务器会把越界的帧变成 `1008` 断线，而那时
+    /// 我们看到的是「连上又断」，看不出是哪一帧闯的祸。
+    #[tokio::test]
+    async fn the_public_tier_keeps_data_frames_off_the_relay() {
+        let mut state = SessionState::new(&ROOT_KEY);
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut direct_pacer = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
+        let mut socket = RecordingSocket::default();
+
+        state.public_tier = true;
+
+        state
+            .queue(
+                FrameKind::Presence,
+                &AppEnvelope::new(message_type::PRESENCE, 0, json!({})),
+                false,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::Chat,
+                &AppEnvelope::new(message_type::CHAT_TEXT, 1, json!({ "text": "hi" })),
+                false,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::PetState,
+                &AppEnvelope::new(message_type::PET_STATE, 2, json!({})),
+                true,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::Ping,
+                &AppEnvelope::new(message_type::SIGNAL, 3, json!({})),
+                false,
+            )
+            .unwrap();
+
+        let dropped = flush(&mut socket, &mut state, &mut pacer, None, false)
+            .await
+            .unwrap();
+        flush_replaceable(
+            &mut socket,
+            None,
+            &mut state,
+            &mut pacer,
+            &mut direct_pacer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(socket.sent.len(), 1, "中继那条线上只该有信令");
+        assert_eq!(frame_kind(&socket.sent[0]), FrameKind::Ping.as_byte());
+        assert!(state.reliable.is_empty(), "数据帧不留在队列里");
+        assert!(state.replaceable.is_empty());
+        // 交回上层的是**信封**：聊天靠 messageId 退回 `pending`、附件 offer 靠它收尾
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|envelope| envelope.message_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![message_type::PRESENCE, message_type::CHAT_TEXT]
+        );
+    }
+
+    /// 公益档 + 直连那条腿**在、但正被背压挡住**（发送缓冲满了）：这一帧要**等**，
+    /// 不能当成「没地方可去」交回上层。
+    ///
+    /// 两种情况对用户是两件事：背压是几毫秒到几秒的事（对面正在收一个大文件），等下一轮
+    /// 就发出去了；把聊天判成「待发送」会让人以为消息没发出去。
+    #[tokio::test]
+    async fn the_public_tier_waits_out_backpressure_instead_of_dropping() {
+        let mut state = SessionState::new(&ROOT_KEY);
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut socket = RecordingSocket::default();
+        // 这条腿存在（`Some`），但 `writable` 是假的
+        let busy = FakeReliableLeg::new(false);
+
+        state.public_tier = true;
+
+        state
+            .queue(
+                FrameKind::Chat,
+                &AppEnvelope::new(message_type::CHAT_TEXT, 0, json!({ "text": "hi" })),
+                false,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::Ping,
+                &AppEnvelope::new(message_type::SIGNAL, 1, json!({})),
+                false,
+            )
+            .unwrap();
+
+        let dropped = flush(&mut socket, &mut state, &mut pacer, Some(&busy), false)
+            .await
+            .unwrap();
+
+        assert!(dropped.is_empty(), "背压不等于没地方可去");
+        assert!(busy.frames().is_empty());
+        assert!(socket.sent.is_empty());
+        // 两帧都还在队里，而且顺序没变（信令不许越过它前面那一帧）
+        assert_eq!(
+            state
+                .reliable
+                .iter()
+                .map(|queued| queued.kind)
+                .collect::<Vec<_>>(),
+            vec![FrameKind::Chat, FrameKind::Ping]
+        );
+
+        // 背压过去（同一轮里那条腿又能写了）：整队照常按顺序出去
+        let writable = FakeReliableLeg::new(true);
+        let dropped = flush(&mut socket, &mut state, &mut pacer, Some(&writable), false)
+            .await
+            .unwrap();
+
+        assert!(dropped.is_empty());
+        assert_eq!(writable.frames().len(), 2, "两帧都要补上，顺序按原样");
+        assert!(state.reliable.is_empty());
+    }
+
+    /// 公益档 + 直连可用：照旧走那条腿（中继一个字节都不碰）
+    #[tokio::test]
+    async fn the_public_tier_still_uses_the_direct_lanes() {
+        let mut state = SessionState::new(&ROOT_KEY);
+        let mut pacer = Pacer::new(OUTBOUND_FRAMES_PER_SECOND, OUTBOUND_BURST);
+        let mut direct_pacer = Pacer::new(DIRECT_FRAMES_PER_SECOND, DIRECT_BURST);
+        let mut socket = RecordingSocket::default();
+        let coverable = FakeLeg::default();
+        let reliable = FakeReliableLeg::new(true);
+
+        state.public_tier = true;
+
+        state
+            .queue(
+                FrameKind::Chat,
+                &AppEnvelope::new(message_type::CHAT_TEXT, 0, json!({ "text": "hi" })),
+                false,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::PetState,
+                &AppEnvelope::new(message_type::PET_STATE, 1, json!({})),
+                true,
+            )
+            .unwrap();
+
+        flush(&mut socket, &mut state, &mut pacer, Some(&reliable), false)
+            .await
+            .unwrap();
+        flush_replaceable(
+            &mut socket,
+            Some(&coverable),
+            &mut state,
+            &mut pacer,
+            &mut direct_pacer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reliable.frames().len(), 1);
+        assert_eq!(coverable.frames().len(), 1);
+        assert!(socket.sent.is_empty(), "两条腿都在时中继线上什么都不该有");
+    }
+
+    /// 档位是拿到 `server.welcome` 才知道的：那之前攒下的数据帧要在开局就被挑掉。
+    ///
+    /// 不挑掉的后果不是「掉进黑洞」而是「被服务器用 `1008` 关掉整条连接」——刚连上的
+    /// 信令一起重来，现象就成了看不懂的「连上又断、连上又断」。
+    #[test]
+    fn take_non_signal_keeps_only_the_signal() {
+        let mut state = SessionState::new(&ROOT_KEY);
+
+        state
+            .queue(
+                FrameKind::Presence,
+                &AppEnvelope::new(message_type::PRESENCE, 0, json!({})),
+                false,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::Chat,
+                &AppEnvelope::new(message_type::CHAT_TEXT, 1, json!({ "text": "hi" })),
+                false,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::PetState,
+                &AppEnvelope::new(message_type::PET_STATE, 2, json!({})),
+                true,
+            )
+            .unwrap();
+        state
+            .queue(
+                FrameKind::Ping,
+                &AppEnvelope::new(message_type::SIGNAL, 3, json!({})),
+                false,
+            )
+            .unwrap();
+
+        let dropped = state.take_non_signal();
+
+        // 被挑出来的要连信封一起交回去：聊天靠它退回 `pending`、附件 offer 靠它收尾
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|envelope| envelope.message_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![message_type::PRESENCE, message_type::CHAT_TEXT]
+        );
+        assert_eq!(state.reliable.len(), 1, "信令必须留下");
+        // 可覆盖流没有信封、也不需要收尾（绝对值快照，等下一帧即可），直接清掉
+        assert!(state.replaceable.is_empty());
     }
 }

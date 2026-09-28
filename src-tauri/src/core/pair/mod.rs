@@ -507,10 +507,11 @@ async fn stage_attachment(
     mime: Option<String>,
     stage: bool,
 ) -> Result<ChatMessage, String> {
-    // 手工码模式下直连还没建立时先挡住（和 `send_chat` 同一个理由）：这条路没有中继兜底，
-    // offer 发出去只会掉进黑洞，而本地已经多出一条「发送失败」的记录，用户还得手动删。
-    // 挡在 `stage_copy` 之前也顺带保住了临时 wav：`send_attachment` 的失败路径会删源文件。
-    if let Some(reason) = manager.manual_blocked() {
+    // 直连还没建立、而这条会合方式又没有中继兜底时先挡住（配对码 / 公益档，和 `send_chat`
+    // 同一个理由）：offer 发出去只会掉进黑洞，而本地已经多出一条「发送失败」的记录，
+    // 用户还得手动删。挡在 `stage_copy` 之前也顺带保住了临时 wav：`send_attachment` 的
+    // 失败路径会删源文件。
+    if let Some(reason) = manager.outbound_blocked() {
         return Err(reason);
     }
 

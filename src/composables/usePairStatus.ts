@@ -59,6 +59,9 @@ export function usePairStatus() {
   const applyStatus = (status: PairStatus) => {
     store.runtime.connection = store.settings.enabled ? translate(status.state) : 'disabled'
     store.runtime.p2p = store.settings.enabled ? (status.p2p ?? 'off') : 'off'
+    // 档位只在连接有效时有意义：关掉联机就落回缺省（部署者那一档），
+    // 免得「上次连的是公益服务器」这条记忆在断开之后还灰着发送口
+    store.runtime.tier = store.settings.enabled ? (status.tier ?? 'full') : 'full'
     // 配对码面板不受总开关影响：它是「这次配对正在进行」这件事实，关掉联机总开关时
     // Rust 那边也会把它清掉（`disconnect`），所以这里如实照搬
     store.runtime.manual = status.manual ?? void 0

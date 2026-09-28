@@ -9,7 +9,7 @@ import { usePairChat } from '@/composables/usePairChat'
 import { setChatVisible } from '@/composables/usePairOverlay'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY } from '@/constants'
-import { pairStateKey, usePairStore } from '@/stores/pair'
+import { outboundBlockKey, pairStateKey, usePairStore } from '@/stores/pair'
 
 /**
  * 猫咪窗口上的聊天浮层（R39）。
@@ -54,16 +54,21 @@ const sendError = ref('')
 const online = computed(() => pairStore.settings.enabled && pairStore.runtime.peerOnline)
 
 /**
- * 配对码模式（手工信令）下直连还没建立。
+ * 现在发不出去的原因（i18n key）；能发时是空串。
  *
- * 这条路没有服务器兜底，语音也一样发不出去（Rust 侧同样会拒），所以麦克风要跟着一起按死，
- * 不能让用户录完一分钟才发现发不出去。
+ * 两条会合方式各有一条硬理由（判据在 store 里，见 `outboundBlockKey`）：配对码没有服务器
+ * 兜底，**公益档**那台服务器只帮忙打洞、不中继。两条都要在按下麦克风之前就挡住——不能让
+ * 用户录完一分钟才发现发不出去。
  */
-const manualBlocked = computed(() => {
-  const manual = pairStore.runtime.manual
-
-  return Boolean(manual && manual.phase !== 'connected')
+const blockKey = computed(() => {
+  return outboundBlockKey({
+    tier: pairStore.runtime.tier,
+    p2p: pairStore.runtime.p2p,
+    manual: pairStore.runtime.manual,
+  })
 })
+
+const blocked = computed(() => Boolean(blockKey.value))
 
 /** 同时显示的气泡数：与聊天窗口共用同一个设置 */
 const bubbleCount = computed(() => {
@@ -91,7 +96,7 @@ const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
 const canSend = computed(() => {
   return (
     online.value
-    && !manualBlocked.value
+    && !blocked.value
     && !sending.value
     && !tooLong.value
     && draft.value.trim().length > 0
@@ -145,6 +150,9 @@ const blockNote = computed(() => {
   if (props.recording || props.pending) return ''
 
   if (manualState.value) return t('pages.chat.hints.manual', { state: manualState.value })
+
+  // 公益档那句要排在「先排队、等连上再发」前面：这一档排队也不会发出去
+  if (blockKey.value) return t(blockKey.value)
 
   return pairState.value || sendError.value
 })
@@ -237,7 +245,7 @@ function handleKeydown(event: KeyboardEvent) {
  * 录音期间把焦点交还出去，免得打字又被当成按键。
  */
 function handleVoice() {
-  if (manualBlocked.value) return
+  if (blocked.value) return
 
   inputRef.value?.blur()
 
@@ -300,8 +308,8 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
       <button
         :aria-label="props.recording ? $t('pages.main.hints.stopRecording') : $t('pages.main.hints.voice')"
         class="voice-button size-[28px] flex shrink-0 items-center justify-center text-[16px] rounded-full"
-        :class="manualBlocked ? 'cursor-not-allowed' : 'cursor-pointer'"
-        :disabled="manualBlocked"
+        :class="blocked ? 'cursor-not-allowed' : 'cursor-pointer'"
+        :disabled="blocked"
         :title="props.pending && !props.recording
           ? $t('pages.main.hints.reRecord')
           : $t('pages.main.hints.voice')"

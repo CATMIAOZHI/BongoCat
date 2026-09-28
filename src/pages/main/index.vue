@@ -120,16 +120,6 @@ onUnmounted(() => {
 })
 
 /**
- * R41：待确认的语音能不能发。
- *
- * 对方不在线时发送一定会失败，而 Rust 侧失败路径会把临时 wav 删掉——那等于白录一段。
- * 所以离线时按钮只显示、不生效，免得用户点一下就没了。
- */
-const canSendRecording = computed(() => {
-  return pairStore.settings.enabled && pairStore.runtime.peerOnline && !recordingSending.value
-})
-
-/**
  * 待确认的语音发不出去的原因（i18n key）；能发时是空串。
  *
  * R44：以前只分「联机没打开」和「对方不在线」，于是「正在连接服务器」「还没连上服务器」
@@ -147,7 +137,24 @@ const recordingBlockReason = computed(() => {
     connection: pairStore.runtime.connection,
     peerOnline: pairStore.runtime.peerOnline,
     sending: recordingSending.value,
+    // 公益档下「对方在线」不等于「发得出去」：那台服务器不转发数据，得等直连
+    tier: pairStore.runtime.tier,
+    p2p: pairStore.runtime.p2p,
   })
+})
+
+/**
+ * R41：待确认的语音能不能发。
+ *
+ * 对方不在线时发送一定会失败，而 Rust 侧失败路径会把临时 wav 删掉——那等于白录一段。
+ * 所以离线时按钮只显示、不生效，免得用户点一下就没了。
+ *
+ * 判据直接复用上面那份原因：它已经把「联机没打开 / 没连上 / 对方不在线 / 公益档等直连」
+ * 都算进去了，两处各写一份迟早会漂。
+ */
+const canSendRecording = computed(() => {
+  // 正在发送时那份「原因」是空串（界面由「正在发送…」接管），所以要单独排掉
+  return !recordingSending.value && !recordingBlockReason.value
 })
 
 /** R41：离线时点「发送」直接不发起（理由同上，别把录音弄丢） */

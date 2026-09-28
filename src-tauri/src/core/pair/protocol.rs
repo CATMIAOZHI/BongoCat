@@ -9,6 +9,13 @@ use std::collections::VecDeque;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// 「我认得档位」这个能力标记的取值（`X-Bongo-Tier: 1`，见 [`crate::core::pair::client`]）。
+///
+/// 客户端**永远**带上它：它自己也不知道用户填的是部署者密码还是公益密码。自建中继只在
+/// 「拿公益密码连进来」时才检查这个头（认不得就回 426 让两边都升级），部署者那一档、
+/// Cloudflare 版、旧自建版都无视它。
+pub const TIER_HEADER_VALUE: &str = "1";
+
 /// 每个应用帧固定 14 字节明文帧头：kind(1) | flags(1) | transferId(8) | seq(4)
 pub const FRAME_HEADER_SIZE: usize = 14;
 
@@ -35,6 +42,18 @@ pub enum FrameKind {
 impl FrameKind {
     pub const fn as_byte(self) -> u8 {
         self as u8
+    }
+
+    /// 这一类是不是「信令」（kind 8）。
+    ///
+    /// 客户端这边 kind 8 叫 [`Self::Ping`]——名字来自它最常见的用途（保活探针），而它在
+    /// 协议里代表的是**信令这一类**：`pair.signal`（打洞信令）与 `pair.ping/pong` 共同
+    /// 走它（服务端叫 `FRAME_KIND_SIGNAL`）。
+    ///
+    /// 公益档的判定就是它：那一档的中继**只**承载信令，别的一律被服务器用 `1008` 拒掉
+    /// （见 [`crate::core::pair::manager`] 的 `SessionState::public_tier`）。
+    pub const fn is_signal(self) -> bool {
+        matches!(self, Self::Ping)
     }
 
     pub fn from_byte(byte: u8) -> Option<Self> {
@@ -588,6 +607,10 @@ pub enum ServerFrame {
             deserialize_with = "deserialize_ice_servers"
         )]
         ice_servers: Vec<IceServer>,
+        /// 这次连接算哪一档（自建中继独有；CF 版与旧版都不发）。缺失或认不出来一律
+        /// 按 `full`，见 [`deserialize_tier`]。
+        #[serde(default = "full_tier", deserialize_with = "deserialize_tier")]
+        tier: RelayTier,
     },
     #[serde(rename = "server.peer")]
     Peer {
@@ -597,6 +620,51 @@ pub enum ServerFrame {
     },
     #[serde(rename = "server.error")]
     Error { code: String, message: String },
+}
+
+/// 这次连接算哪一档（`server.welcome` 的 `tier`）。
+///
+/// 部署者那一档（`full`）照旧「打洞 + 中继兜底」；**公益档（`public`）只借这台服务器
+/// 打洞**——服务器不替它转发任何数据帧（聊天 / 附件 / 语音 / 快照），也不广告 TURN。
+/// 所以拿到 `public` 之后，客户端必须把所有数据都收到直连上（见
+/// [`crate::core::pair::manager::PairManager::outbound_blocked`] 与前端的同一道闸）。
+///
+/// 档位**跟着连接走**，不跟着会话走：填公益密码的人永远只是公益档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayTier {
+    /// 部署者那一档：中继会转发数据
+    Full,
+    /// 公益档：中继只转发信令，数据全靠直连
+    Public,
+}
+
+impl RelayTier {
+    pub const fn is_public(self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
+fn full_tier() -> RelayTier {
+    RelayTier::Full
+}
+
+/// 宽容地解析 `tier`：缺字段、`null`、别的字符串、甚至一个数字，全部按 `full`。
+///
+/// 不能让它解析失败：这会让整条 `server.welcome` 变成「读不出来」，而 welcome 读不出来
+/// 就是一次连接失败。反过来说，把一个**真**公益档认成 `full` 也不是灾难——那台服务器
+/// 会自己在收到数据帧时用 `1008` 拒绝（见 `server-relay/src/relay.rs` 的帧白名单），
+/// 客户端下一轮就会把这条连接重来，只是比「一开始就挡住」多一次重连。
+fn deserialize_tier<'de, D>(deserializer: D) -> Result<RelayTier, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+
+    Ok(match value.as_ref().and_then(Value::as_str) {
+        Some("public") => RelayTier::Public,
+        _ => RelayTier::Full,
+    })
 }
 
 /// 中继在 `server.welcome` 里广告的限流额度（R20）。
@@ -677,6 +745,8 @@ const MAX_ADVERTISED_BYTES_PER_SECOND: f64 = 64.0 * 1024.0 * 1024.0;
 pub struct RelayConfig {
     pub limits: RelayLimits,
     pub ice_servers: Vec<IceServer>,
+    /// 这次连接算哪一档。会话层靠它决定**能不能把数据帧交给中继**：公益档只准发信令。
+    pub tier: RelayTier,
 }
 
 /// 客户端实际使用的出站节奏（见 `RelayLimits::outbound`）
@@ -1304,5 +1374,57 @@ mod tests {
 
             assert!(ice_servers.len() <= 1, "畸形条目要丢掉：{ice_servers:?}");
         }
+    }
+
+    /// 公益档的 `tier`：解析必须**永远成功**，认不出来的一律落回 `full`。
+    ///
+    /// 两种方向都不能出错。认不出来时按 `full`：旧中继（含官方 Cloudflare 版）压根不发
+    /// 这个字段，而「认成 public 就什么都不发了」这种降级比忽略一个未知字段严重得多。
+    /// （反过来的风险由服务端兜着：真公益档收到数据帧会用 `1008` 拒绝。）
+    #[test]
+    fn the_welcome_tier_is_lenient_and_defaults_to_full() {
+        for payload in [
+            // 旧中继：根本没有这个字段
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false }"#,
+            // 显式 null
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": null }"#,
+            // 形状不对：数字
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": 1 }"#,
+            // 形状不对：对象
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": {} }"#,
+            // 认不出来的取值（将来的档位不该把老客户端打瞎）
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "vip" }"#,
+            // 大小写敏感：只有小写的 `public` 才算公益档
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "Public" }"#,
+            // 显式的部署者档
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "full" }"#,
+        ] {
+            let frame: ServerFrame = serde_json::from_str(payload)
+                .unwrap_or_else(|error| panic!("{payload} 不该解析失败：{error}"));
+
+            let ServerFrame::Welcome { tier, .. } = frame else {
+                panic!("应当解析成 server.welcome: {payload}");
+            };
+
+            assert_eq!(tier, RelayTier::Full, "解析：{payload}");
+            assert!(!tier.is_public());
+        }
+
+        let frame: ServerFrame = serde_json::from_str(
+            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": true, "tier": "public" }"#,
+        )
+        .unwrap();
+
+        let ServerFrame::Welcome {
+            tier, peer_online, ..
+        } = frame
+        else {
+            panic!("应当解析成 server.welcome");
+        };
+
+        assert_eq!(tier, RelayTier::Public);
+        assert!(tier.is_public());
+        // 同一帧里的其它字段照常读出来（档位不参与它们的判定）
+        assert!(peer_online);
     }
 }
