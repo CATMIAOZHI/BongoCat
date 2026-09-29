@@ -146,6 +146,18 @@ pub const DEFAULT_PUBLIC_BURST_BYTES: f64 = 64.0 * 1024.0;
 /// 那件事只有部署者做得到。它同时也是「谁在夹带」的天然身份（详见 `sweep` 那行日志）。
 pub const DEFAULT_PUBLIC_KEY_BUDGET_BYTES: f64 = 16.0 * 1024.0 * 1024.0;
 
+/// 完全档**每把钥匙**的滚动预算（`PAIR_FULL_KEY_BUDGET_BYTES`，0 = 不设这一层）。
+///
+/// 与公益档那一份是同一套记账（都挂在**钥匙**上，见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`），
+/// 只是额度大得多：这一档要承载聊天、语音与附件分片，诚实用量本来就比「一轮打洞」大几个
+/// 数量级。它防的不是「你自己用超」，而是**一把流出去的钥匙**：在被撤销之前，那把钥匙最多
+/// 先花 2 GiB、之后每小时 2 GiB——再想多就得换一把，而那件事只有部署者做得到。
+///
+/// 2 GiB 的取法是「比任何诚实的一小时都宽、比一条被滥用的千兆链路窄得多」：按 2 GiB/小时
+/// 算，持续速率约 4.7 Mbit/s，已经接近这类廉价云主机的带宽上限，所以它对诚实用法是隐形的，
+/// 对「拿它当免费中转」是硬的。设 `0` = 不设这一层（回到从前那样无限）。
+pub const DEFAULT_FULL_KEY_BUDGET_BYTES: f64 = 2.0 * 1024.0 * 1024.0 * 1024.0;
+
 /// 公益档的空闲回收窗口（`PAIR_PUBLIC_WINDOW_SECS`）。
 ///
 /// **它是空闲回收器，不是「打洞截止时间」**：中继看不到 DataChannel 有没有建立成功
@@ -153,6 +165,32 @@ pub const DEFAULT_PUBLIC_KEY_BUDGET_BYTES: f64 = 16.0 * 1024.0 * 1024.0;
 /// ——而中继一断，客户端是整条会话重启、直连也跟着重来。这里的判据是「多久没收到**任何**
 /// 入站消息」，诚实客户端每 60 秒发一次 WebSocket Ping，180 秒 = 三次漏拍。
 pub const DEFAULT_PUBLIC_WINDOW_SECS: u64 = 180;
+
+/// 完全档的空闲回收窗口（`PAIR_FULL_WINDOW_SECS`，0 = 不回收）。
+///
+/// 判据与公益档那条完全一样（见 `DEFAULT_PUBLIC_WINDOW_SECS`），只是窗口更长：这一档是
+/// 部署者自己与朋友的日常会话，不该被一个偏紧的秒数打断。它要解决的是**僵尸连接**——对端
+/// 机器睡眠、网线被拔之后，TCP 可能几小时都不报错，于是一条什么都没在传的连接会一直占着
+/// 会话名额与一条连接许可（`stale_after` 只能让**同一个 deviceId** 的新连接顶替它，救不了
+/// 「人已经不在了」这种）。诚实客户端每 60 秒一次 WebSocket Ping，300 秒 = 五次漏拍。
+pub const DEFAULT_FULL_WINDOW_SECS: u64 = 300;
+
+/// 同一把服务器钥匙最多能同时开几组会话（`PAIR_MAX_SESSIONS_PER_KEY`，0 = 不限）。
+///
+/// 「一把钥匙一个人」是运营规则，而这条规则的另一面是：一把钥匙本该只承载**一对**用户的
+/// 一两个会话（两台设备各一条连接，落在同一个 Room 里）。所以这里给的是「一台机器重连重叠
+/// 也够用」的余量，而不是「能开多少就开多少」——一把流出去的钥匙因此最多占掉几个会话位，
+/// 而不是把整档名额吃光。两档共用这一个闸：公益档那把钥匙同样不该能占满 10 组公益名额。
+pub const DEFAULT_MAX_SESSIONS_PER_KEY: usize = 4;
+
+/// 限时 TURN 凭据的有效期（`PAIR_TURN_TTL_SECS`，秒；只在配了 `PAIR_TURN_SECRET` 时生效）。
+///
+/// 24 小时是「一定长过一条会话」的量级：客户端**整条会话只读一次** `iceServers`
+/// （`manager.rs` 的 welcome 处理），之后每一轮 ICE 重试都复用同一份凭据，而中继只有在
+/// **整条会话重连**时才会重读。凭据短于会话寿命就会在会话中途失效，表现为「打洞突然打不
+/// 通了」，所以宁可给长一点：它的作用是让**泄露出去的**那份凭据自己过期，而不是限制正在用
+/// 的人。
+pub const DEFAULT_TURN_TTL_SECS: u64 = 86_400;
 
 /// 一个 Room 里最多同时有几条「已鉴权、还没走进 `admit`」的连接（`pending`）。
 ///
@@ -180,6 +218,22 @@ pub const DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE: f64 = 30.0;
 /// `server.rs::Config::max_connections`），所以部署者不用管它；这个缺省值是给会话层的单测
 /// 与 `RelayOptions::default()` 用的。
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// 预握手（读请求头）阶段的连接数缺省上限（`RelayOptions::max_pre_handshake_connections`
+/// 的缺省值）。
+///
+/// 它与上面那个「真实连接数上限」是**两道不同的闸**：这一道只覆盖「TCP 已经接受、请求头
+/// 还没读完」那一段（`HANDSHAKE_TIMEOUT` 之内），放行之后就再也用不到它。它比真实上限宽
+/// 得多是有意的——它的职责是「别让一堆半开的连接把任务与内存吃光」，而不是「够不够用」：
+/// 把它设成真实额度，等于「随便谁开几条不发请求头的连接就能让所有人拿到 503」。
+pub const DEFAULT_MAX_PRE_HANDSHAKE_CONNECTIONS: usize = 2 * DEFAULT_MAX_CONNECTIONS;
+
+/// 预握手阶段**同一个来源地址**最多同时挂几条（0 = 不限）。
+///
+/// 读请求头时还没有请求头可用，所以这里只能按**对端地址**算：域名模式下那就是前置反代的
+/// 地址（所有人共用），direct 模式下就是客户端本身。64 是「同一个 NAT 后面几十个人同时
+/// 重连也够」的量级——这一道闸要的是「别让一个来源把预握手池吃光」，不是每 IP 的限额。
+pub const DEFAULT_PRE_HANDSHAKE_PER_IP: usize = 64;
 
 /// `ROOM_ID` 的长度上界。客户端派生出来的是 43 个字符（32 字节 base64url 无填充），
 /// 这里按上界校验：中继只需要「非空、够短、字符集合法」，不必钉死长度。
@@ -209,10 +263,13 @@ pub mod close_code {
     pub const PAIR_FULL: u16 = 4003;
     /// 顶替长时间无活动的连接
     pub const STALE: u16 = 4004;
-    /// 公益档：空闲太久被回收（**不是**「打洞失败」，见 `DEFAULT_PUBLIC_WINDOW_SECS`）
-    pub const PUBLIC_WINDOW: u16 = 4005;
-    /// 公益档：这把钥匙的预算用完了（**不是**「你发太快」，见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`）。
-    /// 它与 `1008`（自己的额度不够）分开，客户端才能说出「这台服务器给你的公益额度用完了」
+    /// 空闲太久被回收（**不是**「打洞失败」，见 `DEFAULT_PUBLIC_WINDOW_SECS` /
+    /// `DEFAULT_FULL_WINDOW_SECS`）。两档共用这一个码：客户端要做的事完全一样
+    /// （重连），而它无从知道对面那一档的窗口是哪一个数。
+    pub const IDLE: u16 = 4005;
+    /// 这把钥匙的滚动预算用完了（**不是**「你发太快」，见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES` /
+    /// `DEFAULT_FULL_KEY_BUDGET_BYTES`）。它与 `1008`（自己的额度不够）分开，客户端才能说出
+    /// 「这台服务器给你的额度用完了」
     /// 而不是一句笼统的格式错误。
     pub const KEY_BUDGET: u16 = 4006;
     /// 协议 / 帧格式错误

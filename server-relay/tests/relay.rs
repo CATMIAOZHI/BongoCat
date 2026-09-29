@@ -25,7 +25,7 @@ use bongocat_pair_relay::{
     auth,
     protocol::{
         self, close_code, Limits, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
-        DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+        DEFAULT_PRE_HANDSHAKE_PER_IP, DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
     },
 };
 
@@ -123,8 +123,13 @@ fn config(
         public_key_budget: defaults.public_key_budget,
         handshake_failures_per_minute: defaults.handshake_failures_per_minute,
         max_public_sessions: defaults.max_public_sessions,
+        max_sessions_per_key: defaults.max_sessions_per_key,
         max_public_per_ip: defaults.max_public_per_ip,
         public_window: defaults.public_window,
+        full_window: defaults.full_window,
+        full_key_budget: defaults.full_key_budget,
+        turn_secret: None,
+        turn_ttl: defaults.turn_ttl,
         trust_proxy: false,
     }
 }
@@ -1045,44 +1050,25 @@ async fn the_public_key_budget_is_shared_by_two_sessions_of_one_key() {
     expect_silence(&mut other, "拿另一把公益钥匙的连接").await;
 }
 
-/// 连接数上限（`Config::max_connections`，由名额推出来）真的会挡住新的 TCP 连接。
+/// **未鉴权的半开连接一条真实额度都不占**（审计里的 P0-1）。
 ///
-/// 这条闸防的不是「会话太多」（那是名额），而是「开任意多条 TCP」：`/health` 与握手都不过
-/// 闸，每条连接占一个任务加一份 8 KiB 的请求头缓冲——不管的话一个客户端就能把宿主机拖垮，
-/// 那时连部署者自己那一档也一起连不上。
+/// 修之前的形状是「先领真实额度的许可，再读请求头」：随便谁开几条**不发任何数据**的 TCP
+/// （每条只要在握手超时之内重连一次），就能把整池占住——`/health` 与所有正常握手一起拿
+/// 503，而攻击者什么都不用做。现在读请求头那一段走的是另一道**宽得多**的闸（它只给
+/// 「任务 + 8 KiB 请求头缓冲」一个硬上界），真实额度只在「鉴权与会话判定都过了」之后才领，
+/// 所以这些半开的连接一个真实额度都不占。
 ///
-/// 判据必须是**那句专门的话**：单看状态码不够，因为「会话满了」也是 503。这里用「只连不发」
-/// 的空闲连接把许可占满（它们在等请求头，最多 10 秒），再验两件事：新连接被回 503 + 那句话；
-/// 把这些连接放掉之后又能正常握手。
+/// 这里连的条数（34）正是 `max_sessions = 1` 时的真实额度：修之前它们刚好把闸占满。
 #[tokio::test]
-async fn the_connection_cap_answers_with_its_own_503() {
-    // 1 组完全档 + 0 组公益档 = 2 × 1 + 32 = 34 条连接
+async fn idle_connections_never_consume_the_connection_budget() {
+    // 1 组完全档 + 0 组公益档 = 2 × 1 + 32 = 34 条真实额度
     let config = Config {
         max_public_sessions: 0,
         ..config(Limits::default(), 1, Duration::from_secs(120), None, None)
     };
     let address = start_relay_with_config(config).await;
 
-    // 「服务器把这 34 条空闲连接都接受下来」是异步的，所以连上就断言会闪；一直问到要么
-    // 拿到那句话、要么等够 `PATIENCE`
-    async fn until_refused(address: SocketAddr) -> String {
-        let deadline = tokio::time::Instant::now() + PATIENCE;
-
-        loop {
-            let answer =
-                raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
-
-            if answer.contains("server is at its connection limit")
-                || tokio::time::Instant::now() >= deadline
-            {
-                return answer;
-            }
-
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    // 只连不发：这些连接会一直握着许可
+    // 只连不发：它们会一直挂在「预握手」那一段，而不是真实额度那一段
     let idle: Vec<TcpStream> = {
         let mut idle = Vec::new();
 
@@ -1092,42 +1078,86 @@ async fn the_connection_cap_answers_with_its_own_503() {
 
         idle
     };
-    let refused = until_refused(address).await;
+
+    // 健康检查照旧：它排在限额之前（这一条也钉住「健康检查不会被别人的半开连接影响」）
+    let health = raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
 
     assert!(
-        refused.contains(" 503 "),
-        "连接满了要回 503，实际：{refused}"
-    );
-    assert!(
-        refused.contains("server is at its connection limit"),
-        "而且要说清是**连接数**满了（不是会话满了），实际：{refused}"
+        health.contains(" 200 "),
+        "半开连接不该挡住 /health，实际：{health}"
     );
 
-    // 放掉空闲连接，闸又开了
+    // 真实握手也照常：这些半开连接一个真实额度都没占
+    assert_eq!(
+        handshake_status(address, ROOM_A, TOKEN_A, "aaaa").await,
+        101,
+        "半开连接不该挡住正常握手"
+    );
+
     drop(idle);
+}
 
-    let mut opened = false;
+/// 预握手那道闸满了之后**当场回 503**，而不是把半开连接排进队列里等。
+///
+/// 撞上的是每来源那一层（`DEFAULT_PRE_HANDSHAKE_PER_IP`，默认 64）：同一个地址把额度用光
+/// 之后，下一条**连请求头都没读**就被挡回去。这份配置下真实额度是 `2 × 1 + 32 = 34`，
+/// 比 64 小，所以先撞上的一定是每来源那个数——用例因此同时钉住了「哪一道闸在先」与「那条
+/// 拒绝路上真的把 503 写出去了」（不 drain 的话客户端只会看到 RST）。
+///
+/// 请求用 `/health` 是有意的：它排在一切限额之前，所以「拿到 200」就等于「预握手那道闸
+/// 没被这道请求撞上」，对照明确。
+#[tokio::test]
+async fn the_pre_handshake_gate_answers_with_its_own_503() {
+    let config = Config {
+        max_public_sessions: 0,
+        ..config(Limits::default(), 1, Duration::from_secs(120), None, None)
+    };
+    let address = start_relay_with_config(config).await;
 
-    for _ in 0..200 {
-        if handshake_status(address, ROOM_A, TOKEN_A, "aaaa").await == 101 {
-            opened = true;
+    // 只连不发：这些会一直挂在「预握手」那一段
+    let idle: Vec<TcpStream> = {
+        let mut idle = Vec::new();
 
+        for _ in 0..DEFAULT_PRE_HANDSHAKE_PER_IP {
+            idle.push(TcpStream::connect(address).await.unwrap());
+        }
+
+        idle
+    };
+
+    // 上面那些许可是各自被 `accept` 之后才领的，所以这里要等它们都登记上
+    let request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut refused = String::new();
+
+    for _ in 0..40 {
+        refused = raw_request(address, request).await;
+
+        if refused.contains(" 503 ") {
             break;
         }
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    assert!(opened, "放掉空闲连接之后应当又能正常握手");
+    assert!(
+        refused.contains(" 503 ") && refused.contains("server is at its connection limit"),
+        "预握手额度用光之后该回 503，实际：{refused}"
+    );
+
+    drop(idle);
 }
 
 /// 拿错服务器密码刷 `/ws`：额度（默认 30/分钟）用光之后，这个 IP 会**在鉴权之前**被 429
-/// 挡下，连 `/health` 一起。
+/// 挡下。
 ///
 /// 这一条钉的是「闸放在哪一步」。放在鉴权之后的话，每一次被拒仍然要跑一遍摘要比较——
-/// 而这道闸要省的正是那件事（外加日志）。顺带钉住「被挡的 IP 连健康检查都拿不到」。
+/// 而这道闸要省的正是那件事（外加日志）。
+///
+/// **`/health` 不在这道闸后面**：它排在限额之前。被 429 的地址仍然该能拿到健康检查，否则
+/// 「有人在刷错密码」会同时让监控与被封互相掩盖——而容器健康检查走的正是那条路，健康检查
+/// 失败会让 docker 判 `unhealthy` 并重启容器。
 #[tokio::test]
-async fn a_flood_of_failed_handshakes_is_429_before_anything_else() {
+async fn a_flood_of_failed_handshakes_is_429_before_authentication() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
     let stranger = auth::derive_server_token("relay-tests-stranger-password");
 
@@ -1145,14 +1175,11 @@ async fn a_flood_of_failed_handshakes_is_429_before_anything_else() {
         429
     );
 
-    // 健康检查也在同一道闸后面
+    // 健康检查排在这道闸之前：被 429 也一样拿得到
     let health = raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
 
-    assert!(health.contains(" 429 "), "实际：{health}");
-    assert!(
-        health.contains("too many failed handshakes"),
-        "实际：{health}"
-    );
+    assert!(health.contains(" 200 "), "实际：{health}");
+    assert!(health.contains("\"ok\":true"), "实际：{health}");
 }
 
 #[tokio::test]
@@ -1193,6 +1220,81 @@ async fn the_welcome_advertises_configured_ice_servers() {
     let welcome = next_json(&mut client).await;
 
     assert_eq!(welcome["iceServers"], ice_servers);
+}
+
+/// coturn REST API 的那份凭据：`base64(HMAC-SHA1(共享密钥, username))`。
+///
+/// 用例自己算一遍（不复用被测代码）。算法本身由 `relay.rs` 里钉 RFC 2202 向量的那条用例
+/// 保证，所以这里验的是**接线**：配置有没有真的折进会话层、welcome 里那份凭据是不是现签的。
+fn expected_turn_credential(secret: &str, username: &str) -> String {
+    use base64::Engine as _;
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).unwrap();
+
+    mac.update(username.as_bytes());
+
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// 配了 `PAIR_TURN_SECRET` 之后，welcome 里的 `turn:` 凭据由中继**现签**（限时），而不是
+/// `PAIR_ICE_SERVERS` 里那份长期有效的静态值。
+///
+/// 走的是完整链路（`Config` → `RelayOptions` → welcome），所以顺带钉住「配置项真的折进
+/// 会话层了」——漏一处只表现为「凭据还是旧的」，而那与「TURN 被别人白用」是同一件事。
+#[tokio::test]
+async fn a_configured_turn_secret_signs_short_lived_credentials() {
+    const SECRET: &str = "relay-tests-turn-shared-secret";
+
+    let ice_servers = serde_json::json!([
+        { "urls": ["stun:cat.example.com:3478"] },
+        {
+            "urls": ["turn:cat.example.com:3478"],
+            "username": "static-user",
+            "credential": "static-pass"
+        }
+    ]);
+    let config = Config {
+        turn_secret: Some(SECRET.to_string()),
+        turn_ttl: Duration::from_secs(600),
+        ..config(
+            Limits::default(),
+            20,
+            Duration::from_secs(120),
+            Some(ice_servers),
+            None,
+        )
+    };
+    let address = start_relay_with_config(config).await;
+    let mut client = connect_a(address, "aaaa").await;
+    let welcome = next_json(&mut client).await;
+    let advertised = &welcome["iceServers"];
+
+    // `stun:` 那条原样留着
+    assert_eq!(
+        advertised[0],
+        serde_json::json!({ "urls": ["stun:cat.example.com:3478"] })
+    );
+    // `turn:` 那条换成了限时凭据
+    assert_ne!(advertised[1]["credential"], "static-pass");
+
+    let username = advertised[1]["username"].as_str().unwrap();
+    let (expire, identity) = username.split_once(':').expect("形状要是 {过期}:{标识}");
+    let expire: u64 = expire.parse().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    assert!(
+        expire > now + 500 && expire <= now + 600,
+        "过期时刻要落在 TTL 里：{expire}（现在 {now}）"
+    );
+    assert_eq!(identity, "1");
+    assert_eq!(
+        advertised[1]["credential"].as_str().unwrap(),
+        expected_turn_credential(SECRET, username)
+    );
 }
 
 #[tokio::test]
@@ -1687,10 +1789,30 @@ async fn the_public_window_closes_an_idle_connection_with_4005() {
 
     next_json(&mut guest).await;
 
-    assert_eq!(
-        wait_close(&mut guest).await,
-        Some(close_code::PUBLIC_WINDOW)
-    );
+    assert_eq!(wait_close(&mut guest).await, Some(close_code::IDLE));
+}
+
+/// 完全档同样有空闲回收（`PAIR_FULL_WINDOW_SECS`），关闭码与公益档共用 `4005`。
+///
+/// 它挡的是**僵尸连接**：对端机器睡眠 / 网线被拔之后，TCP 可能几小时都不报错，于是一条
+/// 什么都没在传的连接会一直占着会话名额与一条连接额度。诚实客户端每 60 秒一次 WebSocket
+/// Ping（`manager.rs` 的 ticker，窗口藏起来也照发），所以日常根本碰不到它。
+#[tokio::test]
+async fn the_full_window_reaps_an_idle_connection_with_4005() {
+    let config = Config {
+        // 公益档关掉：这一条只看完全档那一个窗口
+        max_public_sessions: 0,
+        full_window: Some(Duration::from_millis(300)),
+        ..config(Limits::default(), 20, Duration::from_secs(120), None, None)
+    };
+    let address = start_relay_with_config(config).await;
+    let mut owner = connect_with_server(address, ROOM_B, TOKEN_B, "1", "aaaa", &server_token())
+        .await
+        .unwrap();
+
+    next_json(&mut owner).await;
+
+    assert_eq!(wait_close(&mut owner).await, Some(close_code::IDLE));
 }
 
 /// 回归：公益档一加，部署者那一档的转发照旧（kind 1 与 kind 6 都能过）

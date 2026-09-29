@@ -13,10 +13,14 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, KeyInit, Mac};
+use sha1::Sha1;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::error::CapacityError;
@@ -31,11 +35,12 @@ use crate::auth::{auth_verifier, constant_time_eq, room_fingerprint};
 use crate::http::{write_upgrade, RequestHead};
 use crate::protocol::{
     self, close_code, is_known_frame_kind, Limits, ServerFrame, Tier,
-    DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE, DEFAULT_MAX_CONNECTIONS, DEFAULT_PUBLIC_BURST_BYTES,
-    DEFAULT_PUBLIC_BURST_FRAMES, DEFAULT_PUBLIC_KEY_BUDGET_BYTES, FRAME_HEADER_SIZE,
-    FRAME_KIND_SIGNAL, FRAME_KIND_TRANSFER_CHUNK, LAST_SEEN_WRITE_INTERVAL_MS,
-    MAX_BINARY_FRAME_SIZE, MAX_PENDING_PER_ROOM, MAX_PUBLIC_FRAME_SIZE, PAIR_SIZE,
-    PUBLIC_WS_MESSAGE_SIZE,
+    DEFAULT_FULL_KEY_BUDGET_BYTES, DEFAULT_FULL_WINDOW_SECS, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_PRE_HANDSHAKE_CONNECTIONS, DEFAULT_MAX_SESSIONS_PER_KEY,
+    DEFAULT_PRE_HANDSHAKE_PER_IP, DEFAULT_PUBLIC_BURST_BYTES, DEFAULT_PUBLIC_BURST_FRAMES,
+    DEFAULT_PUBLIC_KEY_BUDGET_BYTES, FRAME_HEADER_SIZE, FRAME_KIND_SIGNAL,
+    FRAME_KIND_TRANSFER_CHUNK, LAST_SEEN_WRITE_INTERVAL_MS, MAX_BINARY_FRAME_SIZE,
+    MAX_PENDING_PER_ROOM, MAX_PUBLIC_FRAME_SIZE, PAIR_SIZE, PUBLIC_WS_MESSAGE_SIZE,
 };
 
 /// 一条已经登记进某个 Room 的连接。
@@ -292,14 +297,15 @@ impl Bucket {
 /// 一个连接被限流拦下时，是**哪个桶**不够了。
 ///
 /// 分开是因为这两件事该说不同的话：`Connection` 是「你自己这一秒发太快了」，缓一下就好；
-/// `KeyBudget` 是「这台服务器发给你的那把公益钥匙，这一小时的额度用完了」——它不是这一帧
+/// `KeyBudget` 是「这台服务器发给你的那把钥匙，这一小时的额度用完了」——它不是这一帧
 /// 的问题，等到下一小时才有用。关闭码也跟着分开（`1008` / `4006`），客户端才能给出两句
 /// 不同的话，而不是一句笼统的「格式错误」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Limited {
     /// 这条连接自己的桶（按档位建的那个）
     Connection,
-    /// 公益档**这把钥匙**的滚动预算（拿同一把钥匙的别的会话也在里面）
+    /// **这把钥匙**的滚动预算（拿同一把钥匙的别的会话也在里面）。两档各有一份
+    /// （`PAIR_PUBLIC_KEY_BUDGET_BYTES` / `PAIR_FULL_KEY_BUDGET_BYTES`），没配那一档就没有
     KeyBudget,
 }
 
@@ -307,7 +313,8 @@ impl Limited {
     fn reason(self) -> &'static str {
         match self {
             Self::Connection => "rate limit exceeded",
-            Self::KeyBudget => "public key budget exhausted",
+            // 客户端只按关闭码翻译，这一串是给中继日志与 curl 看的
+            Self::KeyBudget => "key budget exhausted",
         }
     }
 
@@ -325,12 +332,13 @@ struct State {
     /// `ROOM_ID` → 双人会话
     rooms: HashMap<String, PairRoom>,
     buckets: HashMap<u64, Bucket>,
-    /// 公益档**每把钥匙**一份的滚动预算（钥匙序号 → 桶）。
+    /// **每把钥匙**一份的滚动预算（钥匙序号 → 桶）。两档共用这张表，因为钥匙序号本来就
+    /// 是全局唯一的（它是 `server_keys` 的下标）。
     ///
-    /// 这张表的大小天然等于「部署者配了几把公益钥匙」，所以既不需要 TTL 也不需要清理：
+    /// 这张表的大小天然等于「部署者配了几把钥匙」，所以既不需要 TTL 也不需要清理：
     /// 桶里的令牌本来就按时间补满，留着一把没人用的钥匙的桶与不留完全等价。
     /// 挂钥匙而不是挂连接 / 房间 / IP 的理由见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`。
-    public_key_budgets: HashMap<usize, Bucket>,
+    key_budgets: HashMap<usize, Bucket>,
     /// 握手层每个 IP 的**失败**计数（`IpKey` → 桶）。只记失败，成功一次都不算。
     ///
     /// 它同时管两件事：把「一个 IP 持续刷错密码」压到 0.5 次/秒，以及把日志限频
@@ -367,6 +375,8 @@ pub enum RoomRejection {
     Capacity,
     /// 这个 IP 的公益会话已经开满（`PAIR_MAX_PUBLIC_PER_IP`）→ 429
     PublicIpLimit,
+    /// 这把服务器钥匙已经开满了 `PAIR_MAX_SESSIONS_PER_KEY` 组会话 → 429
+    KeySessionLimit,
     /// 这个 Room 里已经堆了太多条「已放行、还没走进 `admit`」的连接
     /// （`MAX_PENDING_PER_ROOM`）→ 429
     TooManyPending,
@@ -442,19 +452,31 @@ pub struct RelayOptions {
     pub handshake_failures_per_minute: Option<f64>,
     /// 部署者那一档能同时承载的会话数（`PAIR_MAX_SESSIONS`）
     pub max_sessions: usize,
-    /// 能同时挂着的 TCP 连接数上限（含还没走完握手的那些）。
+    /// 能同时挂着**已放行**的 TCP 连接数上限。
     ///
     /// 名额（`max_sessions` / `max_public_sessions`）管的是**会话**，一个会话两条连接；
-    /// 这里管的是**任务与内存**。没有它的话「开任意多条 TCP」是不花钱的：`/health` 与握手
-    /// 都不过闸，每条连接占一个任务加一份 8 KiB 的请求头缓冲，直到把宿主机拖垮——那时
-    /// 部署者自己那一档也一起连不上。见 `Relay::try_connection_permit`。
+    /// 这里管的是**任务与内存**。它**只在请求头读完、鉴权与会话判定都过了之后**才领
+    /// （见 `server.rs` 的 `handle`）：放在读请求头之前的话，随便谁开几条不发请求头的
+    /// 连接就能把整池占住，让所有人拿到 503——那正是审计里那条「未鉴权占满许可池」。
+    /// 读请求头那一段另有一道更宽的闸（`max_pre_handshake_connections`）。
     pub max_connections: usize,
+    /// 读请求头那一段能同时挂几条连接（`DEFAULT_MAX_PRE_HANDSHAKE_CONNECTIONS`）
+    ///
+    /// 这一道**宽得多**，因为它只覆盖「TCP 接受了、请求头还没读完」那一段：它的职责是
+    /// 给任务与内存一个硬上界，不是「够不够用」。见 `Relay::try_pre_handshake_permit`。
+    pub max_pre_handshake_connections: usize,
+    /// 预握手阶段**同一个来源地址**最多几条（0 = 不限）
+    pub pre_handshake_per_ip: usize,
     /// 公益档能同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。0 = 公益档关闭
     pub max_public_sessions: usize,
+    /// 同一把服务器钥匙最多能同时开几组会话（`PAIR_MAX_SESSIONS_PER_KEY`）。0 = 不限
+    pub max_sessions_per_key: usize,
     /// 同一个 IP 最多几条公益连接（`PAIR_MAX_PUBLIC_PER_IP`）。0 = 不限
     pub max_public_per_ip: usize,
     /// 公益档的空闲回收窗口：多久没收到任何入站消息就断开。`None` = 不回收
     pub public_window: Option<Duration>,
+    /// 完全档的空闲回收窗口：判据与公益档那条一样。`None` = 不回收
+    pub full_window: Option<Duration>,
     /// 多久没有消息的连接可以被新连接顶替
     pub stale_after: Duration,
     /// `server.welcome` 里附带的 ICE 服务器（`PAIR_ICE_SERVERS`，可选，原样透传）
@@ -468,6 +490,13 @@ pub struct RelayOptions {
     /// `;` 分隔的多把；空表 = 谁都不认（会话层单测用得到，真部署走 `server.rs`，那里
     /// 完全档是**必填**的）。
     pub server_keys: Vec<ServerKey>,
+    /// 完全档**每把钥匙**的滚动预算（`PAIR_FULL_KEY_BUDGET_BYTES`，`None` = 不设这一层）
+    pub full_key_budget: Option<f64>,
+    /// 限时 TURN 凭据的共享密钥（`PAIR_TURN_SECRET`）。`None` = `PAIR_ICE_SERVERS` 原样透传，
+    /// 也就是用那份配置里写死的静态凭据（与旧版行为一致）
+    pub turn_secret: Option<String>,
+    /// 限时 TURN 凭据的有效期（`PAIR_TURN_TTL_SECS`）。只在配了 `turn_secret` 时有意义
+    pub turn_ttl: Duration,
     /// 信不信 `X-Forwarded-For`（`PAIR_TRUST_PROXY`）。只在前面有可信反代时打开
     pub trust_proxy: bool,
 }
@@ -487,13 +516,20 @@ impl Default for RelayOptions {
             handshake_failures_per_minute: Some(DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE),
             max_sessions: protocol::DEFAULT_MAX_SESSIONS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_pre_handshake_connections: DEFAULT_MAX_PRE_HANDSHAKE_CONNECTIONS,
+            pre_handshake_per_ip: DEFAULT_PRE_HANDSHAKE_PER_IP,
             max_public_sessions: protocol::DEFAULT_MAX_PUBLIC_SESSIONS,
+            max_sessions_per_key: DEFAULT_MAX_SESSIONS_PER_KEY,
             max_public_per_ip: protocol::DEFAULT_MAX_PUBLIC_PER_IP,
             public_window: Some(Duration::from_secs(protocol::DEFAULT_PUBLIC_WINDOW_SECS)),
+            full_window: Some(Duration::from_secs(DEFAULT_FULL_WINDOW_SECS)),
             stale_after: Duration::from_millis(protocol::DEFAULT_STALE_AFTER_MS),
             ice_servers: None,
             stun_port: None,
             server_keys: Vec::new(),
+            full_key_budget: Some(DEFAULT_FULL_KEY_BUDGET_BYTES),
+            turn_secret: None,
+            turn_ttl: Duration::from_secs(protocol::DEFAULT_TURN_TTL_SECS),
             trust_proxy: false,
         }
     }
@@ -503,24 +539,121 @@ pub struct Relay {
     options: RelayOptions,
     next_id: AtomicU64,
     state: Mutex<State>,
-    /// 能同时挂着的连接数（见 `RelayOptions::max_connections`）。
+    /// 能同时挂着**已放行**的连接数（见 `RelayOptions::max_connections`）。
     ///
     /// 放在会话层是为了让「准入闸」与「配置」只有一处映射：`server.rs` 拿它当闸门，别的
     /// 调用点（`main.rs`、集成测试）一个字都不用改。
     connections: Arc<Semaphore>,
+    /// 读请求头那一段的闸（见 `RelayOptions::max_pre_handshake_connections`）。
+    ///
+    /// 与 `connections` 分开是这件事的关键：把两者合成一道，未鉴权的连接就会占掉真实额度
+    /// ——那正是审计里 P0-1 那条。这一道只管「任务与内存」，所以它可以（也应该）很宽。
+    pre_handshake: Arc<Semaphore>,
+    /// 预握手阶段每个来源地址的计数（`IpKey` → 条数）。
+    ///
+    /// 用 `std::sync::Mutex` 而不是会话层那个 `tokio::sync::Mutex`：这一段里没有 `await`，
+    /// 而**归还**发生在 `Drop` 里——`Drop` 不能 await，拿异步锁就等于把「漏一个许可」变成
+    /// 一个迟早会发生的必然（那道闸会越来越窄，最后连诚实连接都进不来）。零就删键，别让
+    /// 扫描器留下一堆只用一次的小条目。
+    pre_handshake_per_ip: PreHandshakeCounts,
     /// 「连接数已达上限」那行日志上一次是什么时候打的（见 `CONNECTION_LIMIT_NOTICE_INTERVAL`）。
     connection_limit_notice: Mutex<Option<Instant>>,
+}
+
+/// 「读请求头」那一段的许可，由 [`Relay::try_pre_handshake_permit`] 签发。
+///
+/// 两个额度都在 `Drop` 里归还。这条路上有十来处提前返回（路径不对、协议不对、密码不对、
+/// 格式不对……），靠调用方逐个显式释放迟早会漏掉一处——而漏掉一处的后果是**永久**少一个
+/// 许可：那道闸会越来越窄，最后连诚实连接都进不来，且没有任何日志能看出原因。
+pub struct PreHandshakePermit {
+    /// 总闸那一个。它自己会在 `Drop` 里归还，这里只需要留住它
+    _permit: OwnedSemaphorePermit,
+    /// 这个来源地址那一份计数（`None` = 这一档不限每 IP）
+    per_ip: Option<(PreHandshakeCounts, IpKey)>,
+}
+
+/// 预握手阶段每个来源地址的计数表（见 `Relay::pre_handshake_per_ip`）。
+type PreHandshakeCounts = Arc<SyncMutex<HashMap<IpKey, usize>>>;
+
+impl Drop for PreHandshakePermit {
+    fn drop(&mut self) {
+        let Some((counts, ip)) = self.per_ip.take() else {
+            return;
+        };
+
+        let mut counts = counts.lock().unwrap_or_else(|error| error.into_inner());
+
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+
+            if *count == 0 {
+                counts.remove(&ip);
+            }
+        }
+    }
 }
 
 impl Relay {
     pub fn new(options: RelayOptions) -> Arc<Self> {
         Arc::new(Self {
             connections: Arc::new(Semaphore::new(options.max_connections)),
+            pre_handshake: Arc::new(Semaphore::new(options.max_pre_handshake_connections)),
+            pre_handshake_per_ip: Arc::new(SyncMutex::new(HashMap::new())),
             options,
             next_id: AtomicU64::new(1),
             state: Mutex::new(State::default()),
             connection_limit_notice: Mutex::new(None),
         })
+    }
+
+    /// 读请求头之前先拿一张「预握手」的许可。`None` = 该回 503（**不排队**）。
+    ///
+    /// 两道闸的顺序是这件事的要点：**先**过这一道（宽、短命、读完请求头就还），**后**过
+    /// `try_connection_permit`（窄、与真实容量同阶、持到连接结束）。反过来就是「随便谁开
+    /// 几条不发请求头的 TCP 就能把真实额度占满」——那时所有人（包括部署者自己）都拿到
+    /// 503，而攻击者什么都不用做。
+    pub fn try_pre_handshake_permit(&self, peer: IpAddr) -> Option<PreHandshakePermit> {
+        let permit = Arc::clone(&self.pre_handshake).try_acquire_owned().ok()?;
+        let limit = self.options.pre_handshake_per_ip;
+
+        if limit == 0 {
+            return Some(PreHandshakePermit {
+                _permit: permit,
+                per_ip: None,
+            });
+        }
+
+        let ip = IpKey::from_addr(peer);
+        let counts = Arc::clone(&self.pre_handshake_per_ip);
+
+        {
+            // 中毒只可能是「锁里面 panic 过」；计数本身没有不变量可破坏，恢复原值即可，
+            // 不值得把一次连接失败升级成整台服务器挂掉
+            let mut counts = counts.lock().unwrap_or_else(|error| error.into_inner());
+            let count = counts.entry(ip).or_default();
+
+            if *count >= limit {
+                // 满了：这一条连预握手池都不进（许可随之在这里归还）。等下一次再来。
+                return None;
+            }
+
+            *count += 1;
+        }
+
+        Some(PreHandshakePermit {
+            _permit: permit,
+            per_ip: Some((counts, ip)),
+        })
+    }
+
+    /// 能同时挂几条**已放行**的连接（横幅要如实印出来）
+    pub fn max_connections(&self) -> usize {
+        self.options.max_connections
+    }
+
+    /// 读请求头那一段能同时挂几条（横幅要如实印出来）
+    pub fn max_pre_handshake_connections(&self) -> usize {
+        self.options.max_pre_handshake_connections
     }
 
     /// 拿一张「能挂一条连接」的许可。`None` = 已经打到上限（调用方该回一个 503 并断开）。
@@ -543,11 +676,6 @@ impl Relay {
                 true
             }
         }
-    }
-
-    /// 最多能同时挂几条连接（横幅要如实印出来，见 `RelayOptions::max_connections`）
-    pub fn max_connections(&self) -> usize {
-        self.options.max_connections
     }
 
     pub fn trust_proxy(&self) -> bool {
@@ -611,11 +739,26 @@ impl Relay {
         }
     }
 
-    /// 公益档那把钥匙的预算桶形状（`None` = 这一层关着）。
-    fn key_budget_quota(&self) -> Option<Quota> {
-        self.options
-            .public_key_budget
-            .map(|budget| Quota::bytes_only(budget, budget / KEY_BUDGET_WINDOW_SECS))
+    /// 这一档**每把钥匙**的滚动预算桶形状（`None` = 这一档不设这一层）。
+    ///
+    /// 两档共用一份记账（`State::key_budgets`），只是额度各配各的：公益档是「一轮打洞」
+    /// 的量级（16 MiB），完全档要承载聊天 / 语音 / 附件分片，所以大得多（2 GiB）。没有这一层
+    /// 时，一把流出去的钥匙就是一条无限的中转链路——它的代价由部署者的带宽与账单承担。
+    fn key_budget_quota(&self, tier: Tier) -> Option<Quota> {
+        let budget = match tier {
+            Tier::Full => self.options.full_key_budget,
+            Tier::Public => self.options.public_key_budget,
+        }?;
+
+        Some(Quota::bytes_only(budget, budget / KEY_BUDGET_WINDOW_SECS))
+    }
+
+    /// 这一档的空闲回收窗口（`None` = 不回收）。判据两档一样，只是窗口各配各的。
+    fn window_for(&self, tier: Tier) -> Option<Duration> {
+        match tier {
+            Tier::Full => self.options.full_window,
+            Tier::Public => self.options.public_window,
+        }
     }
 
     /// 这次连接带来的服务器凭据算哪一档（R36 + 公益档）。`None` = 凭据不对，拒绝。
@@ -659,11 +802,31 @@ impl Relay {
     /// 顺手把 `username` / `credential` 字段从留下的小条目里摘掉（纵深防御）。STUN 本身
     /// 就不做鉴权（谁问都答，见 `stun.rs`），所以给公益档不新增任何暴露；不给的话公益档
     /// 只剩内网地址，跨网络一定打不通，那一档等于没有。
-    pub fn ice_servers_for(&self, host: Option<&str>, tier: Tier) -> Option<serde_json::Value> {
+    ///
+    /// 配了 `PAIR_TURN_SECRET` 时，`turn:` 条目的凭据换成**这一次连接现签的限时凭据**
+    /// （见 `sign_turn_credentials`）：那份静态凭据是长期有效的，一旦出现在任何一份日志或
+    /// 聊天记录里，别人就能一直拿它打（流量算部署者的）。客户端那边零改动——`iceServers`
+    /// 在协议里是无类型透传，它只是把这一份转交给 WebRTC。
+    pub fn ice_servers_for(
+        &self,
+        host: Option<&str>,
+        tier: Tier,
+        key_index: usize,
+    ) -> Option<serde_json::Value> {
         if let Some(servers) = &self.options.ice_servers {
+            let servers = match &self.options.turn_secret {
+                // 形状不对（不是数组）时退回原样：凭据该换没换成了一件事，把整份清单吃掉是
+                // 另一件更糟的事（客户端会一个 STUN 都拿不到，跨网络直接打不通）
+                Some(secret) => {
+                    sign_turn_credentials(servers, secret, self.options.turn_ttl, key_index)
+                        .unwrap_or_else(|| servers.clone())
+                }
+                None => servers.clone(),
+            };
+
             return match tier {
-                Tier::Full => Some(servers.clone()),
-                Tier::Public => stun_only(servers),
+                Tier::Full => Some(servers),
+                Tier::Public => stun_only(&servers),
             };
         }
 
@@ -719,6 +882,23 @@ impl Relay {
 
                 if used >= self.max_sessions_for(tier) {
                     return Err(RoomRejection::Capacity);
+                }
+
+                // 「一把钥匙一个人」：同一把钥匙同时能开几组会话。它挡的是「一把流出去的
+                // 钥匙把整档名额吃光」（撤销那把钥匙之前，最坏也就占掉这一个数）。
+                //
+                // 只挡**新建**：同一个会话的第二条连接走上面那一支，不受影响——两个人用
+                // 同一把钥匙进同一个 Room 时，这里数出来仍然只是一组。
+                if self.options.max_sessions_per_key > 0 {
+                    let used = state
+                        .rooms
+                        .values()
+                        .filter(|room| room.key_index == key_index)
+                        .count();
+
+                    if used >= self.options.max_sessions_per_key {
+                        return Err(RoomRejection::KeySessionLimit);
+                    }
                 }
 
                 // 同一个 IP 最多开几组公益会话。只挡新建：同一对用户的第二个人照旧进得来
@@ -869,7 +1049,7 @@ impl Relay {
                     protocol: protocol::PROTOCOL_VERSION,
                     peer_online,
                     limits: self.limits_for(tier),
-                    ice_servers: self.ice_servers_for(head.header("host"), tier),
+                    ice_servers: self.ice_servers_for(head.header("host"), tier, key_index),
                     tier,
                 }
                 .to_json();
@@ -900,13 +1080,15 @@ impl Relay {
             let _ = sink.close().await;
         });
 
-        // 公益档的空闲回收（见 `protocol.rs` 的 `DEFAULT_PUBLIC_WINDOW_SECS`）。
+        // 空闲回收（见 `protocol.rs` 的 `DEFAULT_PUBLIC_WINDOW_SECS` / `DEFAULT_FULL_WINDOW_SECS`）。
         //
         // 它是**空闲回收器**，不是「打洞截止时间」：中继看不到 DataChannel 有没有建立
         // 成功（信令是密文），所以任何「到点硬断」都会掐断已经直连成功、正在正常使用的
         // 会话——而中继一断，客户端是整条会话重启、直连也跟着重来。判据是「多久没收到
-        // **任何**入站消息」，诚实客户端每 60 秒发一次 WebSocket Ping。
-        let window = self.options.public_window.filter(|_| tier == Tier::Public);
+        // **任何**入站消息」，诚实客户端每 60 秒发一次 WebSocket Ping。两档都有它，只是
+        // 窗口不同：完全档那条要挡的是「对端机器睡眠 / 拔网线之后留下的僵尸连接」，那会让
+        // 一条什么都没在传的连接一直占着会话与连接额度。
+        let window = self.window_for(tier);
         let mut idle_deadline = window.map(|window| tokio::time::Instant::now() + window);
 
         loop {
@@ -926,8 +1108,8 @@ impl Relay {
                 _ = &mut ejected => break,
                 _ = idle => {
                     let _ = sender.try_send(Message::Close(Some(close_frame(
-                        close_code::PUBLIC_WINDOW,
-                        "public window idle",
+                        close_code::IDLE,
+                        "idle timeout",
                     ))));
 
                     break;
@@ -1035,14 +1217,15 @@ impl Relay {
                     {
                         // 「这把钥匙的预算用完了」和「你自己发太快」是两件事，而关闭帧里的
                         // 原因客户端只按关闭码翻译、看不到。这里替部署者记一行：不然
-                        // 「我的公益额度突然没了」在日志里只剩一条「会话已释放」，谁也说不清
+                        // 「我的额度突然没了」在日志里只剩一条「会话已释放」，谁也说不清
                         // 是哪把钥匙、更看不出是不是有人在夹带。
                         if limit == Limited::KeyBudget {
                             println!(
-                                "[{}] 公益档第 {} 把钥匙的预算已用完（device {device_id}）：\
+                                "[{}] {}第 {} 把钥匙的预算已用完（device {device_id}）：\
                                  这条连接被关掉；拿同一把钥匙的别的会话也会跟着被拒，\
                                  要等回填（每小时一份额度）",
                                 room_fingerprint(&room_id),
+                                tier_text(tier),
                                 key_index + 1
                             );
                         }
@@ -1324,7 +1507,7 @@ impl Relay {
         chunks: f64,
         bytes: f64,
     ) -> Option<Limited> {
-        let budget = self.key_budget_quota();
+        let budget = self.key_budget_quota(tier);
         let mut state = self.state.lock().await;
         let now = Instant::now();
 
@@ -1338,21 +1521,20 @@ impl Relay {
             return Some(Limited::Connection);
         }
 
-        // 公益档再叠一道「这把钥匙的预算」；没配这一层（`None`）到这儿就是放行
-        if tier == Tier::Public {
-            if let Some(quota) = budget {
-                let budget = state
-                    .public_key_budgets
-                    .entry(key_index)
-                    .or_insert_with(|| Bucket::new(quota, now));
+        // 再叠一道「这把钥匙的预算」（额度按档位取，见 `key_budget_quota`）；
+        // 这一档没配这一层（`None`）到这儿就是放行
+        if let Some(quota) = budget {
+            let budget = state
+                .key_budgets
+                .entry(key_index)
+                .or_insert_with(|| Bucket::new(quota, now));
 
-                if !budget.take(now, frames, chunks, bytes) {
-                    // 这一帧不会被转发出去，那把钥匙上就不该留这笔账：这张表不随连接消失，
-                    // 欠账会一份份攒起来（见 `Bucket::refund`）
-                    budget.refund(frames, chunks, bytes);
+            if !budget.take(now, frames, chunks, bytes) {
+                // 这一帧不会被转发出去，那把钥匙上就不该留这笔账：这张表不随连接消失，
+                // 欠账会一份份攒起来（见 `Bucket::refund`）
+                budget.refund(frames, chunks, bytes);
 
-                    return Some(Limited::KeyBudget);
-                }
+                return Some(Limited::KeyBudget);
             }
         }
 
@@ -1583,6 +1765,93 @@ fn urls_of(value: &serde_json::Value) -> Option<Vec<String>> {
     }
 }
 
+/// 日志里那一档怎么称呼（`Tier::as_str` 是给协议用的 `full` / `public`，人读的话另写一套）。
+fn tier_text(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Full => "完全档",
+        Tier::Public => "公益档",
+    }
+}
+
+/// 把一份 `iceServers` 里的 `turn:` 条目换成**限时凭据**（coturn 的 REST API 形状）。
+///
+/// `username` 是 `<过期 unix 秒>:<标识>`，`credential` 是
+/// `base64(HMAC-SHA1(共享密钥, username))`。coturn 只在**新建分配**时校验时间戳与签名，
+/// 会话内缓存 hmackey，所以同一份凭据在整个会话里一直有效——这正是想要的：TTL 只要长过
+/// 会话寿命就不会中途失效（见 `DEFAULT_TURN_TTL_SECS`）。
+///
+/// 标识用「第几把钥匙」（1 起）：它不带任何秘密，只是让部署者在 coturn 的日志里看得出
+/// 「这份凭据是谁在用」。**不碰 `stun:` 条目**（STUN 本来就不鉴权，给它加凭据没有意义，
+/// 还会把一份干净的探针配置搞得看不懂）。
+///
+/// 返回 `None` 只在「`servers` 不是数组」时——调用方据此退回原样透传：凭据该换没换成是一
+/// 件事，把整份清单吃掉是另一件更糟的事（客户端会一个 STUN 都拿不到，跨网络直接打不通）。
+fn sign_turn_credentials(
+    servers: &serde_json::Value,
+    secret: &str,
+    ttl: Duration,
+    key_index: usize,
+) -> Option<serde_json::Value> {
+    let entries = servers.as_array()?;
+    let expire = unix_now() + ttl.as_secs();
+    let username = format!("{expire}:{}", key_index + 1);
+    let credential = turn_credential(secret, &username)?;
+    let mut signed = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let urls = entry
+            .get("urls")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let carries_turn = urls_of(&urls).is_some_and(|urls| {
+            urls.iter()
+                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+        });
+
+        if !carries_turn {
+            signed.push(entry.clone());
+
+            continue;
+        }
+
+        let mut object = entry.as_object().cloned().unwrap_or_default();
+
+        object.insert("urls".to_string(), urls);
+        object.insert(
+            "username".to_string(),
+            serde_json::Value::String(username.clone()),
+        );
+        object.insert(
+            "credential".to_string(),
+            serde_json::Value::String(credential.clone()),
+        );
+
+        signed.push(serde_json::Value::Object(object));
+    }
+
+    Some(serde_json::Value::Array(signed))
+}
+
+/// coturn REST API 的那一份凭据：`base64(HMAC-SHA1(共享密钥, username))`。
+///
+/// 标准 base64（带 `+/=`），与 coturn 的 `--use-auth-secret` 实现一致。
+fn turn_credential(secret: &str, username: &str) -> Option<String> {
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).ok()?;
+
+    mac.update(username.as_bytes());
+
+    Some(BASE64.encode(mac.finalize().into_bytes()))
+}
+
+/// 当前 unix 秒。时钟被拨到 1970 之前（不该发生）时按 0 算：凭据会立刻过期，而不是算出一
+/// 个荒唐的远期值。
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
 fn close_frame(code: u16, reason: &str) -> CloseFrame {
     CloseFrame {
         code: CloseCode::from(code),
@@ -1792,6 +2061,20 @@ mod tests {
         public_burst_bytes: Option<f64>,
         /// 公益档每把钥匙的滚动预算（`None` = 用缺省，也就是真的开着）
         public_key_budget: Option<f64>,
+        /// 完全档每把钥匙的滚动预算（`None` = 用缺省 2 GiB；`Some` 里 `0` = 关掉这一层）
+        full_key_budget: Option<f64>,
+        /// 完全档的空闲回收窗口（`None` = 用缺省 300 秒）
+        full_window: Option<Option<Duration>>,
+        /// 同一把钥匙的会话上限（`None` = 用缺省 4）
+        max_sessions_per_key: Option<usize>,
+        /// 预握手总闸（`None` = 用缺省 512）
+        max_pre_handshake_connections: Option<usize>,
+        /// 预握手每 IP（`None` = 用缺省 64）
+        pre_handshake_per_ip: Option<usize>,
+        /// 限时 TURN 凭据的共享密钥（`None` = 原样透传）
+        turn_secret: Option<&'static str>,
+        /// 限时 TURN 凭据的有效期（`None` = 用缺省 24 小时）
+        turn_ttl: Option<Duration>,
         /// 握手层每 IP 每分钟的失败次数（`None` = 用缺省的那个 30）
         handshake_failures_per_minute: Option<f64>,
         stale_after: Duration,
@@ -1817,6 +2100,23 @@ mod tests {
                 .public_burst_bytes
                 .unwrap_or(defaults.public_burst_bytes),
             public_key_budget: options.public_key_budget.or(defaults.public_key_budget),
+            // `Some(0.0)` = 关掉这一层（与 `PAIR_FULL_KEY_BUDGET_BYTES=0` 同义）：
+            // 容量 0 的桶会把每一帧都拦下，那不是「关掉」而是「什么都发不出去」
+            full_key_budget: match options.full_key_budget {
+                Some(budget) => (budget > 0.0).then_some(budget),
+                None => defaults.full_key_budget,
+            },
+            max_sessions_per_key: options
+                .max_sessions_per_key
+                .unwrap_or(defaults.max_sessions_per_key),
+            max_pre_handshake_connections: options
+                .max_pre_handshake_connections
+                .unwrap_or(defaults.max_pre_handshake_connections),
+            pre_handshake_per_ip: options
+                .pre_handshake_per_ip
+                .unwrap_or(defaults.pre_handshake_per_ip),
+            turn_secret: options.turn_secret.map(str::to_string),
+            turn_ttl: options.turn_ttl.unwrap_or(defaults.turn_ttl),
             handshake_failures_per_minute: options
                 .handshake_failures_per_minute
                 .or(defaults.handshake_failures_per_minute),
@@ -1825,6 +2125,7 @@ mod tests {
             max_public_sessions: options.max_public_sessions,
             max_public_per_ip: options.max_public_per_ip,
             public_window: options.public_window,
+            full_window: options.full_window.unwrap_or(defaults.full_window),
             stale_after: options.stale_after,
             ice_servers: options.ice_servers,
             stun_port: options.stun_port,
@@ -3323,6 +3624,299 @@ mod tests {
         );
     }
 
+    /// 预握手闸：宽、有硬上界，而且两份计数（总量 + 每个来源）都在 `Drop` 里还回去。
+    ///
+    /// 它管的是「读请求头那一段」，所以**不能**是真实额度那道闸（见 `handle` 里的注释）；
+    /// 这一条把它的三条性质都钉住：每个来源单独封顶、总量封顶、归还之后表要自己缩回去。
+    #[test]
+    fn the_pre_handshake_gate_is_bounded_and_gives_everything_back() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            // 用例只关心形状：3 个总量、2 个每 IP（真实部署里分别是 512 与 64）
+            max_pre_handshake_connections: Some(3),
+            pre_handshake_per_ip: Some(2),
+            ..Options::default()
+        });
+        let first: IpAddr = "203.0.113.7".parse().unwrap();
+        let second: IpAddr = "203.0.113.8".parse().unwrap();
+
+        let a = relay.try_pre_handshake_permit(first).expect("第 1 条");
+        let b = relay.try_pre_handshake_permit(first).expect("第 2 条");
+
+        // 同一个来源别想把池子吃光
+        assert!(relay.try_pre_handshake_permit(first).is_none());
+
+        // 总量还剩 1：另一个来源照进
+        let c = relay.try_pre_handshake_permit(second).expect("另一个来源");
+
+        assert!(relay.try_pre_handshake_permit(second).is_none(), "总量满了");
+
+        // 还一个：总量与那个来源的计数一起还
+        drop(a);
+        assert!(
+            relay.try_pre_handshake_permit(first).is_some(),
+            "还回去之后要能再进"
+        );
+
+        drop(b);
+        drop(c);
+
+        // 两份计数都归零，而且表不能留着一堆零值的条目（扫描器会带来一大堆只用一次的地址）
+        assert!(
+            relay.pre_handshake_per_ip.lock().unwrap().is_empty(),
+            "计数归零要删键"
+        );
+
+        // `0` = 不按来源限（只留总量那一道）
+        let unlimited = relay_with(Options {
+            max_sessions: 20,
+            max_pre_handshake_connections: Some(3),
+            pre_handshake_per_ip: Some(0),
+            ..Options::default()
+        });
+
+        // 三张都**留住**（临时值会在语句末尾就归还，那样测的就不是这道闸了）
+        let held: Vec<_> = (0..3)
+            .map(|_| unlimited.try_pre_handshake_permit(first).expect("总量还够"))
+            .collect();
+
+        assert!(
+            unlimited.try_pre_handshake_permit(first).is_none(),
+            "总量仍然要封顶"
+        );
+
+        drop(held);
+    }
+
+    /// 同一把钥匙最多开几组会话（`PAIR_MAX_SESSIONS_PER_KEY`）。
+    ///
+    /// 它挡的是「一把流出去的钥匙把整档名额吃光」，而不是「同一个会话的第二个人」：同一个
+    /// Room 的第二条连接走的是另一条分支，数出来的仍然只是一组。
+    #[tokio::test]
+    async fn one_key_can_only_open_so_many_sessions() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            max_sessions_per_key: Some(2),
+            ..Options::default()
+        });
+        let (a_tx, _a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, _b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (c_tx, _c_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let full = key_index_for(&relay, Tier::Full);
+
+        join_as(&relay, ROOM_A, "token-a", "a1", &a_tx, Tier::Full, ip(1)).await;
+        // 同一个会话的第二个人：不受这把钥匙的会话数影响
+        join_as(&relay, ROOM_A, "token-a", "a2", &b_tx, Tier::Full, ip(1)).await;
+        // 第 2 组：正好用满
+        join_as(&relay, ROOM_B, "token-b", "b1", &c_tx, Tier::Full, ip(1)).await;
+
+        assert_eq!(
+            relay
+                .reserve(
+                    ROOM_C,
+                    auth::auth_verifier("token-c"),
+                    Tier::Full,
+                    full,
+                    ip(1)
+                )
+                .await
+                .unwrap_err(),
+            RoomRejection::KeySessionLimit
+        );
+    }
+
+    /// 完全档也有「每把钥匙的滚动预算」，而且与公益档**各记各的**（桶按钥匙序号分开）。
+    #[tokio::test]
+    async fn the_full_tier_has_its_own_key_budget() {
+        const SECOND_FULL_KEY: &str = "relay-unit-tests-second-full-key-01";
+
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            full_key_budget: Some(1000.0),
+            extra_keys: vec![(Tier::Full, SECOND_FULL_KEY)],
+            ..Options::default()
+        });
+        let (a_tx, _a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (id, _, _) = join_ok(&relay, ROOM_A, "token-a", "a", &a_tx).await;
+        let first = key_index_for(&relay, Tier::Full);
+        let second = relay
+            .options
+            .server_keys
+            .iter()
+            .position(|key| key.verifier == crate::auth::server_verifier(SECOND_FULL_KEY))
+            .expect("第二把完全钥匙");
+
+        // 1000 字节的预算：一帧 900 字节过，再来一帧就撞上
+        assert_eq!(
+            relay.allow(id, Tier::Full, first, 1.0, 0.0, 900.0).await,
+            None
+        );
+        assert_eq!(
+            relay.allow(id, Tier::Full, first, 1.0, 0.0, 900.0).await,
+            Some(Limited::KeyBudget)
+        );
+
+        // 另一把钥匙有自己的桶（「一把钥匙一个人」的另一面：额度不共享）
+        assert_eq!(
+            relay.allow(id, Tier::Full, second, 1.0, 0.0, 900.0).await,
+            None
+        );
+
+        // `0` = 不设这一层：回到「只按连接自己的额度算」
+        let unlimited = relay_with(Options {
+            max_sessions: 20,
+            full_key_budget: Some(0.0),
+            ..Options::default()
+        });
+        let (b_tx, _b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_id, _, _) = join_ok(&unlimited, ROOM_A, "token-a", "a", &b_tx).await;
+
+        assert_eq!(
+            unlimited
+                .allow(b_id, Tier::Full, first, 1.0, 0.0, 900.0)
+                .await,
+            None
+        );
+    }
+
+    /// 两档各有自己的空闲窗口：回收时按档位取（公益档默认 180 秒、完全档默认 300 秒）
+    #[test]
+    fn each_tier_has_its_own_idle_window() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            public_window: Some(Duration::from_secs(180)),
+            full_window: Some(Some(Duration::from_secs(300))),
+            ..Options::default()
+        });
+
+        assert_eq!(relay.window_for(Tier::Full), Some(Duration::from_secs(300)));
+        assert_eq!(
+            relay.window_for(Tier::Public),
+            Some(Duration::from_secs(180))
+        );
+
+        // `0`（也就是 `None`）= 不回收，两档各算各的
+        let off = relay_with(Options {
+            max_sessions: 20,
+            public_window: None,
+            full_window: Some(None),
+            ..Options::default()
+        });
+
+        assert_eq!(off.window_for(Tier::Full), None);
+        assert_eq!(off.window_for(Tier::Public), None);
+    }
+
+    /// 限时 TURN 凭据：`base64(HMAC-SHA1(secret, "<过期秒>:<标识>"))`。
+    ///
+    /// 算法本身用 RFC 2202 的向量钉住——签错了在部署侧只表现为「打洞一直失败」，和凭据这件
+    /// 事完全联系不起来，所以这里必须钉在标准向量上，而不是钉在「我自己算的另一遍」上。
+    #[test]
+    fn the_turn_credential_matches_rfc_2202() {
+        // 向量 1：key = 20 个 0x0b，data = "Hi There"
+        assert_eq!(
+            turn_credential("\u{b}".repeat(20).as_str(), "Hi There").unwrap(),
+            "thcxhlUFcmTii8C2+zeMjvFGvgA="
+        );
+
+        // 向量 2：key = "Jefe"
+        assert_eq!(
+            turn_credential("Jefe", "what do ya want for nothing?").unwrap(),
+            "7/zfauXrL6LSdBbV8YTfnCWafHk="
+        );
+    }
+
+    /// 只给 `turn:` 条目现签凭据：`stun:` 条目原样留着（STUN 不鉴权，给它加凭据只会让一份
+    /// 干净的探针配置变得看不懂）。
+    #[test]
+    fn signing_turn_credentials_leaves_stun_entries_alone() {
+        let servers = serde_json::json!([
+            { "urls": ["stun:cat.example.com:3478"] },
+            {
+                "urls": ["turn:cat.example.com:3478"],
+                "username": "static-user",
+                "credential": "static-pass"
+            },
+            { "urls": ["turns:cat.example.com:5349?transport=tcp"] }
+        ]);
+        let signed =
+            sign_turn_credentials(&servers, "shared-secret", Duration::from_secs(3600), 0).unwrap();
+        let entries = signed.as_array().unwrap();
+
+        assert_eq!(
+            entries[0],
+            serde_json::json!({ "urls": ["stun:cat.example.com:3478"] })
+        );
+
+        for entry in &entries[1..] {
+            let username = entry["username"].as_str().unwrap();
+            let (expire, identity) = username.split_once(':').expect("形状要是 {过期}:{标识}");
+
+            assert_eq!(identity, "1", "标识是第几把钥匙（1 起）");
+            assert_eq!(
+                entry["credential"].as_str().unwrap(),
+                turn_credential("shared-secret", username).unwrap()
+            );
+
+            let expire: u64 = expire.parse().unwrap();
+            let now = unix_now();
+
+            assert!(
+                expire > now + 3000 && expire <= now + 3600,
+                "过期时刻要落在 TTL 里，实际 {expire}"
+            );
+        }
+
+        // 第 2 把钥匙签出来的标识不一样（同一份密钥、同一份清单，但看得出是谁在用）
+        let second =
+            sign_turn_credentials(&servers, "shared-secret", Duration::from_secs(3600), 1).unwrap();
+
+        assert!(second[1]["username"].as_str().unwrap().ends_with(":2"));
+    }
+
+    /// 配了共享密钥之后，welcome 里那份**静态**凭据被换成限时凭据；公益档仍然只拿 `stun:`。
+    #[test]
+    fn a_turn_secret_replaces_the_static_credential() {
+        let servers = serde_json::json!([
+            { "urls": ["stun:cat.example.com:3478"] },
+            {
+                "urls": ["turn:cat.example.com:3478"],
+                "username": "static-user",
+                "credential": "static-pass"
+            }
+        ]);
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            ice_servers: Some(servers),
+            turn_secret: Some("unit-test-turn-shared-secret"),
+            public_tier: true,
+            ..Options::default()
+        });
+        let advertisement = relay
+            .ice_servers_for(Some("cat.example.com:8080"), Tier::Full, 0)
+            .unwrap();
+
+        assert_eq!(
+            advertisement[0],
+            serde_json::json!({ "urls": ["stun:cat.example.com:3478"] })
+        );
+        assert_ne!(advertisement[1]["credential"], "static-pass");
+        assert_eq!(
+            advertisement[1]["credential"].as_str().unwrap(),
+            turn_credential(
+                "unit-test-turn-shared-secret",
+                advertisement[1]["username"].as_str().unwrap()
+            )
+            .unwrap()
+        );
+
+        // 公益档那一条路不变：限时凭据也是 `turn:`，一样不给
+        assert_eq!(
+            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Public, 0),
+            Some(serde_json::json!([{ "urls": ["stun:cat.example.com:3478"] }]))
+        );
+    }
+
     /// 公益档只拿 `stun:`：`turn:` 条目与凭据一个都不给
     #[test]
     fn the_public_tier_only_gets_stun_servers() {
@@ -3343,11 +3937,11 @@ mod tests {
         });
 
         assert_eq!(
-            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Full),
+            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Full, 0),
             Some(servers)
         );
         assert_eq!(
-            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Public),
+            relay.ice_servers_for(Some("cat.example.com:8080"), Tier::Public, 0),
             Some(serde_json::json!([{ "urls": ["stun:cat.example.com:3478"] }]))
         );
 
@@ -3364,7 +3958,7 @@ mod tests {
         });
 
         assert!(turn_only
-            .ice_servers_for(Some("cat.example.com:8080"), Tier::Public)
+            .ice_servers_for(Some("cat.example.com:8080"), Tier::Public, 0)
             .is_none());
 
         // 内置 STUN 那一条路两档一样（STUN 本来就不鉴权）
@@ -3376,7 +3970,7 @@ mod tests {
         });
 
         assert_eq!(
-            builtin.ice_servers_for(Some("cat.example.com:8080"), Tier::Public),
+            builtin.ice_servers_for(Some("cat.example.com:8080"), Tier::Public, 0),
             Some(serde_json::json!([{ "urls": ["stun:cat.example.com:3479"] }]))
         );
     }

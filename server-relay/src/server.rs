@@ -11,19 +11,31 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::auth;
 use crate::http::{read_request_head, write_response, write_response_with_headers};
 use crate::protocol::{
-    is_valid_device_id, is_valid_room_id, Limits, Tier, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
-    DEFAULT_MAX_BYTES_PER_SECOND, DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND,
-    DEFAULT_MAX_PUBLIC_PER_IP, DEFAULT_MAX_PUBLIC_SESSIONS, DEFAULT_MAX_SESSIONS,
-    DEFAULT_PUBLIC_BURST_BYTES, DEFAULT_PUBLIC_BURST_FRAMES, DEFAULT_PUBLIC_KEY_BUDGET_BYTES,
-    DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND, DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND,
-    DEFAULT_PUBLIC_WINDOW_SECS, DEFAULT_STALE_AFTER_MS, HEADER_AUTHORIZATION, HEADER_CLIENT,
-    HEADER_PROTOCOL, HEADER_ROOM, HEADER_SERVER, HEADER_TIER, HEALTH_PATH,
-    MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, WEBSOCKET_VERSION, WS_PATH,
+    is_valid_device_id, is_valid_room_id, Limits, Tier, DEFAULT_FULL_KEY_BUDGET_BYTES,
+    DEFAULT_FULL_WINDOW_SECS, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE, DEFAULT_MAX_BYTES_PER_SECOND,
+    DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND, DEFAULT_MAX_PUBLIC_PER_IP,
+    DEFAULT_MAX_PUBLIC_SESSIONS, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSIONS_PER_KEY,
+    DEFAULT_PRE_HANDSHAKE_PER_IP, DEFAULT_PUBLIC_BURST_BYTES, DEFAULT_PUBLIC_BURST_FRAMES,
+    DEFAULT_PUBLIC_KEY_BUDGET_BYTES, DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+    DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND, DEFAULT_PUBLIC_WINDOW_SECS, DEFAULT_STALE_AFTER_MS,
+    DEFAULT_TURN_TTL_SECS, HEADER_AUTHORIZATION, HEADER_CLIENT, HEADER_PROTOCOL, HEADER_ROOM,
+    HEADER_SERVER, HEADER_TIER, HEALTH_PATH, MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION,
+    TIER_HEADER_VALUE, WEBSOCKET_VERSION, WS_PATH,
 };
 use crate::relay::{self, IpKey, Relay, RelayOptions, RoomRejection, ServerKey};
 
-/// 请求头必须在这个时间内读完：只发一个连接、永远不发请求头的客户端不该占住一个任务
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 请求头必须在这个时间内读完：只发一个连接、永远不发请求头的客户端不该占住一个任务。
+///
+/// 它同时决定「预握手那道闸被一条什么都不发的连接占住多久」。5 秒对真实客户端是很宽的
+/// 门槛：请求头加起来几百字节，而且域名模式下这一跳是前置反代（Caddy 先把客户端的请求收完
+/// 才转发过来，这里看到的几乎是瞬间到达的一整份请求）。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 预握手阶段（读请求头）的连接余量（见 `Config::relay_options`）。
+///
+/// 比 `HANDSHAKE_HEADROOM` 大一个数量级，而这是有意的：两道闸管的是**不同的东西**，见
+/// `Relay::try_pre_handshake_permit`。
+const PRE_HANDSHAKE_HEADROOM: usize = 512;
 
 /// 一个会话两条连接之外，还允许多少条「正在握手」的连接（见 `Config::max_connections`）。
 const HANDSHAKE_HEADROOM: usize = 32;
@@ -77,10 +89,21 @@ pub struct Config {
     /// 公益档同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。与 `max_sessions` 分开算：
     /// 公益档占不到部署者自己的名额
     pub max_public_sessions: usize,
+    /// 同一把服务器钥匙最多能同时开几组会话（`PAIR_MAX_SESSIONS_PER_KEY`，0 = 不限）。
+    /// 两档共用这一条：一把流出去的钥匙不该能把整档名额吃光
+    pub max_sessions_per_key: usize,
     /// 同一个 IP 最多几组公益会话（`PAIR_MAX_PUBLIC_PER_IP`）。0 = 不限
     pub max_public_per_ip: usize,
     /// 公益档的空闲回收窗口。`None` = 不回收
     pub public_window: Option<Duration>,
+    /// 完全档的空闲回收窗口（`PAIR_FULL_WINDOW_SECS`）。`None` = 不回收
+    pub full_window: Option<Duration>,
+    /// 完全档**每把钥匙**的滚动预算（`PAIR_FULL_KEY_BUDGET_BYTES`）。`None` = 不设这一层
+    pub full_key_budget: Option<f64>,
+    /// 限时 TURN 凭据的共享密钥（`PAIR_TURN_SECRET`）。`None` = 原样透传 `PAIR_ICE_SERVERS`
+    pub turn_secret: Option<String>,
+    /// 限时 TURN 凭据的有效期（`PAIR_TURN_TTL_SECS`）
+    pub turn_ttl: Duration,
     /// 信不信 `X-Forwarded-For`（`PAIR_TRUST_PROXY`）：只有前面站着可信反代时才打开
     pub trust_proxy: bool,
 }
@@ -171,9 +194,48 @@ fn parse_optional_f64(name: &str, text: &str) -> Result<Option<f64>, String> {
         .ok_or_else(|| format!("{name} 必须是非负数字（0 表示关掉这一项限额），实际是 {text:?}"))
 }
 
+/// 读限时 TURN 凭据的共享密钥（`PAIR_TURN_SECRET`，可选）。
+///
+/// 它和 coturn 的 `--static-auth-secret` 是**同一个值**：拿不到它的人只能请中继现签一份
+/// 限时凭据，而那份凭据过期就废。留空 = 不启用限时凭据（回到「`PAIR_ICE_SERVERS` 里那份
+/// 静态凭据原样透传」）。
+fn read_turn_secret() -> Result<Option<String>, String> {
+    match env_non_empty("PAIR_TURN_SECRET") {
+        None => Ok(None),
+        Some(secret) => parse_turn_secret("PAIR_TURN_SECRET", &secret).map(Some),
+    }
+}
+
+/// [`read_turn_secret`] 的纯函数内核：只判长度。
+///
+/// 抽出来与 `parse_passwords` 同一个理由：环境变量在测试里是进程全局的，直接测
+/// `load_config` 会互相干扰。报错里**不回显密钥**——它是秘密，日志里出现一次就等于泄露。
+fn parse_turn_secret(name: &str, text: &str) -> Result<String, String> {
+    let secret = text.trim();
+
+    if secret.chars().count() < MIN_SERVER_PASSWORD_LENGTH {
+        return Err(format!(
+            "{name} 至少要有 {MIN_SERVER_PASSWORD_LENGTH} 个字符：它和 coturn 的 \
+             static-auth-secret 是同一个值，猜中它等于「谁都能拿这台服务器打 TURN 流量」。\
+             用 `openssl rand -hex 32` 生成一个"
+        ));
+    }
+
+    Ok(secret.to_string())
+}
+
 /// 一个会话两条连接之外，再留多少条握手余量（见 `Config::max_connections`）。
 fn derived_max_connections(max_sessions: usize, max_public_sessions: usize) -> usize {
     2 * (max_sessions + max_public_sessions) + HANDSHAKE_HEADROOM
+}
+
+/// 读请求头那一段能同时挂几条（见 `RelayOptions::max_pre_handshake_connections`）。
+///
+/// 它**不是**容量：与名额无关地给一截很宽的余量，职责是「别让一堆半开的连接把任务与内存
+/// 吃光」。放在这里与 `derived_max_connections` 并排，是因为部署者需要的是「这两道闸都从
+/// 名额推出来」这一条不变量——真实部署里没有一个环境变量可以把它改小成「比容量还紧」。
+fn derived_pre_handshake_connections(max_sessions: usize, max_public_sessions: usize) -> usize {
+    2 * (max_sessions + max_public_sessions) + PRE_HANDSHAKE_HEADROOM
 }
 
 /// 读一个「一把或多把密码」的环境变量（`;` 分隔）。
@@ -348,6 +410,22 @@ pub fn load_config() -> Result<Config, String> {
 
     let max_sessions = env_positive_usize("PAIR_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?;
 
+    // 「一把钥匙一个人」的硬上界（0 = 不限）。两档共用它：一把流出去的钥匙不该能把整档
+    // 名额吃光。0 是正当配置（有人就是想让同一把钥匙开好几组），所以走 env_u64。
+    let max_sessions_per_key = env_u64(
+        "PAIR_MAX_SESSIONS_PER_KEY",
+        DEFAULT_MAX_SESSIONS_PER_KEY as u64,
+    )? as usize;
+
+    let full_window_secs = env_u64("PAIR_FULL_WINDOW_SECS", DEFAULT_FULL_WINDOW_SECS)?;
+
+    // 完全档**每把钥匙**的滚动预算（0 = 不设这一层）。与公益档那一份同一个记账口径，
+    // 只是额度大得多（那一档要承载聊天 / 语音 / 附件分片）。
+    let full_key_budget =
+        env_optional_f64("PAIR_FULL_KEY_BUDGET_BYTES", DEFAULT_FULL_KEY_BUDGET_BYTES)?;
+
+    let turn_secret = read_turn_secret()?;
+
     Ok(Config {
         limits,
         max_sessions,
@@ -376,6 +454,17 @@ pub fn load_config() -> Result<Config, String> {
         max_public_per_ip: env_u64("PAIR_MAX_PUBLIC_PER_IP", DEFAULT_MAX_PUBLIC_PER_IP as u64)?
             as usize,
         public_window: (public_window_secs > 0).then(|| Duration::from_secs(public_window_secs)),
+        full_window: (full_window_secs > 0).then(|| Duration::from_secs(full_window_secs)),
+        full_key_budget,
+        turn_secret,
+        // `0` 在这里不给「关掉」的含义：它只会让每份凭据一签发就过期（P2P 直接打不通，
+        // 而现象是「打洞失败」，跟这条配置看起来毫无关系）。要关掉限时凭据就把
+        // PAIR_TURN_SECRET 留空，别把 TTL 写成 0。
+        turn_ttl: Duration::from_secs(env_positive_usize(
+            "PAIR_TURN_TTL_SECS",
+            DEFAULT_TURN_TTL_SECS as usize,
+        )? as u64),
+        max_sessions_per_key,
         trust_proxy: env_bool("PAIR_TRUST_PROXY", false)?,
     })
 }
@@ -402,13 +491,26 @@ impl Config {
             // `load_config`）是为了让它**跟着名额走**——`max_public_sessions` 在配置阶段
             // 还可能被改动，写死一次就可能小于「按配置本来就该跑得起来的量」。
             max_connections: derived_max_connections(self.max_sessions, self.max_public_sessions),
+            // 预握手那道闸宽得多：它只管「任务 + 请求头缓冲」，见
+            // `Relay::try_pre_handshake_permit`。宽到「按配置本来就该跑得起来的量」永远
+            // 塞不满它，所以部署者不需要为它写配置
+            max_pre_handshake_connections: derived_pre_handshake_connections(
+                self.max_sessions,
+                self.max_public_sessions,
+            ),
+            pre_handshake_per_ip: DEFAULT_PRE_HANDSHAKE_PER_IP,
             max_public_sessions: self.max_public_sessions,
+            max_sessions_per_key: self.max_sessions_per_key,
             max_public_per_ip: self.max_public_per_ip,
             public_window: self.public_window,
+            full_window: self.full_window,
             stale_after: self.stale_after,
             ice_servers: self.ice_servers.clone(),
             stun_port,
             server_keys: self.server_keys.clone(),
+            full_key_budget: self.full_key_budget,
+            turn_secret: self.turn_secret.clone(),
+            turn_ttl: self.turn_ttl,
             trust_proxy: self.trust_proxy,
         }
     }
@@ -446,15 +548,21 @@ pub async fn serve(listener: TcpListener, relay: Arc<Relay>) {
 }
 
 async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> Result<(), String> {
-    // 准入闸（`Config::max_connections`）。没有它的话「开任意多条 TCP」是不花钱的：
-    // `/health` 与握手都不过闸，每条连接占一个任务加一份 8 KiB 的请求头缓冲，直到把
-    // 宿主机拖垮——那时部署者自己那一档也一起连不上。
+    // **预握手闸**（`RelayOptions::max_pre_handshake_connections`）。没有它的话「读请求头」
+    // 这件事是不花钱的：每条连接占一个任务加一份 8 KiB 的请求头缓冲，一直挂到把宿主机拖垮
+    // ——那时部署者自己那一档也一起连不上。
+    //
+    // **这道闸必须在读请求头之前**：请求头还没读，我们连「这是不是 `/health`」都不知道，
+    // 而读头本身就要花任务与内存。反过来把**真实额度**（`Config::max_connections`）放在
+    // 这里就是审计里那条「未鉴权占满许可池」：随便谁开几条不发请求头的 TCP（每条只需
+    // `HANDSHAKE_TIMEOUT` 之内重连一次）就能把整池占住，让所有人——包括部署者自己——
+    // 拿到 503，而攻击者什么都不用做。所以真实额度那道闸挪到了本函数末尾（鉴权与会话判定
+    // 都过了之后），这里只留一道**宽得多、而且短命**的预握手闸。
     //
     // 满了就当场回 503 并断开，**不排队等**：排队等于把已经接受的 socket 堆在这里，
-    // 那正是这道闸要防的东西。这里用的是**对端地址**（不是 `X-Forwarded-For` 算出来的
-    // 那个），也不记进每 IP 的失败额度：请求头还没读，域名模式下对端是反代容器，按它
-    // 记账会把所有人算成同一个 IP。所以只留一行、而且每 10 秒最多一行。
-    let _permit = match relay.try_connection_permit() {
+    // 那正是这道闸要防的东西。每 IP 那一档按**对端地址**算（请求头还没读，`X-Forwarded-For`
+    // 还用不上）：它的职责只是「别让一个来源把预握手池吃光」，不是每 IP 的限额。
+    let _pre = match relay.try_pre_handshake_permit(peer.ip()) {
         Some(permit) => permit,
         None => {
             // 先把请求头**尽量**读掉（上限 `REJECT_DRAIN_TIMEOUT`）：不读就关的话，客户端
@@ -466,7 +574,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
                 tokio::time::timeout(REJECT_DRAIN_TIMEOUT, read_request_head(&mut stream)).await;
 
             if relay.note_connection_limit().await {
-                eprintln!("连接 {peer} 被拒绝：连接数已达上限（HTTP 503）");
+                eprintln!("连接 {peer} 被拒绝：正在握手的连接数已达上限（HTTP 503）");
             }
 
             return write_response(
@@ -487,33 +595,24 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         Err(_) => return Err("握手超时".into()),
     };
 
-    // 公益档的每 IP 限额、以及下面那条握手限速都按哪个 IP 算。Caddy 那一跳只在内网，所以
-    // 域名模式下要靠 `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`，compose 已默认打开）；
-    // direct 模式对端就是客户端本身，不需要它。
+    // 请求头读完了，预握手那道闸的活也干完了：后面每一路（包括 `/health` 与各条拒绝路径）
+    // 都不该再占着它。`Drop` 会把总量与「这个来源地址」两份计数一起还回去。
+    drop(_pre);
+
+    // 公益档的每 IP 限额、以及下面那条**每 IP 的握手失败限速**都按哪个 IP 算。Caddy 那一跳
+    // 只在内网，所以域名模式下要靠 `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`，compose 已默认
+    // 打开）；direct 模式对端就是客户端本身，不需要它。
     //
     // 取的是**这个头的每一行**，不是第一行：它可能被反代拆成多行（见 `RequestHead::header_values`）。
     let forwarded_for = head.header_values("x-forwarded-for");
     let client = relay::client_ip(peer, &forwarded_for, relay.trust_proxy());
 
-    // 每 IP 的握手失败限速（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）：一个 IP 连续把密码打错
-    // （或者反复发格式不对的请求）时，这里直接回 429，不再往下走——省下鉴权的摘要计算，
-    // 也省下继续刷日志。诚实客户端碰不到它：密码不对在客户端是**致命**的（它直接提示改
-    // 密码、根本不重试），会按退避重试的是 429 / 503 那一类，而那个退避封顶 30 秒，也就是
-    // 最多 2 次/分钟——离 30 差十几倍。
-    if !relay.handshake_allowed(client).await {
-        reject(&relay, peer, client, "这个地址的失败次数太多", 429).await;
-
-        return write_response(
-            &mut stream,
-            429,
-            "Too Many Requests",
-            "text/plain; charset=utf-8",
-            "too many failed handshakes",
-        )
-        .await
-        .map_err(|error| error.to_string());
-    }
-
+    // **`/health` 排在一切限额与鉴权之前**（除了上面那道预握手的总量闸）。
+    //
+    // 它是容器健康检查走的那条路（`main.rs --health-check`，`docker-compose.yml` 的
+    // `healthcheck`），而健康检查失败会让 docker 判 `unhealthy` 并**重启容器**——把
+    // 「有人在刷」变成「自己把自己打挂」。所以它不占真实连接额度，也不过下面那道每 IP 的
+    // 握手失败闸：一个已经被 429 的地址仍然该能拿到健康检查，否则监控与被封会互相掩盖。
     if head.path() == HEALTH_PATH {
         // §28：只说「我活着、协议是 1、需要服务器密码」。**不暴露**任何 Room、deviceId
         // 或密钥信息；`passwordRequired` 是常量，用来让部署者一条 curl 就确认自己装对了
@@ -542,6 +641,25 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             "Not Found",
             "text/plain; charset=utf-8",
             "not found",
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
+
+    // 每 IP 的握手失败限速（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）：一个 IP 连续把密码打错
+    // （或者反复发格式不对的请求）时，这里直接回 429，不再往下走——省下鉴权的摘要计算，
+    // 也省下继续刷日志。诚实客户端碰不到它：密码不对在客户端是**致命**的（它直接提示改
+    // 密码、根本不重试），会按退避重试的是 429 / 503 那一类，而那个退避封顶 30 秒，也就是
+    // 最多 2 次/分钟——离 30 差十几倍。
+    if !relay.handshake_allowed(client).await {
+        reject(&relay, peer, client, "这个地址的失败次数太多", 429).await;
+
+        return write_response(
+            &mut stream,
+            429,
+            "Too Many Requests",
+            "text/plain; charset=utf-8",
+            "too many failed handshakes",
         )
         .await
         .map_err(|error| error.to_string());
@@ -774,6 +892,22 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             .await
             .map_err(|error| error.to_string());
         }
+        // 「一把钥匙一个人」：同一把服务器钥匙同时能开几组会话（`PAIR_MAX_SESSIONS_PER_KEY`）。
+        // 正常用不到它（一对用户只有一组会话）；撞上它的要么是同一把钥匙被几个人共用，要么
+        // 是这把钥匙泄漏之后有人在开新会话占位。该做的是换一把钥匙，而不是重试。
+        Err(RoomRejection::KeySessionLimit) => {
+            reject(&relay, peer, client, "这把服务器密码的会话数已满", 429).await;
+
+            return write_response(
+                &mut stream,
+                429,
+                "Too Many Requests",
+                "text/plain; charset=utf-8",
+                "too many sessions for this server password",
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
         // 同一个 Room 上「已放行、还没走进 `admit`」的连接堆得太多（见 `MAX_PENDING_PER_ROOM`）。
         // 正常用法的峰值是 2（两个人握手），所以走到这里要么是这个会话正在被刷，要么是它的
         // 客户端一直在重连而对面接不上——两种情况都该让对方等一下再试，而不是继续堆。
@@ -822,6 +956,35 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         "{peer} 已通过鉴权（device {device_id}，room {}）",
         auth::room_fingerprint(&room_id)
     );
+
+    // 直到这里才领**真实额度**那一张许可（`Config::max_connections`）。
+    //
+    // 位置是有意的：前面每一条路（`/health`、404、426、403、401、503、409、429）都可能在
+    // 没有一次成功鉴权的情况下被触发，而它们都不该占着「一条真正在服务的连接」的额度——
+    // 否则随便谁开几条不发请求头的连接（或反复拿错密码）就能让部署者自己进不来。
+    //
+    // 满了就回 503 并把名额还回去。请求头已经读完，所以这里**不需要** drain：对面那份请求
+    // 已经全在我们手里了。
+    let _permit = match relay.try_connection_permit() {
+        Some(permit) => permit,
+        None => {
+            relay.release(reservation).await;
+
+            if relay.note_connection_limit().await {
+                eprintln!("连接 {peer} 被拒绝：连接数已达上限（HTTP 503）");
+            }
+
+            return write_response(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                "server is at its connection limit",
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
+    };
 
     relay.serve(stream, head, device_id, reservation).await
 }
@@ -968,5 +1131,34 @@ mod tests {
         assert_eq!(derived_max_connections(40, 10), 132);
         // 两档都关掉大半时也留得住最基本的握手并发
         assert_eq!(derived_max_connections(1, 0), HANDSHAKE_HEADROOM + 2);
+    }
+
+    /// 预握手那道闸必须**永远比真实额度宽**：它是「读请求头的任务与内存上界」，不是容量。
+    ///
+    /// 比真实额度紧的话，它就变成了「谁都能把所有人挡在门外」——那正是审计里那条 P0 的形状
+    /// （把这道闸放到读请求头之前、又按真实额度定大小，就等于「开几条不发数据的 TCP 让整台
+    /// 服务器回 503」）。这一条把两者的大小关系钉死，免得将来有人「顺手统一一下这两个数」。
+    #[test]
+    fn the_pre_handshake_cap_is_always_wider_than_the_real_one() {
+        for (sessions, public) in [(1usize, 0usize), (20, 10), (40, 10)] {
+            let real = derived_max_connections(sessions, public);
+            let pre = derived_pre_handshake_connections(sessions, public);
+
+            assert!(pre > real, "{pre} 必须宽于 {real}（{sessions} + {public}）");
+        }
+    }
+
+    /// 限时 TURN 凭据的共享密钥：长度不够就拒绝启动，而且**不回显密钥**（日志里出现一次就
+    /// 等于泄露）。
+    #[test]
+    fn a_short_turn_secret_is_rejected_without_echoing_it() {
+        let name = "PAIR_TURN_SECRET";
+
+        assert!(parse_turn_secret(name, "  0123456789abcdef  ").is_ok());
+
+        let error = parse_turn_secret(name, "too-short").unwrap_err();
+
+        assert!(error.contains(name), "{error}");
+        assert!(!error.contains("too-short"), "报错里不该出现密钥：{error}");
     }
 }

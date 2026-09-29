@@ -69,6 +69,17 @@ services:
       # 「十组名额各自贴着上限」，所以再加一层；记账挂钥匙而不是连接 / 房间 / IP
       PAIR_PUBLIC_KEY_BUDGET_BYTES: ${PAIR_PUBLIC_KEY_BUDGET_BYTES:-}
       PAIR_PUBLIC_WINDOW_SECS: ${PAIR_PUBLIC_WINDOW_SECS:-}
+      # 完全档（你自己那一档）也有护栏：每把钥匙最多几组会话、空闲多久回收、以及每把钥匙的
+      # 滚动预算（2 GiB 一次性 + 每小时回填）。它们不影响正常使用，决定的是「一把钥匙流出去
+      # 之后最坏能怎样」。留空都用二进制里的缺省值；写 0 表示关掉那一层。
+      PAIR_MAX_SESSIONS_PER_KEY: ${PAIR_MAX_SESSIONS_PER_KEY:-}
+      PAIR_FULL_WINDOW_SECS: ${PAIR_FULL_WINDOW_SECS:-}
+      PAIR_FULL_KEY_BUDGET_BYTES: ${PAIR_FULL_KEY_BUDGET_BYTES:-}
+      # 限时 TURN 凭据：填了它，welcome 里的 turn 凭据就按每次连接现签、限时有效。
+      # 必须和 coturn 的 static-auth-secret 写同一个值（见 README 的「可选：TURN」）。
+      # 留空 = 用 PAIR_ICE_SERVERS 里那份静态凭据（旧行为，凭据长期有效）
+      PAIR_TURN_SECRET: ${PAIR_TURN_SECRET:-}
+      PAIR_TURN_TTL_SECS: ${PAIR_TURN_TTL_SECS:-}
       # 每 IP 每分钟允许几次握手**失败**（超过就 429，并且不再写日志）。它跟公益档无关，
       # 是你自己那一档的护栏：拿错密码刷 /ws 的代价本来只是一次摘要比较，能被打爆的是日志
       PAIR_HANDSHAKE_FAILURES_PER_MINUTE: ${PAIR_HANDSHAKE_FAILURES_PER_MINUTE:-}

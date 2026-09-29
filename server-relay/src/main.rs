@@ -1,6 +1,7 @@
 //! 自建中继入口：读配置、监听、把连接交给 `server`。
 
 use bongocat_pair_relay::protocol::Tier;
+use bongocat_pair_relay::protocol::DEFAULT_PRE_HANDSHAKE_PER_IP;
 use bongocat_pair_relay::relay::Relay;
 use bongocat_pair_relay::{server, stun};
 use tokio::net::{TcpListener, UdpSocket};
@@ -216,10 +217,48 @@ async fn run() -> Result<(), String> {
         );
     }
     println!("  配对密码  本进程**没有**任何配对密码：那是每一对用户自己的凭据");
-    // 这两项跟公益档无关，是**部署者自己那一档**的护栏（详见 README「准入」一节）
+    // 完全档那几项：它们不影响正常使用，但决定了「一把钥匙流出去之后最坏能怎样」
     println!(
-        "  准入       最多同时挂 {} 条连接（两档名额 ×2 再加握手余量）；握手失败 {}",
+        "  完全档     空闲回收 {}；每把钥匙最多 {} 组会话（两档共用这一条）",
+        match config.full_window {
+            Some(window) => format!("{:.0} 秒", window.as_secs_f64()),
+            None => "关掉（PAIR_FULL_WINDOW_SECS=0）".to_string(),
+        },
+        if config.max_sessions_per_key == 0 {
+            "不限（PAIR_MAX_SESSIONS_PER_KEY=0）".to_string()
+        } else {
+            config.max_sessions_per_key.to_string()
+        }
+    );
+    match config.full_key_budget {
+        Some(budget) => {
+            let mib = budget / (1024.0 * 1024.0);
+
+            println!(
+                "            钥匙预算   一次性 {mib:.0} MiB，之后每小时回填 {mib:.0} MiB\
+                 （每把完全钥匙各一份：聊天 / 语音 / 附件分片都从这里扣）"
+            );
+        }
+        None => println!("            钥匙预算   不设（PAIR_FULL_KEY_BUDGET_BYTES=0）"),
+    }
+    println!(
+        "            TURN 凭据   {}",
+        match config.turn_secret {
+            Some(_) => format!(
+                "限时签发（PAIR_TURN_SECRET，每次连上现签一份、{:.0} 小时后过期）",
+                config.turn_ttl.as_secs_f64() / 3600.0
+            ),
+            None =>
+                "用 PAIR_ICE_SERVERS 里那份静态凭据（**长期有效**，泄漏过就换一份）".to_string(),
+        }
+    );
+    // 这一段跟公益档无关，是**准入**那两道闸（详见 README「准入」一节）
+    println!(
+        "  准入       已放行 {} 条连接（两档名额 ×2 再加余量）、读请求头 {} 条\
+         （每个来源不超过 {}）；握手失败 {}",
         relay.max_connections(),
+        relay.max_pre_handshake_connections(),
+        DEFAULT_PRE_HANDSHAKE_PER_IP,
         match config.handshake_failures_per_minute {
             Some(limit) => format!("每个 IP 每分钟 {limit:.0} 次，超过就 429 并停止写日志"),
             None => "不限（PAIR_HANDSHAKE_FAILURES_PER_MINUTE=0）".to_string(),

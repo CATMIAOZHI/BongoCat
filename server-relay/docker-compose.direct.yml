@@ -52,6 +52,17 @@ services:
       PAIR_PUBLIC_BURST_BYTES: ${PAIR_PUBLIC_BURST_BYTES:-}
       PAIR_PUBLIC_KEY_BUDGET_BYTES: ${PAIR_PUBLIC_KEY_BUDGET_BYTES:-}
       PAIR_PUBLIC_WINDOW_SECS: ${PAIR_PUBLIC_WINDOW_SECS:-}
+      # 完全档（你自己那一档）也有护栏：每把钥匙最多几组会话、空闲多久回收、以及每把钥匙的
+      # 滚动预算（2 GiB 一次性 + 每小时回填）。它们不影响正常使用，决定的是「一把钥匙流出去
+      # 之后最坏能怎样」。留空都用二进制里的缺省值；写 0 表示关掉那一层。
+      PAIR_MAX_SESSIONS_PER_KEY: ${PAIR_MAX_SESSIONS_PER_KEY:-}
+      PAIR_FULL_WINDOW_SECS: ${PAIR_FULL_WINDOW_SECS:-}
+      PAIR_FULL_KEY_BUDGET_BYTES: ${PAIR_FULL_KEY_BUDGET_BYTES:-}
+      # 限时 TURN 凭据：填了它，welcome 里的 turn 凭据就按每次连接现签、限时有效。
+      # 必须和 coturn 的 static-auth-secret 写同一个值（见 README 的「可选：TURN」）。
+      # 留空 = 用 PAIR_ICE_SERVERS 里那份静态凭据（旧行为，凭据长期有效）
+      PAIR_TURN_SECRET: ${PAIR_TURN_SECRET:-}
+      PAIR_TURN_TTL_SECS: ${PAIR_TURN_TTL_SECS:-}
       PAIR_HANDSHAKE_FAILURES_PER_MINUTE: ${PAIR_HANDSHAKE_FAILURES_PER_MINUTE:-}
       # 这里**写死 0**（不用 `${...:-0}`）：两种模式常常共用一份 `.env`，而域名模式那一份
       # 建议打开它（`PAIR_TRUST_PROXY=1`）。direct 模式把 8080 直接发布到公网，没有反代，

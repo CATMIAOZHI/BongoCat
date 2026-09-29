@@ -13,7 +13,11 @@ description = "Self-hosted BongoCat pair relay: one instance serves many two-dev
 base64 = "0.23.1"
 futures-util = "0.3.34"
 hkdf = "0.13.0"
+# 限时 TURN 凭据（coturn 的 REST API）要的那一份：`base64(HMAC-SHA1(secret, username))`。
+# 这两条只用来**签一份有时限的授权**，不做任何机密性保护（共享密钥本身是高熵的随机串）。
+hmac = "0.13.0"
 rand = "0.10.3"
+sha1 = "0.11.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"
