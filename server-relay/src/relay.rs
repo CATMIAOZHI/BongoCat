@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -30,9 +30,12 @@ use tokio_tungstenite::WebSocketStream;
 use crate::auth::{auth_verifier, constant_time_eq, room_fingerprint};
 use crate::http::{write_upgrade, RequestHead};
 use crate::protocol::{
-    self, close_code, is_known_frame_kind, Limits, ServerFrame, Tier, FRAME_HEADER_SIZE,
+    self, close_code, is_known_frame_kind, Limits, ServerFrame, Tier,
+    DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE, DEFAULT_MAX_CONNECTIONS, DEFAULT_PUBLIC_BURST_BYTES,
+    DEFAULT_PUBLIC_BURST_FRAMES, DEFAULT_PUBLIC_KEY_BUDGET_BYTES, FRAME_HEADER_SIZE,
     FRAME_KIND_SIGNAL, FRAME_KIND_TRANSFER_CHUNK, LAST_SEEN_WRITE_INTERVAL_MS,
-    MAX_BINARY_FRAME_SIZE, MAX_PUBLIC_FRAME_SIZE, PAIR_SIZE,
+    MAX_BINARY_FRAME_SIZE, MAX_PENDING_PER_ROOM, MAX_PUBLIC_FRAME_SIZE, PAIR_SIZE,
+    PUBLIC_WS_MESSAGE_SIZE,
 };
 
 /// 一条已经登记进某个 Room 的连接。
@@ -63,6 +66,13 @@ struct PairRoom {
     /// 创建这个会话时那条连接来自哪个 IP（IPv6 按 /64 归并）。公益档的每 IP 限额与它
     /// 挂钩，`sweep` 释放时靠它把账还回去。
     ip: IpKey,
+    /// 创建这个会话的那条连接用的是**第几把**服务器钥匙（`sweep` 那行日志用它回答
+    /// 「是哪把钥匙在用」）。
+    ///
+    /// 同一个会话里的两个人可以拿不同的钥匙（只要档位一样），所以它记的是**先到者**的
+    /// 那一把——它是「这个会话是谁带来的」这个方向上的线索，不是精确归属。中继看不到
+    /// 载荷（信令是端到端加密的），这是部署者事后唯一能看出「哪把钥匙在夹带」的东西。
+    key_index: usize,
     /// 按 deviceId 索引：同一个 deviceId 重连天然就是「换掉原来那条」。
     clients: HashMap<String, ClientEntry>,
     /// 已经由 `reserve` 放行、还没走进 `admit` 的连接数。
@@ -73,6 +83,12 @@ struct PairRoom {
     pending: usize,
     created_at: Instant,
     last_active: Instant,
+    /// 这个会话累计**真的转发出去**多少帧 / 多少字节（`sweep` 那行日志用）。
+    ///
+    /// 「真的转发出去」= 那一刻房间里有对端可收：发给空气的帧不算，否则这份统计与部署者
+    /// 在出口看到（或没看到）的流量对不上，作为「谁在夹带」的证据就失效了。
+    forwarded_frames: u64,
+    forwarded_bytes: u64,
 }
 
 /// 每个连接的出站队列容量。
@@ -81,6 +97,32 @@ struct PairRoom {
 /// 隧道、笔记本睡眠）时，中继会停止读发送方，反压自然传回发送方的 socket，
 /// 而不是在这里把内存吃光。真被拖死（见 `FORWARD_TIMEOUT`）才摘掉那个对端。
 const OUTBOUND_QUEUE: usize = 32;
+
+/// 公益档连接的出站队列容量。
+///
+/// 它的帧上限是 64 KiB，所以 32 条队列本身就是 2 MiB——而它的诚实流量是「一轮十来帧、
+/// 之后静默」，8 条（512 KiB）已经远超任何真实需要。加上写缓冲 256 KiB 与读上限
+/// 128 KiB，公益档的单连接最坏内存是 **0.875 MiB**（完全档约 44 MiB）。
+const PUBLIC_OUTBOUND_QUEUE: usize = 8;
+
+/// 公益档连接的写缓冲上限（完全档是 4 MiB）。
+///
+/// 真正的流控靠上面那个有界队列，这里只是「对端停摆时不无限攒」的兜底；公益档的帧
+/// 本来就小，256 KiB 足够。
+const PUBLIC_WS_WRITE_BUFFER: usize = 256 * 1024;
+
+/// 公益档每把钥匙的预算按多长时间回填（`DEFAULT_PUBLIC_KEY_BUDGET_BYTES` 说的是「每小时」）。
+const KEY_BUDGET_WINDOW_SECS: f64 = 3600.0;
+
+/// 「连接数已达上限」那行日志的抑制窗口。
+///
+/// 走到那一步说明服务器已经满负荷，而满负荷时连接尝试只会更多——不抑制的话这行会自己把
+/// 日志刷满，反而把「为什么满了」的线索盖掉。10 秒一行足够知道正在发生什么。
+const CONNECTION_LIMIT_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// `handshake_failures` 这张表到多少项之后，**再插一个新地址**时顺手清一遍
+/// （见 `Relay::note_handshake_failure`）。
+const HANDSHAKE_FAILURE_TABLE_SWEEP: usize = 1024;
 
 /// 转发时最多等一个对端消费多久；超时说明这条连接已经停摆，直接摘掉
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,15 +133,91 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 /// 直接中止 writer 让 socket 真正关闭。
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 令牌桶：容量 = 每秒上限，按经过的时间连续补充。
+/// 令牌桶的**形状**：容量（一次能突发多少）与回填速率（长期能持续多快）是**两个数**。
 ///
 /// 用令牌桶而不是固定窗口，是因为固定窗口在边界会允许双倍突发，而 R4 要求
 /// 「状态变化立即发送」，一次抖动就可能被误判成超限并关掉连接。
+///
+/// 只用一个数（容量 = 速率）在完全档上是对的——那正是 Cloudflare 版的形状，`Limits`
+/// 自己就是它的语义。但公益档不能这么算：它的诚实流量是「一轮几 KB 的突发 + 长期静默」，
+/// 用一个数就只能二选一——小到装不下一轮打洞，或者大到等于没有上限（「256 KiB/秒」
+/// 实际是「256 KiB 的突发」，一小时能灌 900 MB）。所以这里把两个维度分开。
+#[derive(Debug, Clone, Copy)]
+struct Quota {
+    frames_cap: f64,
+    frames_rate: f64,
+    chunks_cap: f64,
+    chunks_rate: f64,
+    bytes_cap: f64,
+    bytes_rate: f64,
+}
+
+/// 「这一维不管」用的数：取一个大而**有限**的值。
+///
+/// 不能用 `f64::INFINITY`。理由不是「`inf - inf` 是 `NaN` 会关掉连接」——那一条现在恰好
+/// 不会发生：`take` 只减有限值，而 `refill` 里 `elapsed * inf` 虽然在同一时刻连扣两笔时
+/// 会算出 `0.0 * inf = NaN`，`f64::min` 的语义又正好是「一个是 NaN 就返回另一个」，于是桶
+/// 值仍然是 `inf`、`inf - 1.0 >= 0.0` 成立。问题在于这条正确性**挂在一处很容易被改掉的
+/// 细节上**（把这个 `min` 换成 `f64::maximum` 或者手写 `if`，`NaN` 就会留在桶里，之后每一次
+/// 扣减都失败）。取一个有限的大数就没有这个隐含前提。
+const NEVER_BINDS: f64 = 1e12;
+
+impl Quota {
+    /// 容量 = 速率。完全档用它，行为与 CF 版逐条一致。
+    fn steady(limits: Limits) -> Self {
+        Self {
+            frames_cap: limits.frames_per_second,
+            frames_rate: limits.frames_per_second,
+            chunks_cap: limits.chunks_per_second,
+            chunks_rate: limits.chunks_per_second,
+            bytes_cap: limits.bytes_per_second,
+            bytes_rate: limits.bytes_per_second,
+        }
+    }
+
+    /// 公益档的一条连接：突发给足（一轮打洞一口气发得完），持续压到涓流。
+    fn public_connection(limits: Limits, burst_frames: f64, burst_bytes: f64) -> Self {
+        Self {
+            frames_cap: burst_frames,
+            frames_rate: limits.frames_per_second,
+            // 公益档一个分片都不转发（帧白名单只有 kind 8），分片那一维只是个形状
+            chunks_cap: limits.chunks_per_second,
+            chunks_rate: limits.chunks_per_second,
+            bytes_cap: burst_bytes,
+            bytes_rate: limits.bytes_per_second,
+        }
+    }
+
+    /// 只按**帧数**算的闸（每 IP 的握手失败限速用它）：字节与分片两维给一个不会拦住的数。
+    fn frames_only(cap: f64, rate: f64) -> Self {
+        Self {
+            frames_cap: cap,
+            frames_rate: rate,
+            chunks_cap: NEVER_BINDS,
+            chunks_rate: NEVER_BINDS,
+            bytes_cap: NEVER_BINDS,
+            bytes_rate: NEVER_BINDS,
+        }
+    }
+
+    /// 只按**字节**算的滚动预算（每把公益钥匙的预算用它）。帧与分片两维不拦：预算要管的
+    /// 是「传了多少数据」，而一帧一帧地数会让「用大帧夹带」比「用小帧夹带」更划算。
+    fn bytes_only(cap: f64, rate: f64) -> Self {
+        Self {
+            frames_cap: NEVER_BINDS,
+            frames_rate: NEVER_BINDS,
+            chunks_cap: NEVER_BINDS,
+            chunks_rate: NEVER_BINDS,
+            bytes_cap: cap,
+            bytes_rate: rate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
-    /// 这条连接所属档位的额度。公益档有自己的小额度（见 `RelayOptions::public_limits`），
-    /// 所以桶自己记着该用哪一份，不必在每次扣额度时回头查档位。
-    limits: Limits,
+    /// 这个桶按哪份形状扣（见 `Quota`）。桶自己记着，省得每次扣额度时回头查档位。
+    quota: Quota,
     frames: f64,
     chunks: f64,
     bytes: f64,
@@ -107,26 +225,34 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn full(limits: Limits, now: Instant) -> Self {
+    fn new(quota: Quota, now: Instant) -> Self {
         Self {
-            limits,
-            frames: limits.frames_per_second,
-            chunks: limits.chunks_per_second,
-            bytes: limits.bytes_per_second,
+            quota,
+            frames: quota.frames_cap,
+            chunks: quota.chunks_cap,
+            bytes: quota.bytes_cap,
             updated_at: now,
         }
     }
 
     fn refill(&mut self, now: Instant) {
-        let limits = self.limits;
+        let quota = self.quota;
         let elapsed = now.duration_since(self.updated_at).as_secs_f64();
 
         self.updated_at = now;
-        self.frames =
-            (self.frames + elapsed * limits.frames_per_second).min(limits.frames_per_second);
-        self.chunks =
-            (self.chunks + elapsed * limits.chunks_per_second).min(limits.chunks_per_second);
-        self.bytes = (self.bytes + elapsed * limits.bytes_per_second).min(limits.bytes_per_second);
+        self.frames = (self.frames + elapsed * quota.frames_rate).min(quota.frames_cap);
+        self.chunks = (self.chunks + elapsed * quota.chunks_rate).min(quota.chunks_cap);
+        self.bytes = (self.bytes + elapsed * quota.bytes_rate).min(quota.bytes_cap);
+    }
+
+    /// 只问「现在还有额度吗」，**不扣**。
+    ///
+    /// 给每 IP 的握手闸用：被拒的尝试在拒绝那一刻就返回 429 了，不该再记一笔——
+    /// 否则一次失败会被算成两次（见 `Relay::note_handshake_failure`）。
+    fn available(&mut self, now: Instant) -> bool {
+        self.refill(now);
+
+        self.frames >= 1.0
     }
 
     /// 扣掉本次额度；不够就返回 false（连接随之关闭，所以负值不必回滚，与 CF 版一致）
@@ -139,6 +265,59 @@ impl Bucket {
 
         self.frames >= 0.0 && self.chunks >= 0.0 && self.bytes >= 0.0
     }
+
+    /// 把 [`Self::take`] 刚扣掉的那笔还回去。
+    ///
+    /// 只有**不随连接消失**的桶用得上（公益档那把钥匙的预算）：它记的账跨连接，所以
+    /// 「先扣再判、不回滚」会一直挂在那里（每次「重连 + 发一帧」都多记一笔），而按连接的
+    /// 桶不需要它——那个桶与连接同生共死，欠账跟着连接一起没了。
+    fn refund(&mut self, frames: f64, chunks: f64, bytes: f64) {
+        self.frames += frames;
+        self.chunks += chunks;
+        self.bytes += bytes;
+    }
+
+    /// 把欠账钉在下界上（只抬不压）。
+    ///
+    /// 也只有**不随连接消失**的桶用得上它，而且真的用它的只有每 IP 的握手失败桶：
+    /// 那个桶的欠账（负的 `frames`）换算成「这个 IP 要被挡多久」，没有下界就等于
+    /// 「刷多久封多久」——拿错密码刷五分钟能封一个 IP 八个多小时，同一个 NAT（或 IPv6
+    /// 的 /64）后面的人跟着连坐。钉在「一份满额度」上之后，封禁时长最多就是回填一份
+    /// 额度的时间（默认约一分钟），刷得再多也只是「继续被封」。见 `README.md` 的「准入」。
+    fn floor(&mut self, floor: f64) {
+        self.frames = self.frames.max(floor);
+    }
+}
+
+/// 一个连接被限流拦下时，是**哪个桶**不够了。
+///
+/// 分开是因为这两件事该说不同的话：`Connection` 是「你自己这一秒发太快了」，缓一下就好；
+/// `KeyBudget` 是「这台服务器发给你的那把公益钥匙，这一小时的额度用完了」——它不是这一帧
+/// 的问题，等到下一小时才有用。关闭码也跟着分开（`1008` / `4006`），客户端才能给出两句
+/// 不同的话，而不是一句笼统的「格式错误」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limited {
+    /// 这条连接自己的桶（按档位建的那个）
+    Connection,
+    /// 公益档**这把钥匙**的滚动预算（拿同一把钥匙的别的会话也在里面）
+    KeyBudget,
+}
+
+impl Limited {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Connection => "rate limit exceeded",
+            Self::KeyBudget => "public key budget exhausted",
+        }
+    }
+
+    /// 关这条连接时用哪个关闭码
+    fn close_code(self) -> u16 {
+        match self {
+            Self::Connection => close_code::PROTOCOL_ERROR,
+            Self::KeyBudget => close_code::KEY_BUDGET,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -146,6 +325,17 @@ struct State {
     /// `ROOM_ID` → 双人会话
     rooms: HashMap<String, PairRoom>,
     buckets: HashMap<u64, Bucket>,
+    /// 公益档**每把钥匙**一份的滚动预算（钥匙序号 → 桶）。
+    ///
+    /// 这张表的大小天然等于「部署者配了几把公益钥匙」，所以既不需要 TTL 也不需要清理：
+    /// 桶里的令牌本来就按时间补满，留着一把没人用的钥匙的桶与不留完全等价。
+    /// 挂钥匙而不是挂连接 / 房间 / IP 的理由见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`。
+    public_key_budgets: HashMap<usize, Bucket>,
+    /// 握手层每个 IP 的**失败**计数（`IpKey` → 桶）。只记失败，成功一次都不算。
+    ///
+    /// 它同时管两件事：把「一个 IP 持续刷错密码」压到 0.5 次/秒，以及把日志限频
+    /// （部署者排障的唯一证据，被刷掉就等于没有）。见 `Relay::note_handshake_failure`。
+    handshake_failures: HashMap<IpKey, Bucket>,
     /// 公益档的每 IP **会话**数（`IpKey` → 组数）。只算新建的那一组，房间空了（`sweep`）
     /// 就还回去；计数归零删键，别让扫描器留下小条目。
     public_rooms_per_ip: HashMap<IpKey, usize>,
@@ -177,6 +367,9 @@ pub enum RoomRejection {
     Capacity,
     /// 这个 IP 的公益会话已经开满（`PAIR_MAX_PUBLIC_PER_IP`）→ 429
     PublicIpLimit,
+    /// 这个 Room 里已经堆了太多条「已放行、还没走进 `admit`」的连接
+    /// （`MAX_PENDING_PER_ROOM`）→ 429
+    TooManyPending,
 }
 
 /// 一次已经被计进容量的入场许可：`reserve` 签发，`serve` 消费。
@@ -190,6 +383,9 @@ pub struct Reservation {
     auth_hash: [u8; 32],
     /// 这次连接算哪一档（welcome 要广告它，桶要按它取额度）
     tier: Tier,
+    /// 这次连接用的是第几把服务器钥匙。公益档的滚动预算记在钥匙上（见
+    /// `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`），所以它要跟着许可一路带到 `allow`。
+    key_index: usize,
     /// 这条连接来自哪个 IP（IPv6 按 /64 归并）。只在极少数「Room 被并发清掉、就地重建」
     /// 的路径上要用它，所以跟着许可一起走，不必再回头问调用方。
     ip: IpKey,
@@ -229,8 +425,30 @@ pub struct RelayOptions {
     pub limits: Limits,
     /// 公益档自己的额度。公益档只放行小帧（信令），所以这份值比 `limits` 小得多
     pub public_limits: Limits,
+    /// 公益档**一条连接**的突发容量（`PAIR_PUBLIC_BURST_FRAMES` / `PAIR_PUBLIC_BURST_BYTES`）。
+    ///
+    /// 令牌桶的容量与回填速率是两个数（见 `Quota`），这是容量那一半，与
+    /// `public_limits` 里的速率配成一对：一轮打洞十几帧、几 KB 要能一口气发完，否则诚实
+    /// 打洞会被自己的额度掐断。
+    pub public_burst_frames: f64,
+    pub public_burst_bytes: f64,
+    /// 公益档**每把钥匙**的滚动预算（`PAIR_PUBLIC_KEY_BUDGET_BYTES`，`None` = 不设这一层）。
+    ///
+    /// 桶的容量就是它本身（可以一次花完），回填速率是「容量 / 一小时」——一个数同时说明
+    /// 「最多能欠多少」与「长期最快多快」。挂钥匙的理由见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`。
+    pub public_key_budget: Option<f64>,
+    /// 握手层每个 IP 每分钟允许几次**失败**（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`，
+    /// `None` = 不限）
+    pub handshake_failures_per_minute: Option<f64>,
     /// 部署者那一档能同时承载的会话数（`PAIR_MAX_SESSIONS`）
     pub max_sessions: usize,
+    /// 能同时挂着的 TCP 连接数上限（含还没走完握手的那些）。
+    ///
+    /// 名额（`max_sessions` / `max_public_sessions`）管的是**会话**，一个会话两条连接；
+    /// 这里管的是**任务与内存**。没有它的话「开任意多条 TCP」是不花钱的：`/health` 与握手
+    /// 都不过闸，每条连接占一个任务加一份 8 KiB 的请求头缓冲，直到把宿主机拖垮——那时
+    /// 部署者自己那一档也一起连不上。见 `Relay::try_connection_permit`。
+    pub max_connections: usize,
     /// 公益档能同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。0 = 公益档关闭
     pub max_public_sessions: usize,
     /// 同一个 IP 最多几条公益连接（`PAIR_MAX_PUBLIC_PER_IP`）。0 = 不限
@@ -263,7 +481,12 @@ impl Default for RelayOptions {
                 chunks_per_second: protocol::DEFAULT_MAX_CHUNKS_PER_SECOND,
                 bytes_per_second: protocol::DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
             },
+            public_burst_frames: DEFAULT_PUBLIC_BURST_FRAMES,
+            public_burst_bytes: DEFAULT_PUBLIC_BURST_BYTES,
+            public_key_budget: Some(DEFAULT_PUBLIC_KEY_BUDGET_BYTES),
+            handshake_failures_per_minute: Some(DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE),
             max_sessions: protocol::DEFAULT_MAX_SESSIONS,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             max_public_sessions: protocol::DEFAULT_MAX_PUBLIC_SESSIONS,
             max_public_per_ip: protocol::DEFAULT_MAX_PUBLIC_PER_IP,
             public_window: Some(Duration::from_secs(protocol::DEFAULT_PUBLIC_WINDOW_SECS)),
@@ -280,15 +503,51 @@ pub struct Relay {
     options: RelayOptions,
     next_id: AtomicU64,
     state: Mutex<State>,
+    /// 能同时挂着的连接数（见 `RelayOptions::max_connections`）。
+    ///
+    /// 放在会话层是为了让「准入闸」与「配置」只有一处映射：`server.rs` 拿它当闸门，别的
+    /// 调用点（`main.rs`、集成测试）一个字都不用改。
+    connections: Arc<Semaphore>,
+    /// 「连接数已达上限」那行日志上一次是什么时候打的（见 `CONNECTION_LIMIT_NOTICE_INTERVAL`）。
+    connection_limit_notice: Mutex<Option<Instant>>,
 }
 
 impl Relay {
     pub fn new(options: RelayOptions) -> Arc<Self> {
         Arc::new(Self {
+            connections: Arc::new(Semaphore::new(options.max_connections)),
             options,
             next_id: AtomicU64::new(1),
             state: Mutex::new(State::default()),
+            connection_limit_notice: Mutex::new(None),
         })
+    }
+
+    /// 拿一张「能挂一条连接」的许可。`None` = 已经打到上限（调用方该回一个 503 并断开）。
+    ///
+    /// 不排队等：等就等于把已经接受的 socket 堆在队列里，而那正是这道闸要防的东西。
+    pub fn try_connection_permit(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.connections).try_acquire_owned().ok()
+    }
+
+    /// 「连接数已达上限」这一行现在该不该打（每 `CONNECTION_LIMIT_NOTICE_INTERVAL` 一行）。
+    pub async fn note_connection_limit(&self) -> bool {
+        let mut last = self.connection_limit_notice.lock().await;
+        let now = Instant::now();
+
+        match *last {
+            Some(at) if now.duration_since(at) < CONNECTION_LIMIT_NOTICE_INTERVAL => false,
+            _ => {
+                *last = Some(now);
+
+                true
+            }
+        }
+    }
+
+    /// 最多能同时挂几条连接（横幅要如实印出来，见 `RelayOptions::max_connections`）
+    pub fn max_connections(&self) -> usize {
+        self.options.max_connections
     }
 
     pub fn trust_proxy(&self) -> bool {
@@ -336,6 +595,29 @@ impl Relay {
         }
     }
 
+    /// 这一档**一条连接**的令牌桶形状。
+    ///
+    /// 完全档就是 `Limits` 自己（容量 = 速率 = 每秒上限，与 CF 版逐条一致）；公益档把突发
+    /// 与持续拆成两个数——诚实流量是「一轮几 KB 的突发 + 长期静默」，只用一个数就只能
+    /// 二选一（小到装不下一轮打洞，或者大到等于没有上限）。
+    fn connection_quota(&self, tier: Tier) -> Quota {
+        match tier {
+            Tier::Full => Quota::steady(self.options.limits),
+            Tier::Public => Quota::public_connection(
+                self.options.public_limits,
+                self.options.public_burst_frames,
+                self.options.public_burst_bytes,
+            ),
+        }
+    }
+
+    /// 公益档那把钥匙的预算桶形状（`None` = 这一层关着）。
+    fn key_budget_quota(&self) -> Option<Quota> {
+        self.options
+            .public_key_budget
+            .map(|budget| Quota::bytes_only(budget, budget / KEY_BUDGET_WINDOW_SECS))
+    }
+
     /// 这次连接带来的服务器凭据算哪一档（R36 + 公益档）。`None` = 凭据不对，拒绝。
     ///
     /// 恒定时间比较、与长度无关的旁路不成立（两边都是 32 字节摘要）。**每一把都要比完
@@ -345,12 +627,12 @@ impl Relay {
     /// 公益档被关掉（名额 0）时**故意**不认那把钥匙：它就等于「这台服务器没有公益档」，
     /// 于是那些人拿到的是 403「服务器密码不正确」，而不是一条会让客户端无限退避重试的
     /// 503「会话已满」——后者说的是一件没发生的事（名额根本没被占满）。
-    pub fn classify_server_token(&self, token: &str) -> Option<Tier> {
+    pub fn classify_server_token(&self, token: &str) -> Option<(Tier, usize)> {
         let verifier = auth_verifier(token);
         let public_open = self.has_public_tier();
         let mut matched = None;
 
-        for key in &self.options.server_keys {
+        for (index, key) in self.options.server_keys.iter().enumerate() {
             // 公益档关掉时那把钥匙不参与比较：它等于「这台服务器没有公益档」，判定要
             // 和「压根没配过」完全一样（见上面那条 403 与 503 的区别）。
             if key.tier == Tier::Public && !public_open {
@@ -358,7 +640,9 @@ impl Relay {
             }
 
             if constant_time_eq(&verifier, &key.verifier) {
-                matched = Some(key.tier);
+                // 序号一起带出去：公益档的滚动预算记在**钥匙**上（见
+                // `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`），后面每一帧都要按它记账。
+                matched = Some((key.tier, index));
             }
         }
 
@@ -396,6 +680,7 @@ impl Relay {
         room_id: &str,
         auth_hash: [u8; 32],
         tier: Tier,
+        key_index: usize,
         ip: IpKey,
     ) -> Result<Reservation, RoomRejection> {
         let mut state = self.state.lock().await;
@@ -411,6 +696,14 @@ impl Relay {
                 // 这里挡住并给出指向，比「一个人有中继兜底、另一个人什么都没有」好。
                 if room.tier != tier {
                     return Err(RoomRejection::TierMismatch);
+                }
+
+                // 已经在握手里的连接也要封顶：不封顶时同一个 Room 能被堆上任意多条这样的
+                // 连接，每条占一个任务、一份 8 KiB 的请求头缓冲（还在 10 秒的握手超时
+                // 里），而它们的许可**都算进容量**——既拖住自己，也拖住别人。
+                // 4 条 = 正常用法的两倍余量（两个人握手 + 一次重连重叠）。
+                if room.pending >= MAX_PENDING_PER_ROOM {
+                    return Err(RoomRejection::TooManyPending);
                 }
 
                 room.pending += 1;
@@ -452,10 +745,13 @@ impl Relay {
                         auth_hash,
                         tier,
                         ip,
+                        key_index,
                         clients: HashMap::new(),
                         pending: 1,
                         created_at: now,
                         last_active: now,
+                        forwarded_frames: 0,
+                        forwarded_bytes: 0,
                     },
                 );
             }
@@ -465,6 +761,7 @@ impl Relay {
             room_id: room_id.to_string(),
             auth_hash,
             tier,
+            key_index,
             ip,
         })
     }
@@ -490,6 +787,7 @@ impl Relay {
     ) -> Result<(), String> {
         let room_id = reservation.room_id.clone();
         let tier = reservation.tier;
+        let key_index = reservation.key_index;
 
         let Some(key) = head.header("sec-websocket-key") else {
             self.release(reservation).await;
@@ -514,18 +812,37 @@ impl Relay {
         // 帧头后立刻报错，帧体还留在接收缓冲里；这时关连接会让 TCP 直接 RST，对端拿到
         // 的是「连接被重置」而不是 1009。留出这段余量，1 MiB ~ 8 MiB 的帧就能被完整
         // 读完、干净地关掉；超过 8 MiB 才落到「尽力发 1009」的那条路径（见读循环）。
+        //
+        // 公益档那三个数都按自己的档位取（`PUBLIC_WS_MESSAGE_SIZE` /
+        // `PUBLIC_WS_WRITE_BUFFER` / `PUBLIC_OUTBOUND_QUEUE`）：那一档只转发 64 KiB 以下的
+        // 信令帧，所以它的单连接内存从完全档的十几 MiB 降到 1 MiB 以下。「一堆公益连接把
+        // 宿主机内存吃光、把部署者自己那一档一起搞死」这条路因此被堵住——这是**按档位的
+        // 硬隔离**，不靠额度（额度是策略，内存是物理）。
         // `WebSocketConfig` 是 non_exhaustive，只能先取默认值再改字段
         let mut config = WebSocketConfig::default();
 
-        config.max_message_size = Some(MAX_BINARY_FRAME_SIZE * 8);
-        config.max_frame_size = Some(MAX_BINARY_FRAME_SIZE * 8);
-        // 写缓冲也设上限：默认是无限，碰到对端停摆时同样会吃内存（真正的流控靠
-        // 上面那个有界队列，这里只是兜底）
-        config.max_write_buffer_size = 4 * MAX_BINARY_FRAME_SIZE;
+        let (read_limit, write_buffer, queue) = match tier {
+            Tier::Full => (
+                MAX_BINARY_FRAME_SIZE * 8,
+                // 写缓冲也设上限：默认是无限，碰到对端停摆时同样会吃内存（真正的流控靠
+                // 上面那个有界队列，这里只是兜底）
+                4 * MAX_BINARY_FRAME_SIZE,
+                OUTBOUND_QUEUE,
+            ),
+            Tier::Public => (
+                PUBLIC_WS_MESSAGE_SIZE,
+                PUBLIC_WS_WRITE_BUFFER,
+                PUBLIC_OUTBOUND_QUEUE,
+            ),
+        };
+
+        config.max_message_size = Some(read_limit);
+        config.max_frame_size = Some(read_limit);
+        config.max_write_buffer_size = write_buffer;
 
         let mut websocket =
             WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
-        let (sender, receiver) = mpsc::channel::<Message>(OUTBOUND_QUEUE);
+        let (sender, receiver) = mpsc::channel::<Message>(queue);
 
         // 先决定能不能进：满了就握手后立刻用 4003 关掉（CF 版同样是「升级成功再关」，
         // 客户端才能把 4003 显示成「该联机会话已有两台设备在线」而不是一次普通连接失败）。
@@ -710,11 +1027,29 @@ impl Relay {
                     } else {
                         0.0
                     };
+                    let frame_bytes = bytes.len() as f64;
 
-                    if !self.allow(id, 1.0, chunks, bytes.len() as f64).await {
+                    if let Some(limit) = self
+                        .allow(id, tier, key_index, 1.0, chunks, frame_bytes)
+                        .await
+                    {
+                        // 「这把钥匙的预算用完了」和「你自己发太快」是两件事，而关闭帧里的
+                        // 原因客户端只按关闭码翻译、看不到。这里替部署者记一行：不然
+                        // 「我的公益额度突然没了」在日志里只剩一条「会话已释放」，谁也说不清
+                        // 是哪把钥匙、更看不出是不是有人在夹带。
+                        if limit == Limited::KeyBudget {
+                            println!(
+                                "[{}] 公益档第 {} 把钥匙的预算已用完（device {device_id}）：\
+                                 这条连接被关掉；拿同一把钥匙的别的会话也会跟着被拒，\
+                                 要等回填（每小时一份额度）",
+                                room_fingerprint(&room_id),
+                                key_index + 1
+                            );
+                        }
+
                         let _ = sender.try_send(Message::Close(Some(close_frame(
-                            close_code::PROTOCOL_ERROR,
-                            "rate limit exceeded",
+                            limit.close_code(),
+                            limit.reason(),
                         ))));
 
                         break;
@@ -799,10 +1134,13 @@ impl Relay {
                         auth_hash: reservation.auth_hash,
                         tier,
                         ip,
+                        key_index: reservation.key_index,
                         clients: HashMap::new(),
                         pending: 0,
                         created_at: now,
                         last_active: now,
+                        forwarded_frames: 0,
+                        forwarded_bytes: 0,
                     },
                 );
             }
@@ -877,7 +1215,9 @@ impl Relay {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (ejected, ejected_receiver) = oneshot::channel();
 
-        state.buckets.insert(id, Bucket::full(self.limits_for(tier), now));
+        state
+            .buckets
+            .insert(id, Bucket::new(self.connection_quota(tier), now));
 
         {
             let room = state
@@ -970,16 +1310,116 @@ impl Relay {
         }
     }
 
-    async fn allow(&self, id: u64, frames: f64, chunks: f64, bytes: f64) -> bool {
+    /// 扣这一帧的额度。`None` = 放行；`Some(_)` = 被哪个桶拦下了（调用方据此关连接）。
+    ///
+    /// 公益档要过两道：这条连接自己的桶（按档位建的那个），和**这把钥匙**的滚动预算。
+    /// 顺序是「先自己的、后钥匙的」，而且钥匙那份拒掉的一笔要立刻还回去——它记的账不随
+    /// 连接消失，不还就等于每拒一帧都白记一笔（见 `Bucket::refund`）。
+    async fn allow(
+        &self,
+        id: u64,
+        tier: Tier,
+        key_index: usize,
+        frames: f64,
+        chunks: f64,
+        bytes: f64,
+    ) -> Option<Limited> {
+        let budget = self.key_budget_quota();
         let mut state = self.state.lock().await;
         let now = Instant::now();
+
         // 已经不在名单里的连接不再有桶：`entry().or_insert_with()` 会把桶重建出来，
         // 被摘掉的对端再发一帧就永久留下一条残留。这里直接拒绝，让读循环退出。
         let Some(bucket) = state.buckets.get_mut(&id) else {
-            return false;
+            return Some(Limited::Connection);
         };
 
-        bucket.take(now, frames, chunks, bytes)
+        if !bucket.take(now, frames, chunks, bytes) {
+            return Some(Limited::Connection);
+        }
+
+        // 公益档再叠一道「这把钥匙的预算」；没配这一层（`None`）到这儿就是放行
+        if tier == Tier::Public {
+            if let Some(quota) = budget {
+                let budget = state
+                    .public_key_budgets
+                    .entry(key_index)
+                    .or_insert_with(|| Bucket::new(quota, now));
+
+                if !budget.take(now, frames, chunks, bytes) {
+                    // 这一帧不会被转发出去，那把钥匙上就不该留这笔账：这张表不随连接消失，
+                    // 欠账会一份份攒起来（见 `Bucket::refund`）
+                    budget.refund(frames, chunks, bytes);
+
+                    return Some(Limited::KeyBudget);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// 这个 IP 现在还能不能做一次握手（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）。
+    ///
+    /// 只问不扣：被挡下的这一次本身也已经被记过一次了（它走到这里之前的那次失败调的是
+    /// `note_handshake_failure`），这里再扣就会一次失败算两次。还没失败过的 IP 连桶都没
+    /// 建，直接放行。
+    pub async fn handshake_allowed(&self, ip: IpKey) -> bool {
+        if self.options.handshake_failures_per_minute.is_none() {
+            return true;
+        }
+
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+
+        match state.handshake_failures.get_mut(&ip) {
+            Some(bucket) => bucket.available(now),
+            None => true,
+        }
+    }
+
+    /// 记一次握手失败（格式不对 / 密码不对 / 被挡下），并回答「这一行日志该不该打」。
+    ///
+    /// 返回值同时承担两件事：日志限频（刷错密码时每个 IP 每分钟最多 30 行——部署者排障的
+    /// 唯一证据就是日志，被刷掉等于没有）与「这个 IP 是不是该被 429 了」（下一次握手先问
+    /// `handshake_allowed`）。关掉这一项（`None`）时永远返回 `true`，也就是回到从前那样
+    /// 每拒一次写一行。
+    ///
+    /// 欠账跟着 [`Bucket::floor`] 钉了下界，所以「被挡多久」有个上界（约一分钟），刷得
+    /// 再多也只是「继续被封」。
+    pub async fn note_handshake_failure(&self, ip: IpKey) -> bool {
+        let Some(limit) = self.options.handshake_failures_per_minute else {
+            return true;
+        };
+
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+
+        // 表大了就顺手清一遍：回填到顶的条目代表「这个 IP 已经安静了一次失败该回填的
+        // 时间」，留着就是一份只涨不跌的表（扫描器会带来一大堆只用一次的 IP）。
+        // 只在**要插一个新地址**时扫：表停在高位时（IPv6 下现实）老地址反复失败每次都扫
+        // 一遍全表，而那正是被刷的时刻——扫描本身成了放大器。正常部署里这张表只有几项，
+        // 连扫都不会扫。
+        if !state.handshake_failures.contains_key(&ip)
+            && state.handshake_failures.len() >= HANDSHAKE_FAILURE_TABLE_SWEEP
+        {
+            state.handshake_failures.retain(|_, bucket| {
+                bucket.refill(now);
+
+                bucket.frames < limit
+            });
+        }
+
+        let bucket = state
+            .handshake_failures
+            .entry(ip)
+            .or_insert_with(|| Bucket::new(Quota::frames_only(limit, limit / 60.0), now));
+
+        let logged = bucket.take(now, 1.0, 0.0, 0.0);
+
+        bucket.floor(-limit);
+
+        logged
     }
 
     /// 只转发给**同一个 Room** 的对端，不回发给发送者，也不遍历别的 Room（§15）。
@@ -989,16 +1429,30 @@ impl Relay {
     /// 而且只摘在它自己的 Room 里）——一条停摆的连接不该拖死整台中继。
     async fn forward(&self, room_id: &str, from: u64, message: Message) {
         let targets: Vec<(String, u64, mpsc::Sender<Message>)> = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
 
-            match state.rooms.get(room_id) {
+            match state.rooms.get_mut(room_id) {
                 None => Vec::new(),
-                Some(room) => room
-                    .clients
-                    .iter()
-                    .filter(|(_, entry)| entry.id != from)
-                    .map(|(device_id, entry)| (device_id.clone(), entry.id, entry.sender.clone()))
-                    .collect(),
+                Some(room) => {
+                    let targets: Vec<(String, u64, mpsc::Sender<Message>)> = room
+                        .clients
+                        .iter()
+                        .filter(|(_, entry)| entry.id != from)
+                        .map(|(device_id, entry)| {
+                            (device_id.clone(), entry.id, entry.sender.clone())
+                        })
+                        .collect();
+
+                    // 真的有人接才算「转发了一帧」。这条统计是给部署者事后看「哪个会话 /
+                    // 哪把钥匙在夹带」用的（`sweep` 那行日志），把发给空气的帧也算进去
+                    // 会让它对不上真实出口流量，作为证据就没用了。
+                    if !targets.is_empty() {
+                        room.forwarded_frames += 1;
+                        room.forwarded_bytes += message.len() as u64;
+                    }
+
+                    targets
+                }
             }
         };
 
@@ -1260,6 +1714,9 @@ fn sweep(state: &mut State, room_id: &str) {
     let last_active = room.last_active;
     let tier = room.tier;
     let ip = room.ip;
+    let key_index = room.key_index;
+    let forwarded_frames = room.forwarded_frames;
+    let forwarded_bytes = room.forwarded_bytes;
 
     state.rooms.remove(room_id);
 
@@ -1274,10 +1731,17 @@ fn sweep(state: &mut State, room_id: &str) {
         }
     }
 
+    // 「第几把钥匙」与「转发了多少」是给部署者事后看的两条线索：中继看不到载荷
+    // （信令是端到端加密的），所以「哪个会话在夹带、是哪把钥匙带来的」只能靠这两项推断。
+    // 前者是创建这个会话的那把钥匙，同一个会话里的两个人可以拿不同的钥匙。
     println!(
-        "[{}] 双人会话已释放（{} 档，存活 {:.0}s，最后活动在 {:.0}s 前）",
+        "[{}] 双人会话已释放（{} 档，钥匙 #{}，转发 {} 帧 / {:.1} KB，\
+         存活 {:.0}s，最后活动在 {:.0}s 前）",
         room_fingerprint(room_id),
         tier.as_str(),
+        key_index + 1,
+        forwarded_frames,
+        forwarded_bytes as f64 / 1024.0,
         created_at.elapsed().as_secs_f64(),
         last_active.elapsed().as_secs_f64()
     );
@@ -1302,6 +1766,8 @@ mod tests {
     const SERVER_PASSWORD: &str = "relay-unit-tests-server-password";
     /// 公益档的服务器密码
     const PUBLIC_PASSWORD: &str = "relay-unit-tests-public-password";
+    /// 第二把**公益**钥匙：验「预算记在钥匙上，不是记在档位上」
+    const SECOND_PUBLIC_KEY: &str = "relay-unit-tests-second-public-key-1";
 
     fn relay(max_sessions: usize, stale_after: Duration) -> Arc<Relay> {
         relay_with(Options {
@@ -1318,6 +1784,13 @@ mod tests {
         max_public_sessions: usize,
         max_public_per_ip: usize,
         public_window: Option<Duration>,
+        /// 公益档一条连接的突发容量（`None` = 用缺省：24 帧 / 64 KiB 足够一轮打洞）
+        public_burst_frames: Option<f64>,
+        public_burst_bytes: Option<f64>,
+        /// 公益档每把钥匙的滚动预算（`None` = 用缺省，也就是真的开着）
+        public_key_budget: Option<f64>,
+        /// 握手层每 IP 每分钟的失败次数（`None` = 用缺省的那个 30）
+        handshake_failures_per_minute: Option<f64>,
         stale_after: Duration,
         ice_servers: Option<serde_json::Value>,
         stun_port: Option<u16>,
@@ -1329,10 +1802,19 @@ mod tests {
     }
 
     fn relay_with(options: Options) -> Arc<Relay> {
+        let defaults = RelayOptions::default();
+
         Relay::new(RelayOptions {
             limits: Limits::default(),
-            public_limits: RelayOptions::default().public_limits,
+            public_limits: defaults.public_limits,
+            public_burst_frames: options.public_burst_frames.unwrap_or(defaults.public_burst_frames),
+            public_burst_bytes: options.public_burst_bytes.unwrap_or(defaults.public_burst_bytes),
+            public_key_budget: options.public_key_budget.or(defaults.public_key_budget),
+            handshake_failures_per_minute: options
+                .handshake_failures_per_minute
+                .or(defaults.handshake_failures_per_minute),
             max_sessions: options.max_sessions,
+            max_connections: defaults.max_connections,
             max_public_sessions: options.max_public_sessions,
             max_public_per_ip: options.max_public_per_ip,
             public_window: options.public_window,
@@ -1368,7 +1850,8 @@ mod tests {
         let relay = relay(20, Duration::from_secs(120));
         let token = auth::derive_server_token(SERVER_PASSWORD);
 
-        assert_eq!(relay.classify_server_token(&token), Some(Tier::Full));
+        // 序号一起返回：它是公益档那把钥匙的预算归属（部署者那一档不记账，所以不影响行为）
+        assert_eq!(relay.classify_server_token(&token), Some((Tier::Full, 0)));
         assert_eq!(relay.classify_server_token(""), None);
         // 密码原文不是凭据：凭据是它派生出的一串
         assert_eq!(relay.classify_server_token(SERVER_PASSWORD), None);
@@ -1390,11 +1873,11 @@ mod tests {
 
         assert_eq!(
             open.classify_server_token(&auth::derive_server_token(SERVER_PASSWORD)),
-            Some(Tier::Full)
+            Some((Tier::Full, 0))
         );
         assert_eq!(
             open.classify_server_token(&auth::derive_server_token(PUBLIC_PASSWORD)),
-            Some(Tier::Public)
+            Some((Tier::Public, 1))
         );
         assert_eq!(
             open.classify_server_token(&auth::derive_server_token("someone-else")),
@@ -1428,7 +1911,7 @@ mod tests {
         // 部署者那一档不受影响
         assert_eq!(
             off.classify_server_token(&auth::derive_server_token(SERVER_PASSWORD)),
-            Some(Tier::Full)
+            Some((Tier::Full, 0))
         );
     }
 
@@ -1450,15 +1933,17 @@ mod tests {
         assert_eq!(relay.server_key_count(Tier::Full), 2);
         assert_eq!(relay.server_key_count(Tier::Public), 2);
 
-        for (password, tier) in [
-            (SERVER_PASSWORD, Tier::Full),
-            ("relay-unit-tests-second-full-key-01", Tier::Full),
-            (PUBLIC_PASSWORD, Tier::Public),
-            ("relay-unit-tests-second-public-key-1", Tier::Public),
+        // 序号也要对：公益档的预算记在**钥匙**上，认对档位却认错钥匙等于把两把钥匙的
+        // 额度混成一个。键的顺序是「完全档那一批，然后公益档那一批」
+        for (password, tier, index) in [
+            (SERVER_PASSWORD, Tier::Full, 0),
+            (PUBLIC_PASSWORD, Tier::Public, 1),
+            ("relay-unit-tests-second-full-key-01", Tier::Full, 2),
+            ("relay-unit-tests-second-public-key-1", Tier::Public, 3),
         ] {
             assert_eq!(
                 relay.classify_server_token(&auth::derive_server_token(password)),
-                Some(tier),
+                Some((tier, index)),
                 "{password} 应该是 {tier:?}"
             );
         }
@@ -1490,8 +1975,9 @@ mod tests {
         tier: Tier,
         source: IpKey,
     ) -> Result<Admit, RoomRejection> {
+        let key_index = key_index_for(relay, tier);
         let reservation = relay
-            .reserve(room_id, auth::auth_verifier(token), tier, source)
+            .reserve(room_id, auth::auth_verifier(token), tier, key_index, source)
             .await?;
 
         Ok(relay.admit(reservation, device_id, sender).await)
@@ -1508,12 +1994,27 @@ mod tests {
         tier: Tier,
         source: IpKey,
     ) -> Admit {
+        let key_index = key_index_for(relay, tier);
         let reservation = relay
-            .reserve(room_id, auth::auth_verifier(token), tier, source)
+            .reserve(room_id, auth::auth_verifier(token), tier, key_index, source)
             .await
             .unwrap_or_else(|rejection| panic!("预留 {room_id} 不该被拒：{rejection:?}"));
 
         relay.admit(reservation, device_id, sender).await
+    }
+
+    /// 这一档在**这台**服务器上的第一把钥匙是第几把。
+    ///
+    /// 会话层只认「摘要 + 档位」，序号是 `server.rs` 握手时算出来的（它是公益档记账的
+    /// 归属）。用例里按同一个口径反推，省得每个调用点硬编码那个数——那样将来钥匙顺序一变，
+    /// 一堆用例会跟着改错。
+    fn key_index_for(relay: &Relay, tier: Tier) -> usize {
+        relay
+            .options
+            .server_keys
+            .iter()
+            .position(|key| key.tier == tier)
+            .unwrap_or_else(|| panic!("用例里没配 {tier:?} 那一档的钥匙"))
     }
 
     /// `join` 的成功路径
@@ -1592,7 +2093,7 @@ mod tests {
     fn the_bucket_holds_one_second_of_capacity() {
         let limits = Limits::default();
         let start = Instant::now();
-        let mut bucket = Bucket::full(limits, start);
+        let mut bucket = Bucket::new(Quota::steady(limits), start);
         let frame = 1_024.0;
         let mut admitted = 0;
 
@@ -1615,13 +2116,30 @@ mod tests {
         assert_eq!(admitted_after_refill, 29);
     }
 
+    /// 还回去的那一笔就真的回到池子里了：合计桶不随连接消失，所以「被拒的帧不留账」
+    /// 只能靠 [`Bucket::refund`] 做到（按连接的桶不需要它，那个桶跟连接一起没）
+    #[test]
+    fn a_refund_puts_the_tokens_back() {
+        let start = Instant::now();
+        let mut bucket = Bucket::new(Quota::steady(Limits::default()), start);
+
+        assert!(bucket.take(start, 1.0, 0.0, 1_024.0));
+        assert!(bucket.take(start, 1.0, 0.0, 1_024.0));
+        assert!(!bucket.take(start, 1.0, 0.0, Limits::default().bytes_per_second));
+
+        // 把刚才那笔大的还回去，桶回到「扣两次小的」之后的状态
+        bucket.refund(1.0, 0.0, Limits::default().bytes_per_second);
+
+        assert!(bucket.take(start, 1.0, 0.0, 1_024.0));
+    }
+
     #[test]
     fn a_twenty_chunk_burst_is_legal() {
         // 20 个 512 KiB chunk（含帧头与 nonce/tag 每个约 524 KiB）合计约 10 MiB，
         // 低于 12 MiB 的字节上限——这正是 12 MiB 这个数字的由来
         let limits = Limits::default();
         let start = Instant::now();
-        let mut bucket = Bucket::full(limits, start);
+        let mut bucket = Bucket::new(Quota::steady(limits), start);
         let chunk = 512.0 * 1024.0 + FRAME_HEADER_SIZE as f64 + 24.0 + 16.0;
 
         for _ in 0..20 {
@@ -1636,7 +2154,7 @@ mod tests {
     fn the_byte_bucket_is_twelve_mebibytes() {
         let limits = Limits::default();
         let start = Instant::now();
-        let mut bucket = Bucket::full(limits, start);
+        let mut bucket = Bucket::new(Quota::steady(limits), start);
         let half = limits.bytes_per_second / 2.0;
 
         assert!(bucket.take(start, 0.0, 0.0, half));
@@ -1721,7 +2239,13 @@ mod tests {
 
         assert_eq!(
             relay
-                .reserve(ROOM_A, auth::auth_verifier("token-wrong"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_A,
+                    auth::auth_verifier("token-wrong"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .unwrap_err(),
             RoomRejection::AuthMismatch
@@ -1894,7 +2418,13 @@ mod tests {
         // 新的会话被拒（就是 server.rs 翻成 HTTP 503 的那条路径）
         assert_eq!(
             relay
-                .reserve(ROOM_C, auth::auth_verifier("token-c"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_C,
+                    auth::auth_verifier("token-c"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .unwrap_err(),
             RoomRejection::Capacity
@@ -1919,7 +2449,13 @@ mod tests {
 
         assert_eq!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_B,
+                    auth::auth_verifier("token-b"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .unwrap_err(),
             RoomRejection::Capacity
@@ -1929,7 +2465,13 @@ mod tests {
 
         assert!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_B,
+                    auth::auth_verifier("token-b"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .is_ok(),
             "会话空了就该把名额还回来"
@@ -1972,7 +2514,13 @@ mod tests {
     async fn a_reservation_that_never_reaches_admit_is_given_back() {
         let relay = relay(1, Duration::from_secs(120));
         let reservation = relay
-            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
+            .reserve(
+                    ROOM_A,
+                    auth::auth_verifier("token-a"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
             .await
             .unwrap();
 
@@ -1980,7 +2528,13 @@ mod tests {
 
         assert!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_B,
+                    auth::auth_verifier("token-b"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .is_ok(),
             "没用掉的预留必须把名额还回来"
@@ -1992,11 +2546,23 @@ mod tests {
     async fn a_room_with_a_handshake_in_flight_is_not_swept() {
         let relay = relay(1, Duration::from_secs(120));
         let first = relay
-            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
+            .reserve(
+                    ROOM_A,
+                    auth::auth_verifier("token-a"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
             .await
             .unwrap();
         let second = relay
-            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
+            .reserve(
+                    ROOM_A,
+                    auth::auth_verifier("token-a"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
             .await
             .unwrap();
 
@@ -2005,7 +2571,13 @@ mod tests {
         // 房间还在，而且仍然认同一份密钥（没有被清掉再重建）
         assert_eq!(
             relay
-                .reserve(ROOM_A, auth::auth_verifier("wrong"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_A,
+                    auth::auth_verifier("wrong"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .unwrap_err(),
             RoomRejection::AuthMismatch
@@ -2029,16 +2601,266 @@ mod tests {
         let (id_b, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
         for _ in 0..30 {
-            assert!(relay.allow(id_a, 1.0, 0.0, 64.0).await);
+            assert_eq!(relay.allow(id_a, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await, None);
         }
-        assert!(!relay.allow(id_a, 1.0, 0.0, 64.0).await);
+        assert_eq!(
+            relay.allow(id_a, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await,
+            Some(Limited::Connection)
+        );
 
         // 另一个 socket 有自己的桶
-        assert!(relay.allow(id_b, 1.0, 0.0, 64.0).await);
+        assert_eq!(relay.allow(id_b, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await, None);
 
         // 已经摘掉的连接不再有桶，也不会被 `entry().or_insert_with()` 重新造出来
         relay.drop_peer(ROOM_A, "b", id_b).await;
-        assert!(!relay.allow(id_b, 1.0, 0.0, 64.0).await);
+        assert_eq!(
+            relay.allow(id_b, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await,
+            Some(Limited::Connection)
+        );
+    }
+
+    /// 公益档的滚动预算记在**钥匙**上：拿同一把钥匙的会话共用一个桶，另一把钥匙不受影响。
+    ///
+    /// 按连接、按房间、按 IP 记账都能被绕开（房间是客户端用配对密码推出来的、一空就没了；
+    /// 换配对密码就是新房间；IP 会连坐同一个 NAT，在 IPv6 上还软），只有钥匙是部署者发出去
+    /// 的、拿钥匙的人换不掉。这一条把三件事一起钉住：同一把钥匙跨**会话**共用、另一把钥匙
+    /// 自己那一份不动、部署者那一档完全不扣这个桶。
+    #[tokio::test]
+    async fn the_public_budget_is_per_key_not_per_room() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            max_public_sessions: 10,
+            max_public_per_ip: 4,
+            public_tier: true,
+            // 第二把公益钥匙（键的顺序是「完全档那一批，然后公益档那一批」，所以它是第 3 把）
+            extra_keys: vec![(Tier::Public, SECOND_PUBLIC_KEY)],
+            // 预算小到一眼能数清：1000 字节一次性，回填速率是它的 1/3600，测试里等于没有
+            public_key_budget: Some(1000.0),
+            ..Options::default()
+        });
+        let (a_tx, _a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (b_tx, _b_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (other_tx, _other_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (full_tx, _full_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let public = key_index_for(&relay, Tier::Public);
+
+        // 两个**不同会话**，但都用第一把公益钥匙
+        let (id_a, _, _) = join_ok_tier(&relay, ROOM_A, "token-a", "a", &a_tx, Tier::Public).await;
+        let (id_b, _, _) = join_ok_tier(&relay, ROOM_B, "token-b", "b", &b_tx, Tier::Public).await;
+        let (id_full, _, _) = join_ok(&relay, ROOM_C, "token-c", "c", &full_tx).await;
+
+        assert_eq!(relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0).await, None);
+        assert_eq!(
+            relay.allow(id_b, Tier::Public, public, 1.0, 0.0, 900.0).await,
+            Some(Limited::KeyBudget),
+            "同一把钥匙跨会话共用一个桶：A 花掉之后 B 也发不出去（B 自己那一份还有的是）"
+        );
+
+        // 另一把公益钥匙自己那一份没被动过：它是**另一个**会话，且换了一把钥匙
+        let (id_other, _, _) =
+            join_ok_tier(&relay, ROOM_A, "token-a", "a2", &other_tx, Tier::Public).await;
+        let second = relay.options.server_keys.len() - 1;
+
+        assert_eq!(
+            relay.allow(id_other, Tier::Public, second, 1.0, 0.0, 900.0).await,
+            None,
+            "换一把钥匙就是另一份预算，不该被前一把的欠账连坐"
+        );
+
+        // 部署者那一档压根不扣这个桶：它照旧按自己的额度走
+        for _ in 0..30 {
+            assert_eq!(
+                relay.allow(id_full, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0)
+                    .await,
+                None
+            );
+        }
+    }
+
+    /// 被预算拒掉的那一帧**不在钥匙上留账**。
+    ///
+    /// 钥匙那张表不随连接消失，所以「先扣再判、不回滚」在这里会变成会累加的欠账（每次
+    /// 「重连 + 发一帧」都多记一笔）。这一条用字节那一维把它钉住：剩余 100 字节时，一个
+    /// 900 字节的帧该被拒，而那笔钱必须立刻还回来——紧接着那个 50 字节的小帧装得下剩下的
+    /// 100，就该放行。没有 `refund` 的话它会被误伤。
+    #[tokio::test]
+    async fn a_frame_the_budget_refuses_leaves_no_debt() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            max_public_sessions: 10,
+            max_public_per_ip: 4,
+            public_tier: true,
+            public_key_budget: Some(1000.0),
+            ..Options::default()
+        });
+        let (a_tx, _a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (id_a, _, _) = join_ok_tier(&relay, ROOM_A, "token-a", "a", &a_tx, Tier::Public).await;
+        let public = key_index_for(&relay, Tier::Public);
+
+        assert_eq!(relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0).await, None);
+        assert_eq!(
+            relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0).await,
+            Some(Limited::KeyBudget),
+            "只剩 100 字节，900 的帧装不下"
+        );
+        assert_eq!(
+            relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 50.0).await,
+            None,
+            "被拒的那笔已经还回去了，50 字节的帧仍然装得下"
+        );
+    }
+
+    /// 同一个 Room 上「已放行、还没走进 `admit`」的连接要封顶。
+    ///
+    /// 不封顶时这条路上**没有任何额度**：同一个 Room 能被堆上任意多条这样的连接，每条占
+    /// 一个任务加一份 8 KiB 的请求头缓冲（还在 10 秒的握手超时里），而且它们的许可都算进
+    /// 容量——既拖住自己，也拖住别人（`pending > 0` 的 Room 永远不被 `sweep` 清掉）。
+    #[tokio::test]
+    async fn a_room_refuses_to_pile_up_pending_handshakes() {
+        let relay = relay(20, Duration::from_secs(120));
+        let held: Vec<_> = {
+            let mut held = Vec::new();
+
+            for index in 1..=MAX_PENDING_PER_ROOM {
+                let reservation = relay
+                    .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, 0, ip(1))
+                    .await
+                    .unwrap_or_else(|rejection| panic!("第 {index} 条握手该放行：{rejection:?}"));
+
+                held.push(reservation);
+            }
+
+            held
+        };
+
+        assert_eq!(
+            relay
+                .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, 0, ip(1))
+                .await
+                .unwrap_err(),
+            RoomRejection::TooManyPending
+        );
+
+        // 还回一份之后又有位置：这正是「握手失败要还回去」走的那条路，正常重连也靠它
+        let mut held = held;
+
+        relay.release(held.pop().unwrap()).await;
+
+        assert!(relay
+            .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, 0, ip(1))
+            .await
+            .is_ok());
+    }
+
+    /// 握手失败按 IP 限速，而且**同一份计数**决定日志写不写。
+    ///
+    /// 拿错密码刷 `/ws` 的代价本来只是一次摘要比较，能被打爆的是**日志**（部署者排障的
+    /// 唯一证据，被刷掉就等于没有）。这一条钉住三个形状：没失败过的 IP 直接放行、失败
+    /// 攒够了就被挡下、被挡下之后不再写日志——而别的 IP 一点不受影响。
+    #[tokio::test]
+    async fn a_flood_of_failed_handshakes_is_throttled_per_ip() {
+        let relay = relay(20, Duration::from_secs(120));
+
+        // 还没失败过：连桶都没建，直接放行
+        assert!(relay.handshake_allowed(ip(1)).await);
+
+        // 前 30 次都该写日志（也就是都返回 true）
+        for index in 1..=(DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE as usize) {
+            assert!(
+                relay.note_handshake_failure(ip(1)).await,
+                "第 {index} 行日志该照写"
+            );
+        }
+
+        assert!(
+            !relay.note_handshake_failure(ip(1)).await,
+            "额度用光之后这一行该静默（连接照样按状态码被拒）"
+        );
+        assert!(
+            !relay.handshake_allowed(ip(1)).await,
+            "而且下一次握手该被 429"
+        );
+
+        // 另一个 IP 有自己的额度：刷爆一个不该连坐别人
+        assert!(relay.handshake_allowed(ip(2)).await);
+        assert!(relay.note_handshake_failure(ip(2)).await);
+    }
+
+    /// 封禁时长有个上界：刷得再久也只是「继续被封」，不是「刷多久封多久」。
+    ///
+    /// 欠账是拿「还差多少额度」算的，没有下界就会一直涨——刷五分钟错密码能封一个 IP
+    /// 八个多小时，同一个 NAT（或 IPv6 的 /64）后面的人跟着连坐。这里钉住「桶底 = 一份
+    /// 满额度」：两千次失败之后欠账仍然停在下界上。
+    #[tokio::test]
+    async fn a_long_flood_cannot_extend_the_ban_forever() {
+        let relay = relay(20, Duration::from_secs(120));
+        let limit = DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE;
+
+        for _ in 0..2_000 {
+            relay.note_handshake_failure(ip(1)).await;
+        }
+
+        assert!(!relay.handshake_allowed(ip(1)).await);
+
+        let state = relay.state.lock().await;
+        let bucket = state.handshake_failures.get(&ip(1)).unwrap();
+
+        assert!(
+            bucket.frames >= -limit,
+            "欠账越过下界了：{}",
+            bucket.frames
+        );
+        // 回填到「能再握手」（`frames >= 1`）要 (limit + 1) / (limit / 60) ≈ 62 秒，
+        // 与刷了多少次无关
+        assert!(bucket.frames <= -limit + 1.0);
+    }
+
+    /// 清理只在**要插一个新地址**时做：表停在高位时，老地址反复失败不该每次都扫全表。
+    #[tokio::test]
+    async fn the_failure_table_is_only_swept_for_a_new_address() {
+        let relay = relay(20, Duration::from_secs(120));
+        let limit = DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE;
+        let quota = Quota::frames_only(limit, limit / 60.0);
+
+        // 「额度已经回满」的条目：正是清理该扔掉的那一种
+        let idle = || Bucket::new(quota, Instant::now());
+
+        {
+            let mut state = relay.state.lock().await;
+
+            for index in 0..HANDSHAKE_FAILURE_TABLE_SWEEP {
+                let address = IpAddr::from([10, 1, (index >> 8) as u8, index as u8]);
+
+                state.handshake_failures.insert(IpKey::from_addr(address), idle());
+            }
+
+            // 一条早就安静下来的旧账（表顶到阈值之后才插的，所以它一定还在）
+            state.handshake_failures.insert(ip(250), idle());
+            // 这个地址接着还要再失败一次
+            state.handshake_failures.insert(ip(251), idle());
+        }
+
+        // 老地址又失败一次：不插新条目，也就不扫表——旧账还躺着
+        assert!(relay.note_handshake_failure(ip(251)).await);
+        assert!(
+            relay
+                .state
+                .lock()
+                .await
+                .handshake_failures
+                .contains_key(&ip(250))
+        );
+
+        // 新地址失败：这才是「表到顶了」的时刻，顺手清一遍
+        assert!(relay.note_handshake_failure(ip(252)).await);
+
+        let state = relay.state.lock().await;
+
+        // 该清的清掉（已经回满的旧账）……
+        assert!(!state.handshake_failures.contains_key(&ip(250)));
+        // ……而**还欠着**的条目一条都不能少：把 `retain` 的判据放宽（比如 `<= limit`）
+        // 会让表被反复清空、桶被重建，限速整条废掉。这一条就是钉住它的。
+        assert!(state.handshake_failures.contains_key(&ip(251)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2196,6 +3018,7 @@ mod tests {
                     &room_id_of('c'),
                     auth::auth_verifier("token-c"),
                     Tier::Public,
+                    key_index_for(&relay, Tier::Public),
                     ip(1)
                 )
                 .await
@@ -2208,6 +3031,7 @@ mod tests {
                     &room_id_of('d'),
                     auth::auth_verifier("token-d"),
                     Tier::Full,
+                    key_index_for(&relay, Tier::Full),
                     ip(2)
                 )
                 .await
@@ -2243,7 +3067,13 @@ mod tests {
         // 而不是「一个人有中继兜底、另一个人什么都没有」）
         assert_eq!(
             relay
-                .reserve(ROOM_A, auth::auth_verifier("token-a"), Tier::Full, ip(1))
+                .reserve(
+                    ROOM_A,
+                    auth::auth_verifier("token-a"),
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    ip(1)
+                )
                 .await
                 .unwrap_err(),
             RoomRejection::TierMismatch
@@ -2286,7 +3116,13 @@ mod tests {
         // 第二个**会话**来自同一个 IP：拒
         assert_eq!(
             relay
-                .reserve(ROOM_B, auth::auth_verifier("token-b"), Tier::Public, ip(1))
+                .reserve(
+                    ROOM_B,
+                    auth::auth_verifier("token-b"),
+                    Tier::Public,
+                    key_index_for(&relay, Tier::Public),
+                    ip(1)
+                )
                 .await
                 .unwrap_err(),
             RoomRejection::PublicIpLimit
@@ -2492,25 +3328,40 @@ mod tests {
         );
     }
 
-    /// 公益档的额度是另一份（默认 10 帧/秒 / 256 KiB/秒），桶按档位取
+    /// 公益档的桶是**另一份形状**：突发与持续分成两个数，而且都比部署者那一档小。
+    ///
+    /// 只看「额度」那一项已经不够了——决定诚实打洞能不能一口气发完的是**突发容量**，
+    /// 决定「拿信令帧夹带数据」能跑多快的是**回填速率**。这一条把两半都钉住，顺带钉住
+    /// 完全档仍是「容量 = 速率」（那是与 Cloudflare 版逐条一致的地方，不能顺手改成两半）。
     #[test]
     fn the_public_tier_uses_its_own_limits() {
         let relay = public_relay(20, 20, 0);
         let start = Instant::now();
-        let public = Bucket::full(relay.limits_for(Tier::Public), start);
-        let full = Bucket::full(relay.limits_for(Tier::Full), start);
+        let public = Bucket::new(relay.connection_quota(Tier::Public), start);
+        let full = Bucket::new(relay.connection_quota(Tier::Full), start);
+        let public_limits = relay.limits_for(Tier::Public);
 
         assert_eq!(
-            public.limits.frames_per_second,
-            protocol::DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND
+            public.frames,
+            protocol::DEFAULT_PUBLIC_BURST_FRAMES,
+            "突发给足：一轮 12 帧 / 8 KB 要能一口气发完"
         );
         assert_eq!(
-            public.limits.bytes_per_second,
-            protocol::DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND
+            public.bytes,
+            protocol::DEFAULT_PUBLIC_BURST_BYTES
         );
+        assert!(public.frames > protocol::DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND);
+
+        // 持续那一半就是广告出去的那份额度
+        assert_eq!(public.quota.frames_rate, public_limits.frames_per_second);
+        assert_eq!(public.quota.bytes_rate, public_limits.bytes_per_second);
         assert!(
-            public.limits.frames_per_second < full.limits.frames_per_second,
-            "公益档的额度必须比部署者那一档小"
+            public.quota.bytes_rate < full.quota.bytes_rate,
+            "公益档的持续额度必须比部署者那一档小"
         );
+
+        // 完全档：容量 = 速率（与 CF 版逐条一致）
+        assert_eq!(full.frames, full.quota.frames_rate);
+        assert_eq!(full.bytes, full.quota.bytes_rate);
     }
 }

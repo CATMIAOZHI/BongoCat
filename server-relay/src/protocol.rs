@@ -74,6 +74,18 @@ pub const FRAME_KIND_SIGNAL: u8 = 8;
 /// 夹带通道」压成涓流。超过就 `1009` 关连接。
 pub const MAX_PUBLIC_FRAME_SIZE: usize = 64 * 1024;
 
+/// 公益档连接的 **WebSocket 层**读上限。
+///
+/// 协议上限是 [`MAX_PUBLIC_FRAME_SIZE`]，但交给 tungstenite 的 `max_message_size` 不能
+/// 贴着它设：超限时 tungstenite 读完**帧头**就报错，帧体还在接收缓冲里，关连接会让 TCP
+/// 直接 RST，对端看到的是「连接被重置」而不是干净的 `1009`（完全档那边的 8 MiB 余量就是
+/// 同一个理由）。取两倍：64 KiB ~ 128 KiB 的帧能被完整读完、干净地回 `1009`，再大就落到
+/// 「尽力回 `1009`」那条路径。
+///
+/// 它的真正作用是**内存隔离**：这一条把单条公益连接的读缓冲从完全档的 8 MiB 压到 128 KiB，
+/// 于是「一堆公益连接把宿主机内存吃光、把部署者自己那一档一起搞死」这条路被堵住。
+pub const PUBLIC_WS_MESSAGE_SIZE: usize = 2 * MAX_PUBLIC_FRAME_SIZE;
+
 /// 单帧上限（整帧，含帧头与 nonce/tag）
 pub const MAX_BINARY_FRAME_SIZE: usize = 1024 * 1024;
 
@@ -97,12 +109,42 @@ pub const DEFAULT_MAX_PUBLIC_SESSIONS: usize = 10;
 /// 挡住）。一条公益会话是两条连接，所以默认 4 = 两对。
 pub const DEFAULT_MAX_PUBLIC_PER_IP: usize = 4;
 
-/// 公益档的额度（`PAIR_PUBLIC_MAX_FRAMES_PER_SECOND` / `PAIR_PUBLIC_MAX_BYTES_PER_SECOND`）。
+/// 公益档一条连接的**持续**额度（`PAIR_PUBLIC_MAX_FRAMES_PER_SECOND` /
+/// `PAIR_PUBLIC_MAX_BYTES_PER_SECOND`）——这是回填速率，不再是「突发容量」（见下）。
 ///
-/// 信令一轮只有个位数帧、总共几 KB，10 帧/秒与 256 KiB/秒 都留了很大余量；它们的作用是
-/// 把「拿 kind 8 夹带数据」限制成涓流，同时保护部署者的带宽与 CPU。
-pub const DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND: f64 = 10.0;
-pub const DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND: f64 = 256.0 * 1024.0;
+/// 诚实形状是它唯一的依据：一组一轮打洞是 `hello` + `offer`/`answer` + 逐条的 `candidate`
+/// （一条一帧），**约 12 帧、8 KB**，一次发完，然后长时间静默（失败时按 5 → 120 秒退避
+/// 重试一轮，整夜也就是 0.2~1.6 KB/秒）。所以持续额度压到 12 帧/秒与 **8 KiB/秒** 仍然有
+/// 5~35 倍余量，而「拿 kind 8 夹带数据」被压到 28 MB/小时这个量级。
+///
+/// 帧这一维还会被客户端看到：它按广告值的 2/3 推导自己的出站速率（12 → 8 帧/秒），
+/// 12 帧的报价因此摊在约 1.5 秒里发完——打洞不差这点时间。字节那一维客户端不消费
+/// （它只用帧与分片两维），所以它纯粹是中继自己的账。
+pub const DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND: f64 = 12.0;
+pub const DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND: f64 = 8.0 * 1024.0;
+
+/// 公益档一条连接的**突发容量**（`PAIR_PUBLIC_BURST_FRAMES` / `PAIR_PUBLIC_BURST_BYTES`）。
+///
+/// 令牌桶的容量与回填速率**必须是两个数**：只用一个数时它就是「容量 = 1 秒的量」，于是
+/// 要么小到装不下一轮打洞（误伤），要么大到等于没有上限（比如「256 KiB/秒」实际是
+/// 「256 KiB 的突发」，一小时能灌 900 MB）。诚实形状偏偏是「一轮几 KB 的突发 + 长期
+/// 静默」，所以这里把突发给足、把持续压低：
+///
+/// - 24 帧 / 64 KiB 的突发：一轮 12 帧 / 8 KB 能一口气发完（2 倍 / 8 倍余量）；
+/// - 上面那两个持续值：整夜重试也不会见底（见它的注释）。
+pub const DEFAULT_PUBLIC_BURST_FRAMES: f64 = 24.0;
+pub const DEFAULT_PUBLIC_BURST_BYTES: f64 = 64.0 * 1024.0;
+
+/// 公益档**每把钥匙**的滚动预算（`PAIR_PUBLIC_KEY_BUDGET_BYTES`，0 = 不设这一层）。
+///
+/// 记账挂到「钥匙」上，而不是连接 / 房间 / IP：连接与房间都能靠「断开重连」「换个配对
+/// 密码」白嫖刷新（Room 是客户端自己用配对密码推出来的，一空就被清掉），IP 会连坐同一个
+/// NAT 下的无辜用户、在 IPv6 上还很软——而**钥匙是部署者发出去的**，拿钥匙的人换不掉。
+///
+/// 16 MiB 的桶 + 每小时回填 16 MiB：诚实用法每把钥匙约 0.8 MB/小时（整夜打不通的极端值），
+/// 20 倍余量；而夹带者最坏也只能「先花 16 MiB、之后 16 MiB/小时」——想更多就得换钥匙，
+/// 那件事只有部署者做得到。它同时也是「谁在夹带」的天然身份（详见 `sweep` 那行日志）。
+pub const DEFAULT_PUBLIC_KEY_BUDGET_BYTES: f64 = 16.0 * 1024.0 * 1024.0;
 
 /// 公益档的空闲回收窗口（`PAIR_PUBLIC_WINDOW_SECS`）。
 ///
@@ -111,6 +153,33 @@ pub const DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND: f64 = 256.0 * 1024.0;
 /// ——而中继一断，客户端是整条会话重启、直连也跟着重来。这里的判据是「多久没收到**任何**
 /// 入站消息」，诚实客户端每 60 秒发一次 WebSocket Ping，180 秒 = 三次漏拍。
 pub const DEFAULT_PUBLIC_WINDOW_SECS: u64 = 180;
+
+/// 一个 Room 里最多同时有几条「已鉴权、还没走进 `admit`」的连接（`pending`）。
+///
+/// 正常情况永远只会有 1~2 条：两个人各自握手。给它封顶是因为**不封顶的那条路不需要任何
+/// 额度**——同一个 Room 可以被堆上任意多条这样的连接，每条占一个任务、一份 8 KiB 的请求头
+/// 缓冲（还在 `HANDSHAKE_TIMEOUT` 那 10 秒里），而且它们的许可都算进容量（`pending`），
+/// 于是既拖住自己、也拖住别人。4 条 = 正常用法的两倍余量（握手 + 一次重连重叠）。
+pub const MAX_PENDING_PER_ROOM: usize = 4;
+
+/// 握手层每个 IP 允许的**失败**速率（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`，0 = 不限）。
+///
+/// 它**按 IP 算、两档都算**：拿错服务器密码、拿错公益密码、公益名额满……每一次被拒都记一笔。
+/// 错密码刷 `/ws` 的代价是「一次 SHA256 与一次恒定时间比较」——单次很便宜，但可以无限刷，
+/// 而且每次都写一行日志（日志是部署者排障的唯一证据，被刷掉就等于没有）。
+///
+/// 30 次/分钟对诚实客户端是很宽的门槛：密码不对在客户端是**致命**的（它直接提示改密码、
+/// 根本不重试），会按退避重试的是 429 / 503 那一类，而那个退避封顶 30 秒，也就是最多
+/// 2 次/分钟——离 30 差十几倍。所以这一项只用来把「一个 IP 的持续爆破」压到 0.5 次/秒。
+/// 代价是同一个 NAT 后面的无辜用户会跟着被 429 一段时间（按 IP 记账的固有取舍）。
+pub const DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE: f64 = 30.0;
+
+/// 能同时挂着的 TCP 连接数缺省上限（`RelayOptions::max_connections` 的缺省值）。
+///
+/// 真实部署里这个数由名额推出来（一个会话两条连接，再加一截握手余量，见
+/// `server.rs::Config::max_connections`），所以部署者不用管它；这个缺省值是给会话层的单测
+/// 与 `RelayOptions::default()` 用的。
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// `ROOM_ID` 的长度上界。客户端派生出来的是 43 个字符（32 字节 base64url 无填充），
 /// 这里按上界校验：中继只需要「非空、够短、字符集合法」，不必钉死长度。
@@ -142,6 +211,10 @@ pub mod close_code {
     pub const STALE: u16 = 4004;
     /// 公益档：空闲太久被回收（**不是**「打洞失败」，见 `DEFAULT_PUBLIC_WINDOW_SECS`）
     pub const PUBLIC_WINDOW: u16 = 4005;
+    /// 公益档：这把钥匙的预算用完了（**不是**「你发太快」，见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`）。
+    /// 它与 `1008`（自己的额度不够）分开，客户端才能说出「这台服务器给你的公益额度用完了」
+    /// 而不是一句笼统的格式错误。
+    pub const KEY_BUDGET: u16 = 4006;
     /// 协议 / 帧格式错误
     pub const PROTOCOL_ERROR: u16 = 1008;
     /// 帧过大
@@ -313,8 +386,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&frame.to_json()).unwrap();
 
         assert_eq!(json["tier"], "public");
-        assert_eq!(json["limits"]["framesPerSecond"], 10.0);
-        assert_eq!(json["limits"]["bytesPerSecond"], 256.0 * 1024.0);
+        // 广告出去的是**持续**额度（客户端按它的 2/3 推自己的出站速率）：12 帧/秒与
+        // 8 KiB/秒。突发容量（24 帧 / 64 KiB）是中继这边的账，不进 welcome。
+        assert_eq!(json["limits"]["framesPerSecond"], 12.0);
+        assert_eq!(json["limits"]["bytesPerSecond"], 8.0 * 1024.0);
     }
 
     #[test]

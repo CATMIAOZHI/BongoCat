@@ -23,7 +23,10 @@ use bongocat_pair_relay::relay::{Relay, RelayOptions, ServerKey};
 use bongocat_pair_relay::server::{self, Config};
 use bongocat_pair_relay::{
     auth,
-    protocol::{self, close_code, Limits, DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND},
+    protocol::{
+        self, close_code, Limits, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
+        DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
+    },
 };
 
 /// 两个互不相干的会话：多会话的隔离性全靠它们来验
@@ -115,6 +118,10 @@ fn config(
         stun_port,
         server_keys: vec![ServerKey::new(Tier::Full, SERVER_PASSWORD)],
         public_limits: defaults.public_limits,
+        public_burst_frames: defaults.public_burst_frames,
+        public_burst_bytes: defaults.public_burst_bytes,
+        public_key_budget: defaults.public_key_budget,
+        handshake_failures_per_minute: defaults.handshake_failures_per_minute,
         max_public_sessions: defaults.max_public_sessions,
         max_public_per_ip: defaults.max_public_per_ip,
         public_window: defaults.public_window,
@@ -902,18 +909,21 @@ async fn the_rate_limit_closes_with_1008() {
 /// 公益档的额度是**它自己那一份**（`PAIR_PUBLIC_MAX_FRAMES_PER_SECOND` /
 /// `PAIR_PUBLIC_MAX_BYTES_PER_SECOND`），和部署者那一档分开配。
 ///
-/// 桶确实按档位建（`relay.rs` 里的 `Bucket::full(self.limits_for(tier), now)`），但额度
+/// 桶确实按档位建（`relay.rs` 里的 `Bucket::new(self.connection_quota(tier), now)`），但额度
 /// 本身只在 welcome 的广告值和 `limits_for` 上被断言过——把桶写成部署者那一档的额度，
 /// 别的用例一条都不会红。这一条真拿公益连接把额度打穿。
 #[tokio::test]
 async fn the_public_tier_has_its_own_rate_limit() {
-    // 公益档只给 2 帧/秒：第 3 帧必然超限（部署者那一档仍是 `Limits::default()`，远大于此）
+    // 公益档只给 2 帧/秒、突发也只有 2 帧：第 3 帧必然超限（部署者那一档仍是
+    // `Limits::default()`，远大于此）。突发必须跟着调小——它的缺省是 24 帧，只调速率的话
+    // 前 24 帧都在突发额度里，这一条会误判成「限流没生效」。
     let config = Config {
         public_limits: Limits {
             frames_per_second: 2.0,
             chunks_per_second: 2.0,
             bytes_per_second: 1024.0 * 1024.0,
         },
+        public_burst_frames: 2.0,
         ..public_config(20, 10, 4, None)
     };
     let address = start_relay_with_config(config).await;
@@ -932,6 +942,206 @@ async fn the_public_tier_has_its_own_rate_limit() {
     assert_eq!(
         wait_close(&mut client).await,
         Some(close_code::PROTOCOL_ERROR)
+    );
+}
+
+/// 发一条消息，然后用一次 Ping/Pong 确认服务器**真的处理过它了**。
+///
+/// 同一个 TCP 流是按顺序读的，而 Pong 由 tungstenite 在读循环里自动回（不碰限流那一层），
+/// 所以「收到 Pong」= 「前面那条消息已经走完处理」。跨连接做限流断言时必须要有这个同步点，
+/// 否则「谁先把预算用光」会变成抽签。
+async fn send_and_settle(client: &mut Client, message: Message) {
+    client.send(message).await.unwrap();
+    client.send(Message::Ping(Vec::new().into())).await.unwrap();
+
+    loop {
+        let next = tokio::time::timeout(PATIENCE, client.next())
+            .await
+            .expect("等 Pong 超时")
+            .unwrap()
+            .unwrap();
+
+        if let Message::Pong(_) = next {
+            return;
+        }
+    }
+}
+
+/// 公益档的滚动预算记在**钥匙**上（`PAIR_PUBLIC_KEY_BUDGET_BYTES`）：拿同一把钥匙的
+/// 会话共用一个桶，另一把钥匙不受影响。
+///
+/// 与上一条的区别：那一条是「这条连接自己发太快」（关 1008），这一条是「同一把钥匙的
+/// 两个**不同会话**合起来把它用光了」（关 4006）。它必须在真连接上验——`Config::relay_options`
+/// 有没有把这一项折进会话层、关闭码是不是 4006、另一把钥匙是不是真的不受影响，只有跑到
+/// 这一步才看得出来。
+#[tokio::test]
+async fn the_public_key_budget_is_shared_by_two_sessions_of_one_key() {
+    let mut config = public_config(20, 10, 4, None);
+
+    // 第二把公益钥匙：验「换一把钥匙就是另一份预算」
+    config
+        .server_keys
+        .push(ServerKey::new(Tier::Public, SECOND_PUBLIC_PASSWORD));
+    // 预算小到一眼能数清：两帧 900 字节的载荷就用光（回填速率是它的 1/3600，测试里等于
+    // 没有）。载荷取 900 而不是 16：帧头只有 14 字节，用 16 字节的帧要发几百条才够得着
+    // 这层预算，而那条连接自己的突发（64 KiB）反而先成为限制。
+    config.public_key_budget = Some(2_000.0);
+
+    let address = start_relay_with_config(config).await;
+
+    // 两个**不同**的会话（`ROOM_A` / `ROOM_B`），都用第一把公益钥匙
+    let mut first = connect_public(address, ROOM_A, TOKEN_A, "aaaa").await;
+    let mut second = connect_public(address, ROOM_B, TOKEN_B, "bbbb").await;
+
+    next_json(&mut first).await;
+    next_json(&mut second).await;
+
+    let signal = |payload| Message::Binary(frame(protocol::FRAME_KIND_SIGNAL, payload).into());
+
+    // 一人一帧：这把钥匙的预算还剩 172 字节
+    send_and_settle(&mut first, signal(900)).await;
+    send_and_settle(&mut second, signal(900)).await;
+
+    // 第 3 帧无论从哪一边发都会越界——这里从**第二个**会话发，证明它借的是同一把钥匙的
+    // 那份预算，而不是自己那条连接的那一份（那条还有 64 KiB 的突发、24 帧的额度）
+    second.send(signal(900)).await.unwrap();
+
+    let closed = wait_close_frame(&mut second).await.expect("应当被关掉");
+
+    assert_eq!(u16::from(closed.code), close_code::KEY_BUDGET);
+    assert!(
+        closed.reason.contains("budget"),
+        "关闭帧要说清是**预算**用完了（不是「你发太快」），实际：{:?}",
+        closed.reason
+    );
+
+    // 换一把公益钥匙就是另一份预算：它不该被前一把的欠账连坐——这两帧合计 1828 字节，
+    // 装得进它自己那份 2000。要是预算记成了「档位」或者别的共用的东西，它们会被当场拒掉
+    let mut other = connect_with_server(
+        address,
+        ROOM_C,
+        TOKEN_C,
+        "1",
+        "cccc",
+        &auth::derive_server_token(SECOND_PUBLIC_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    next_json(&mut other).await;
+
+    for _ in 0..2 {
+        other.send(signal(900)).await.unwrap();
+    }
+
+    expect_silence(&mut other, "拿另一把公益钥匙的连接").await;
+}
+
+/// 连接数上限（`Config::max_connections`，由名额推出来）真的会挡住新的 TCP 连接。
+///
+/// 这条闸防的不是「会话太多」（那是名额），而是「开任意多条 TCP」：`/health` 与握手都不过
+/// 闸，每条连接占一个任务加一份 8 KiB 的请求头缓冲——不管的话一个客户端就能把宿主机拖垮，
+/// 那时连部署者自己那一档也一起连不上。
+///
+/// 判据必须是**那句专门的话**：单看状态码不够，因为「会话满了」也是 503。这里用「只连不发」
+/// 的空闲连接把许可占满（它们在等请求头，最多 10 秒），再验两件事：新连接被回 503 + 那句话；
+/// 把这些连接放掉之后又能正常握手。
+#[tokio::test]
+async fn the_connection_cap_answers_with_its_own_503() {
+    // 1 组完全档 + 0 组公益档 = 2 × 1 + 32 = 34 条连接
+    let config = Config {
+        max_public_sessions: 0,
+        ..config(Limits::default(), 1, Duration::from_secs(120), None, None)
+    };
+    let address = start_relay_with_config(config).await;
+
+    // 「服务器把这 34 条空闲连接都接受下来」是异步的，所以连上就断言会闪；一直问到要么
+    // 拿到那句话、要么等够 `PATIENCE`
+    async fn until_refused(address: SocketAddr) -> String {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+
+        loop {
+            let answer =
+                raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+
+            if answer.contains("server is at its connection limit")
+                || tokio::time::Instant::now() >= deadline
+            {
+                return answer;
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // 只连不发：这些连接会一直握着许可
+    let idle: Vec<TcpStream> = {
+        let mut idle = Vec::new();
+
+        for _ in 0..34 {
+            idle.push(TcpStream::connect(address).await.unwrap());
+        }
+
+        idle
+    };
+    let refused = until_refused(address).await;
+
+    assert!(refused.contains(" 503 "), "连接满了要回 503，实际：{refused}");
+    assert!(
+        refused.contains("server is at its connection limit"),
+        "而且要说清是**连接数**满了（不是会话满了），实际：{refused}"
+    );
+
+    // 放掉空闲连接，闸又开了
+    drop(idle);
+
+    let mut opened = false;
+
+    for _ in 0..200 {
+        if handshake_status(address, ROOM_A, TOKEN_A, "aaaa").await == 101 {
+            opened = true;
+
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(opened, "放掉空闲连接之后应当又能正常握手");
+}
+
+/// 拿错服务器密码刷 `/ws`：额度（默认 30/分钟）用光之后，这个 IP 会**在鉴权之前**被 429
+/// 挡下，连 `/health` 一起。
+///
+/// 这一条钉的是「闸放在哪一步」。放在鉴权之后的话，每一次被拒仍然要跑一遍摘要比较——
+/// 而这道闸要省的正是那件事（外加日志）。顺带钉住「被挡的 IP 连健康检查都拿不到」。
+#[tokio::test]
+async fn a_flood_of_failed_handshakes_is_429_before_anything_else() {
+    let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
+    let stranger = auth::derive_server_token("relay-tests-stranger-password");
+
+    for index in 1..=(DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE as usize) {
+        assert_eq!(
+            handshake_status_with_server(address, ROOM_A, TOKEN_A, "1", "aaaa", &stranger).await,
+            403,
+            "第 {index} 次仍按「密码不对」拒"
+        );
+    }
+
+    // 第 31 次：这一次拿的是**对**的密码，照样被挡——闸在鉴权之前
+    assert_eq!(
+        handshake_status_with_server(address, ROOM_A, TOKEN_A, "1", "aaaa", &server_token()).await,
+        429
+    );
+
+    // 健康检查也在同一道闸后面
+    let health =
+        raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+
+    assert!(health.contains(" 429 "), "实际：{health}");
+    assert!(
+        health.contains("too many failed handshakes"),
+        "实际：{health}"
     );
 }
 
@@ -1141,7 +1351,7 @@ async fn the_public_tier_is_announced_with_stun_only() {
         welcome["iceServers"],
         serde_json::json!([{ "urls": ["stun:cat.example.com:3478"] }])
     );
-    assert_eq!(welcome["limits"]["framesPerSecond"], 10.0);
+    assert_eq!(welcome["limits"]["framesPerSecond"], 12.0);
     assert_eq!(
         welcome["limits"]["bytesPerSecond"],
         DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND

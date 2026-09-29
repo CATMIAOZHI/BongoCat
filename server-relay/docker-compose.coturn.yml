@@ -18,6 +18,12 @@ services:
     image: coturn/coturn:latest
     restart: unless-stopped
     network_mode: host
+    # 同主 compose：coturn 的日志也走 docker 的 json-file 驱动，给它一份同样的上限
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
     # 镜像自带的命令里有 `--external-ip=$(detect-external-ip)`，而配置文件里也写着

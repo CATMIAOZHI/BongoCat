@@ -184,10 +184,28 @@ async fn run() -> Result<(), String> {
             }
         );
         println!(
-            "            额度       {:.0} 帧/秒 · {:.0} KiB/秒（只有信令）",
+            "            额度       {:.0} 帧/秒 · {:.0} KiB/秒（只有信令；这是回填速率）",
             config.public_limits.frames_per_second,
             config.public_limits.bytes_per_second / 1024.0
         );
+        println!(
+            "            突发       {:.0} 帧 · {:.0} KiB（一轮打洞要能一口气发完）",
+            config.public_burst_frames,
+            config.public_burst_bytes / 1024.0
+        );
+        // 按连接的额度拦不住「十组名额各自贴着上限」，所以另有一层记在**钥匙**上的滚动
+        // 预算（换不掉的东西是钥匙，不是房间也不是 IP）。设成 0 就是关掉它，横幅要如实说。
+        match config.public_key_budget {
+            Some(budget) => {
+                let mib = budget / (1024.0 * 1024.0);
+
+                println!(
+                    "            钥匙预算   一次性 {mib:.0} MiB，之后每小时回填 {mib:.0} MiB\
+                     （每把公益钥匙各一份，见 README 的运营规则）"
+                );
+            }
+            None => println!("            钥匙预算   不设（PAIR_PUBLIC_KEY_BUDGET_BYTES=0）"),
+        }
         println!(
             "            真实 IP    {}",
             if config.trust_proxy {
@@ -198,6 +216,15 @@ async fn run() -> Result<(), String> {
         );
     }
     println!("  配对密码  本进程**没有**任何配对密码：那是每一对用户自己的凭据");
+    // 这两项跟公益档无关，是**部署者自己那一档**的护栏（详见 README「准入」一节）
+    println!(
+        "  准入       最多同时挂 {} 条连接（两档名额 ×2 再加握手余量）；握手失败 {}",
+        relay.max_connections(),
+        match config.handshake_failures_per_minute {
+            Some(limit) => format!("每个 IP 每分钟 {limit:.0} 次，超过就 429 并停止写日志"),
+            None => "不限（PAIR_HANDSHAKE_FAILURES_PER_MINUTE=0）".to_string(),
+        }
+    );
     println!("  提醒      中继不保存聊天与文件，只做转发");
 
     server::serve(listener, relay).await;

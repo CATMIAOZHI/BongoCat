@@ -16,6 +16,15 @@ services:
   relay:
     build: .
     restart: unless-stopped
+    # 日志上限是**默认就带上**的（见 docker-compose.yml 里的同一段说明）：不设它时
+    # docker 的 json-file 驱动会一路写下去，被人拿错密码刷 /ws 时能把宿主机磁盘写满。
+    # 10MB × 3 个文件 = 最多 30MB。改完要 `docker compose -f docker-compose.direct.yml
+    # up -d` 重建容器才生效（`restart` 不会应用新的 logging 配置）。
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     environment:
       PAIR_LISTEN: ${PAIR_LISTEN:-0.0.0.0:8080}
       # 必填（R36）：同 docker-compose.yml，客户端要填同一个值
@@ -38,7 +47,12 @@ services:
       PAIR_MAX_PUBLIC_PER_IP: ${PAIR_MAX_PUBLIC_PER_IP:-}
       PAIR_PUBLIC_MAX_FRAMES_PER_SECOND: ${PAIR_PUBLIC_MAX_FRAMES_PER_SECOND:-}
       PAIR_PUBLIC_MAX_BYTES_PER_SECOND: ${PAIR_PUBLIC_MAX_BYTES_PER_SECOND:-}
+      # 突发容量与每把钥匙的滚动预算：同 docker-compose.yml
+      PAIR_PUBLIC_BURST_FRAMES: ${PAIR_PUBLIC_BURST_FRAMES:-}
+      PAIR_PUBLIC_BURST_BYTES: ${PAIR_PUBLIC_BURST_BYTES:-}
+      PAIR_PUBLIC_KEY_BUDGET_BYTES: ${PAIR_PUBLIC_KEY_BUDGET_BYTES:-}
       PAIR_PUBLIC_WINDOW_SECS: ${PAIR_PUBLIC_WINDOW_SECS:-}
+      PAIR_HANDSHAKE_FAILURES_PER_MINUTE: ${PAIR_HANDSHAKE_FAILURES_PER_MINUTE:-}
       # 这里**写死 0**（不用 `${...:-0}`）：两种模式常常共用一份 `.env`，而域名模式那一份
       # 建议打开它（`PAIR_TRUST_PROXY=1`）。direct 模式把 8080 直接发布到公网，没有反代，
       # 打开就等于让**私网**对端伪造 `X-Forwarded-For` 绕过公益档的「每 IP 几组」限额。

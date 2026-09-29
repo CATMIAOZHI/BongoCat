@@ -23,6 +23,16 @@ services:
   relay:
     build: .
     restart: unless-stopped
+    # 日志上限是**默认就带上**的（不用自己加）：不设它时 docker 的 json-file 驱动会一路
+    # 写下去，而中继每来一次错误密码、每建一个会话都会打一行——被人拿错密码刷 /ws 时
+    # 能把宿主机磁盘写满。10MB × 3 个文件 = 中继最多占 30MB（平稳时约一个月一轮换；
+    # 被刷的时候也只占这么多）。改这里之后要 `docker compose up -d` 重建容器才生效：
+    # `restart` 不会应用新的 logging 配置。
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     environment:
       PAIR_LISTEN: ${PAIR_LISTEN:-0.0.0.0:8080}
       # 必填（R36）：决定「谁能用这台服务器」。客户端要填同一个值才连得上
@@ -52,7 +62,16 @@ services:
       PAIR_MAX_PUBLIC_PER_IP: ${PAIR_MAX_PUBLIC_PER_IP:-}
       PAIR_PUBLIC_MAX_FRAMES_PER_SECOND: ${PAIR_PUBLIC_MAX_FRAMES_PER_SECOND:-}
       PAIR_PUBLIC_MAX_BYTES_PER_SECOND: ${PAIR_PUBLIC_MAX_BYTES_PER_SECOND:-}
+      # 突发容量（一次能发多少）：一轮打洞要能一口气发完，所以它比上面那两份额度大
+      PAIR_PUBLIC_BURST_FRAMES: ${PAIR_PUBLIC_BURST_FRAMES:-}
+      PAIR_PUBLIC_BURST_BYTES: ${PAIR_PUBLIC_BURST_BYTES:-}
+      # 每把公益钥匙的滚动预算（16 MiB 一次性 + 每小时回填）：按连接的额度拦不住
+      # 「十组名额各自贴着上限」，所以再加一层；记账挂钥匙而不是连接 / 房间 / IP
+      PAIR_PUBLIC_KEY_BUDGET_BYTES: ${PAIR_PUBLIC_KEY_BUDGET_BYTES:-}
       PAIR_PUBLIC_WINDOW_SECS: ${PAIR_PUBLIC_WINDOW_SECS:-}
+      # 每 IP 每分钟允许几次握手**失败**（超过就 429，并且不再写日志）。它跟公益档无关，
+      # 是你自己那一档的护栏：拿错密码刷 /ws 的代价本来只是一次摘要比较，能被打爆的是日志
+      PAIR_HANDSHAKE_FAILURES_PER_MINUTE: ${PAIR_HANDSHAKE_FAILURES_PER_MINUTE:-}
       # 只在前面站着可信反代（这一份就是 Caddy）时打开，否则每 IP 限额会把所有公益
       # 连接算成同一个 IP（127.0.0.1）。direct 模式对端就是客户端本身，不要开
       PAIR_TRUST_PROXY: ${PAIR_TRUST_PROXY:-1}
@@ -73,6 +92,12 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    # 同 relay：Caddy 的访问日志与 ACME 重试也会一直写盘，这里给它一份同样的上限
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
     depends_on:
       relay:
         condition: service_healthy

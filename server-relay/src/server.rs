@@ -11,18 +11,28 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::auth;
 use crate::http::{read_request_head, write_response, write_response_with_headers};
 use crate::protocol::{
-    is_valid_device_id, is_valid_room_id, Limits, DEFAULT_MAX_BYTES_PER_SECOND,
-    DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND, DEFAULT_MAX_PUBLIC_PER_IP,
-    DEFAULT_MAX_PUBLIC_SESSIONS, DEFAULT_MAX_SESSIONS, DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
-    DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND, DEFAULT_PUBLIC_WINDOW_SECS, DEFAULT_STALE_AFTER_MS,
-    HEADER_AUTHORIZATION, HEADER_CLIENT, HEADER_PROTOCOL, HEADER_ROOM, HEADER_SERVER, HEADER_TIER,
-    HEALTH_PATH, MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, Tier,
-    WEBSOCKET_VERSION, WS_PATH,
+    is_valid_device_id, is_valid_room_id, Limits, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
+    DEFAULT_MAX_BYTES_PER_SECOND, DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND,
+    DEFAULT_MAX_PUBLIC_PER_IP, DEFAULT_MAX_PUBLIC_SESSIONS, DEFAULT_MAX_SESSIONS,
+    DEFAULT_PUBLIC_BURST_BYTES, DEFAULT_PUBLIC_BURST_FRAMES, DEFAULT_PUBLIC_KEY_BUDGET_BYTES,
+    DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND, DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND,
+    DEFAULT_PUBLIC_WINDOW_SECS, DEFAULT_STALE_AFTER_MS, HEADER_AUTHORIZATION, HEADER_CLIENT,
+    HEADER_PROTOCOL, HEADER_ROOM, HEADER_SERVER, HEADER_TIER, HEALTH_PATH,
+    MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, Tier, WEBSOCKET_VERSION,
+    WS_PATH,
 };
-use crate::relay::{self, Relay, RelayOptions, RoomRejection, ServerKey};
+use crate::relay::{self, IpKey, Relay, RelayOptions, RoomRejection, ServerKey};
 
 /// 请求头必须在这个时间内读完：只发一个连接、永远不发请求头的客户端不该占住一个任务
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 一个会话两条连接之外，还允许多少条「正在握手」的连接（见 `Config::max_connections`）。
+const HANDSHAKE_HEADROOM: usize = 32;
+
+/// 被准入闸挡下时，最多花多久把请求头读掉（见 `handle` 里那条 503 的注释）。
+///
+/// 它取得很短是有意的：这一条路上本来就不该有长命任务。
+const REJECT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// `Sec-WebSocket-Key` 的合法性（RFC 6455 §4.2.1：16 字节的 base64）
 fn is_valid_websocket_key(value: &str) -> bool {
@@ -57,6 +67,14 @@ pub struct Config {
     pub server_keys: Vec<ServerKey>,
     /// 公益档（public tier）的额度。它只放行信令，所以比 `limits` 小得多。
     pub public_limits: Limits,
+    /// 公益档一条连接的**突发容量**（`PAIR_PUBLIC_BURST_FRAMES` / `PAIR_PUBLIC_BURST_BYTES`）
+    pub public_burst_frames: f64,
+    pub public_burst_bytes: f64,
+    /// 公益档**每把钥匙**的滚动预算（`PAIR_PUBLIC_KEY_BUDGET_BYTES`）。`None` = 不设这一层
+    pub public_key_budget: Option<f64>,
+    /// 握手层每个 IP 每分钟允许几次失败（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）。
+    /// `None` = 不限
+    pub handshake_failures_per_minute: Option<f64>,
     /// 公益档同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。与 `max_sessions` 分开算：
     /// 公益档占不到部署者自己的名额
     pub max_public_sessions: usize,
@@ -121,6 +139,40 @@ fn env_positive_usize(name: &str, default: usize) -> Result<usize, String> {
             .filter(|value| *value >= 1)
             .ok_or_else(|| format!("{name} 必须是大于 0 的整数，实际是 {text:?}")),
     }
+}
+
+/// 读一个「`0` = 关掉这一层」的数（`PAIR_PUBLIC_KEY_BUDGET_BYTES` /
+/// `PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）。
+///
+/// 单独一个读取器，不塞进 `env_f64`：那一个要求 > 0，因为「每秒 0 帧」等于一个人都发不
+/// 出去，几乎一定是配置事故；而这里的 0 有正当含义——关掉这一层限额，与
+/// `PAIR_MAX_PUBLIC_PER_IP=0` 同义。负数是真写错了，报错。缺省值因此要求 > 0。
+fn env_optional_f64(name: &str, default: f64) -> Result<Option<f64>, String> {
+    match env_non_empty(name) {
+        None => Ok(Some(default)),
+        Some(text) => parse_optional_f64(name, &text),
+    }
+}
+
+/// [`env_optional_f64`] 的纯函数内核。
+///
+/// 与 `parse_passwords` 同一个理由抽出来：环境变量在测试里是进程全局的，直接测
+/// `load_config` 会互相干扰，所以判定本身要能被单测钉住。
+fn parse_optional_f64(name: &str, text: &str) -> Result<Option<f64>, String> {
+    // `f64::from_str` 不接受前后空白，而 `.env` 里多打一个空格是很常见的事。走
+    // `env_optional_f64` 时 `env_non_empty` 已经削过一次，这一行是给直接调用它的单测
+    // 与将来的复用者兜底。错误信息里仍然带上原文，好让人一眼看出自己写的是什么。
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| *value >= 0.0 && value.is_finite())
+        .map(|value| (value > 0.0).then_some(value))
+        .ok_or_else(|| format!("{name} 必须是非负数字（0 表示关掉这一项限额），实际是 {text:?}"))
+}
+
+/// 一个会话两条连接之外，再留多少条握手余量（见 `Config::max_connections`）。
+fn derived_max_connections(max_sessions: usize, max_public_sessions: usize) -> usize {
+    2 * (max_sessions + max_public_sessions) + HANDSHAKE_HEADROOM
 }
 
 /// 读一个「一把或多把密码」的环境变量（`;` 分隔）。
@@ -281,9 +333,23 @@ pub fn load_config() -> Result<Config, String> {
 
     let public_window_secs = env_u64("PAIR_PUBLIC_WINDOW_SECS", DEFAULT_PUBLIC_WINDOW_SECS)?;
 
+    // 公益档**每把钥匙**的滚动预算（0 = 不设这一层）。记账挂钥匙而不是挂连接 / 房间 /
+    // IP 的理由见 `protocol.rs` 里那条常量的注释。
+    let public_key_budget =
+        env_optional_f64("PAIR_PUBLIC_KEY_BUDGET_BYTES", DEFAULT_PUBLIC_KEY_BUDGET_BYTES)?;
+
+    // 握手层每个 IP 的失败速率。它和公益档无关，是**部署者自己那一档**的护栏：拿错密码
+    // 刷 `/ws` 的代价本来只是一次摘要比较，真正会被打爆的是日志（排障的唯一证据）。
+    let handshake_failures_per_minute = env_optional_f64(
+        "PAIR_HANDSHAKE_FAILURES_PER_MINUTE",
+        DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
+    )?;
+
+    let max_sessions = env_positive_usize("PAIR_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?;
+
     Ok(Config {
         limits,
-        max_sessions: env_positive_usize("PAIR_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?,
+        max_sessions,
         stale_after: Duration::from_millis(env_u64("PAIR_STALE_AFTER_MS", DEFAULT_STALE_AFTER_MS)?),
         ice_servers,
         stun_port,
@@ -301,6 +367,10 @@ pub fn load_config() -> Result<Config, String> {
                 DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND,
             )?,
         },
+        public_burst_frames: env_f64("PAIR_PUBLIC_BURST_FRAMES", DEFAULT_PUBLIC_BURST_FRAMES)?,
+        public_burst_bytes: env_f64("PAIR_PUBLIC_BURST_BYTES", DEFAULT_PUBLIC_BURST_BYTES)?,
+        public_key_budget,
+        handshake_failures_per_minute,
         max_public_sessions,
         max_public_per_ip: env_u64("PAIR_MAX_PUBLIC_PER_IP", DEFAULT_MAX_PUBLIC_PER_IP as u64)?
             as usize,
@@ -323,7 +393,18 @@ impl Config {
         RelayOptions {
             limits: self.limits,
             public_limits: self.public_limits,
+            public_burst_frames: self.public_burst_frames,
+            public_burst_bytes: self.public_burst_bytes,
+            public_key_budget: self.public_key_budget,
+            handshake_failures_per_minute: self.handshake_failures_per_minute,
             max_sessions: self.max_sessions,
+            // 准入闸不单独配一项：一个会话两条连接，再加一截握手余量。放在这里（而不是
+            // `load_config`）是为了让它**跟着名额走**——`max_public_sessions` 在配置阶段
+            // 还可能被改动，写死一次就可能小于「按配置本来就该跑得起来的量」。
+            max_connections: derived_max_connections(
+                self.max_sessions,
+                self.max_public_sessions,
+            ),
             max_public_sessions: self.max_public_sessions,
             max_public_per_ip: self.max_public_per_ip,
             public_window: self.public_window,
@@ -368,11 +449,73 @@ pub async fn serve(listener: TcpListener, relay: Arc<Relay>) {
 }
 
 async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> Result<(), String> {
+    // 准入闸（`Config::max_connections`）。没有它的话「开任意多条 TCP」是不花钱的：
+    // `/health` 与握手都不过闸，每条连接占一个任务加一份 8 KiB 的请求头缓冲，直到把
+    // 宿主机拖垮——那时部署者自己那一档也一起连不上。
+    //
+    // 满了就当场回 503 并断开，**不排队等**：排队等于把已经接受的 socket 堆在这里，
+    // 那正是这道闸要防的东西。这里用的是**对端地址**（不是 `X-Forwarded-For` 算出来的
+    // 那个），也不记进每 IP 的失败额度：请求头还没读，域名模式下对端是反代容器，按它
+    // 记账会把所有人算成同一个 IP。所以只留一行、而且每 10 秒最多一行。
+    let _permit = match relay.try_connection_permit() {
+        Some(permit) => permit,
+        None => {
+            // 先把请求头**尽量**读掉（上限 `REJECT_DRAIN_TIMEOUT`）：不读就关的话，客户端
+            // 已经发出来的请求还躺在接收缓冲里，内核会直接回 RST——那条 503 还没被读到就被
+            // 丢掉，客户端只看到「连接被重置」，而这正是「明明服务器活着、却看不出为什么
+            // 连不上」的来源。真实客户端都是连上就把请求发出来的，所以这一步瞬间完成；
+            // 上限取得很短，所以卡在这里慢慢发头的人也只能多占这个任务这么久。
+            let _ =
+                tokio::time::timeout(REJECT_DRAIN_TIMEOUT, read_request_head(&mut stream)).await;
+
+            if relay.note_connection_limit().await {
+                eprintln!("连接 {peer} 被拒绝：连接数已达上限（HTTP 503）");
+            }
+
+            return write_response(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                "server is at its connection limit",
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
+    };
+
     // 握手超时：只连不发（或慢慢发）的客户端不能无限占着一个任务
     let head = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request_head(&mut stream)).await {
         Ok(head) => head?,
         Err(_) => return Err("握手超时".into()),
     };
+
+    // 公益档的每 IP 限额、以及下面那条握手限速都按哪个 IP 算。Caddy 那一跳只在内网，所以
+    // 域名模式下要靠 `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`，compose 已默认打开）；
+    // direct 模式对端就是客户端本身，不需要它。
+    //
+    // 取的是**这个头的每一行**，不是第一行：它可能被反代拆成多行（见 `RequestHead::header_values`）。
+    let forwarded_for = head.header_values("x-forwarded-for");
+    let client = relay::client_ip(peer, &forwarded_for, relay.trust_proxy());
+
+    // 每 IP 的握手失败限速（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）：一个 IP 连续把密码打错
+    // （或者反复发格式不对的请求）时，这里直接回 429，不再往下走——省下鉴权的摘要计算，
+    // 也省下继续刷日志。诚实客户端碰不到它：密码不对在客户端是**致命**的（它直接提示改
+    // 密码、根本不重试），会按退避重试的是 429 / 503 那一类，而那个退避封顶 30 秒，也就是
+    // 最多 2 次/分钟——离 30 差十几倍。
+    if !relay.handshake_allowed(client).await {
+        reject(&relay, peer, client, "这个地址的失败次数太多", 429).await;
+
+        return write_response(
+            &mut stream,
+            429,
+            "Too Many Requests",
+            "text/plain; charset=utf-8",
+            "too many failed handshakes",
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
 
     if head.path() == HEALTH_PATH {
         // §28：只说「我活着、协议是 1、需要服务器密码」。**不暴露**任何 Room、deviceId
@@ -454,7 +597,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     let expected_protocol = PROTOCOL_VERSION.to_string();
 
     if head.header(HEADER_PROTOCOL) != Some(expected_protocol.as_str()) {
-        reject(peer, "协议版本不支持", 426);
+        reject(&relay, peer, client, "协议版本不支持", 426).await;
 
         return write_response(
             &mut stream,
@@ -480,7 +623,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         .to_string();
 
     if server_token.is_empty() {
-        reject(peer, "缺少服务器密码", 403);
+        reject(&relay, peer, client, "缺少服务器密码", 403).await;
 
         return write_response(
             &mut stream,
@@ -493,8 +636,10 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         .map_err(|error| error.to_string());
     }
 
-    let Some(tier) = relay.classify_server_token(&server_token) else {
-        reject(peer, "服务器密码不正确", 403);
+    // 拿到的除了档位还有**第几把**钥匙：公益档的滚动预算记在钥匙上（见
+    // `DEFAULT_PUBLIC_KEY_BUDGET_BYTES`），所以序号要一路带到 `reserve` / `allow`。
+    let Some((tier, key_index)) = relay.classify_server_token(&server_token) else {
+        reject(&relay, peer, client, "服务器密码不正确", 403).await;
 
         return write_response(
             &mut stream,
@@ -517,7 +662,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     if tier == Tier::Public
         && head.header(HEADER_TIER) != Some(TIER_HEADER_VALUE)
     {
-        reject(peer, "公益档需要新客户端", 426);
+        reject(&relay, peer, client, "公益档需要新客户端", 426).await;
 
         return write_response(
             &mut stream,
@@ -539,7 +684,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
         .to_string();
 
     if !is_valid_room_id(&room_id) {
-        reject(peer, "会话标识不合法", 400);
+        reject(&relay, peer, client, "会话标识不合法", 400).await;
 
         return write_response(
             &mut stream,
@@ -556,7 +701,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     let token = auth::bearer_token(head.header(HEADER_AUTHORIZATION));
 
     if token.is_empty() {
-        reject(peer, "缺少配对密码", 401);
+        reject(&relay, peer, client, "缺少配对密码", 401).await;
 
         return write_response(
             &mut stream,
@@ -571,21 +716,13 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
 
     // §8 / §9 / §27：容量与密钥判定都在升级之前完成，客户端才能按状态码区分
     // 「配对密码不正确」（401）与「服务器会话已满」（503）。
-    // 公益档的每 IP 限额按哪个 IP 算。Caddy 那一跳只在内网，所以域名模式下要靠
-    // `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`，compose 已默认打开）；direct 模式对端
-    // 就是客户端本身，不需要它。
-    //
-    // 取的是**这个头的每一行**，不是第一行：它可能被反代拆成多行（见 `RequestHead::header_values`）。
-    let forwarded_for = head.header_values("x-forwarded-for");
-    let client = relay::client_ip(peer, &forwarded_for, relay.trust_proxy());
-
     let reservation = match relay
-        .reserve(&room_id, auth::auth_verifier(&token), tier, client)
+        .reserve(&room_id, auth::auth_verifier(&token), tier, key_index, client)
         .await
     {
         Ok(reservation) => reservation,
         Err(RoomRejection::AuthMismatch) => {
-            reject(peer, "配对密码与这个会话不一致", 401);
+            reject(&relay, peer, client, "配对密码与这个会话不一致", 401).await;
 
             return write_response(
                 &mut stream,
@@ -598,7 +735,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             .map_err(|error| error.to_string());
         }
         Err(RoomRejection::Capacity) => {
-            reject(peer, "服务器会话已满", 503);
+            reject(&relay, peer, client, "服务器会话已满", 503).await;
 
             return write_response(
                 &mut stream,
@@ -611,7 +748,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             .map_err(|error| error.to_string());
         }
         Err(RoomRejection::TierMismatch) => {
-            reject(peer, "会话档位与这次凭据不一致", 409);
+            reject(&relay, peer, client, "会话档位与这次凭据不一致", 409).await;
 
             return write_response(
                 &mut stream,
@@ -624,7 +761,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
             .map_err(|error| error.to_string());
         }
         Err(RoomRejection::PublicIpLimit) => {
-            reject(peer, "这个 IP 的公益会话已满", 429);
+            reject(&relay, peer, client, "这个 IP 的公益会话已满", 429).await;
 
             return write_response(
                 &mut stream,
@@ -632,6 +769,22 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
                 "Too Many Requests",
                 "text/plain; charset=utf-8",
                 "too many public sessions from this address",
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
+        // 同一个 Room 上「已放行、还没走进 `admit`」的连接堆得太多（见 `MAX_PENDING_PER_ROOM`）。
+        // 正常用法的峰值是 2（两个人握手），所以走到这里要么是这个会话正在被刷，要么是它的
+        // 客户端一直在重连而对面接不上——两种情况都该让对方等一下再试，而不是继续堆。
+        Err(RoomRejection::TooManyPending) => {
+            reject(&relay, peer, client, "这个会话正在握手的连接太多", 429).await;
+
+            return write_response(
+                &mut stream,
+                429,
+                "Too Many Requests",
+                "text/plain; charset=utf-8",
+                "too many pending handshakes for this room",
             )
             .await
             .map_err(|error| error.to_string());
@@ -650,7 +803,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     if !is_valid_device_id(&device_id) {
         // 名额已经占上了，这里必须还回去，否则一个拼错 deviceId 的客户端会永久占住一个会话位
         relay.release(reservation).await;
-        reject(peer, "设备标识不合法", 400);
+        reject(&relay, peer, client, "设备标识不合法", 400).await;
 
         return write_response(
             &mut stream,
@@ -672,13 +825,20 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     relay.serve(stream, head, device_id, reservation).await
 }
 
-/// 被拒绝的连接要留下**一行**不含秘密的痕迹（P2-2）。
+/// 被拒绝的连接要留下**一行**不含秘密的痕迹（P2-2），而且这一行本身要被限频。
 ///
 /// 此前只有「通过鉴权」会打日志，于是「两台设备连不上、`docker compose logs` 一片空白」
-/// 时分不清是「客户端根本没连到这台服务器」还是「被 401/503 挡在门外」。这里只写
-/// 对端地址、阶段与状态码——不写 token、不写 ROOM_ID、不写密码。
-fn reject(peer: SocketAddr, reason: &str, status: u16) {
-    eprintln!("连接 {peer} 被拒绝：{reason}（HTTP {status}）");
+/// 时分不清是「客户端根本没连到这台服务器」还是「被 401/503 挡在门外」。这里只写对端
+/// 地址、阶段与状态码——不写 token、不写 ROOM_ID、不写密码。
+///
+/// 限频是另一件事：拿错密码刷 `/ws` 的代价本来只是一次摘要比较，能被打爆的是**日志**
+/// ——它是部署者排障的唯一证据，被刷掉就等于没有。记多少、什么时候静默由
+/// `Relay::note_handshake_failure` 一个桶说了算（同一个桶也决定这个 IP 会不会被 429），
+/// 所以「拒绝了但没写日志」不是丢证据：那说明前后一分钟里已经有 30 行同样的东西了。
+async fn reject(relay: &Relay, peer: SocketAddr, ip: IpKey, reason: &str, status: u16) {
+    if relay.note_handshake_failure(ip).await {
+        eprintln!("连接 {peer} 被拒绝：{reason}（HTTP {status}）");
+    }
 }
 
 #[cfg(test)]
@@ -760,5 +920,43 @@ mod tests {
     fn an_empty_value_yields_no_keys() {
         assert!(parse_passwords(NAME, "   ", WHY).unwrap().is_empty());
         assert!(parse_passwords(NAME, " ; ; ", WHY).unwrap().is_empty());
+    }
+
+    /// 「`0` = 关掉这一层」的读数：正数照收，`0` 是「不设这一层」而不是「一个字节都不许发」
+    #[test]
+    fn an_optional_limit_reads_zero_as_off() {
+        let name = "PAIR_PUBLIC_KEY_BUDGET_BYTES";
+
+        assert_eq!(parse_optional_f64(name, "16777216").unwrap(), Some(16777216.0));
+        assert_eq!(parse_optional_f64(name, " 0 ").unwrap(), None);
+        assert_eq!(parse_optional_f64(name, "0.0").unwrap(), None);
+    }
+
+    /// 写错的数字要报错、而且要说清是哪个变量：一个「当成没设」的负值会让部署者以为
+    /// 自己设的那一层限额生效了
+    #[test]
+    fn an_optional_limit_rejects_what_is_not_a_number() {
+        let name = "PAIR_HANDSHAKE_FAILURES_PER_MINUTE";
+
+        assert!(parse_optional_f64(name, "-1").is_err());
+        assert!(parse_optional_f64(name, "十").is_err());
+        assert!(parse_optional_f64(name, "inf").is_err());
+        assert!(parse_optional_f64(name, "nan").is_err());
+
+        let error = parse_optional_f64(name, "abc").unwrap_err();
+
+        assert!(error.contains(name), "{error}");
+    }
+
+    /// 连接数上限由名额推出来：一个会话两条连接，再加一截握手余量。
+    ///
+    /// 它**不可能**小于「按配置本来就该跑得起来的量」——这正是「不给部署者加一项配置」的
+    /// 前提：一个小于名额的连接上限会把服务器变成「名额还有、就是连不上」。
+    #[test]
+    fn the_connection_cap_follows_the_capacity() {
+        // 40 组完全档 + 10 组公益档 = 100 条连接，再加 32 条握手余量
+        assert_eq!(derived_max_connections(40, 10), 132);
+        // 两档都关掉大半时也留得住最基本的握手并发
+        assert_eq!(derived_max_connections(1, 0), HANDSHAKE_HEADROOM + 2);
     }
 }
