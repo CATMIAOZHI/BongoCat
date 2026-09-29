@@ -20,6 +20,7 @@
         "sendRecordingNotConnected": "Not connected to the server yet — nothing can be sent",
         "sendRecordingOffline": "Your partner is offline — send it once they are back",
         "sendRecordingPublicNotDirect": "This server only helps you punch through (public tier) and does not relay voice — send it once the direct link is up",
+        "sendRecordingPublicFailed": "Hole punching failed: your key is the public tier (it only borrows this server to punch through, no relaying), so voice cannot be sent — switch servers or ask your partner to change networks",
         "reRecord": "Record a new one (the current one is dropped)",
         "voicePlaybackFailed": "Cannot play this recording back",
         "voiceSendFailed": "Sending failed: {reason}. This recording has been deleted — record a new one.",
@@ -68,7 +69,9 @@
         "manual": "Pairing-code link: {state}",
         "manualNotReady": "The pairing-code link has no server behind it — you can send once your partner's cat shows up",
         "publicNotDirect": "This server only helps you punch through (public tier); it does not relay messages or files — you can send once the P2P line says \"Direct\"",
+        "publicFailed": "Hole punching failed: your key is the public tier (it only borrows this server to punch through, no relaying) — nothing can be sent; switch servers or ask your partner to change networks",
         "blockedTitle": "Public server: wait for a direct link",
+        "blockedTitlePublicFailed": "Hole punching failed — the public tier only punches",
         "preview": "View this image",
         "close": "Close",
         "imageCopied": "Image copied to the clipboard",
@@ -330,6 +333,11 @@
           "relayUrlEmpty": "The server address cannot be empty — an empty box has no effect. To change it, type a new address and press Save.",
           "relayUrlCopied": "Server address copied",
           "serverPassword": "Not needed with the official Cloudflare relay. Only for a self-hosted server: whoever deployed it set a password there, and both of you must enter the same value. Without it you cannot connect (it keeps strangers from freeloading). If someone gave you a public-server password (a server opened up to help anyone punch through), put it here too: that server only helps you connect and does not relay chat or files.",
+          "serverKeyTier": {
+            "full": "This server says: your key is the full tier (punch-through plus relay fallback).",
+            "public": "This server says: your key is the public tier — it only borrows the server to punch through and never relays, so if punching fails nothing can be sent."
+          },
+          "serverKeyTierLead": " ",
           "valuesRemembered": "Saved the values you entered; they will be used again on next launch",
           "valuesReplaced": "Saved the values you entered and replaced the pairing key that was stored before. The old key no longer works, so your partner has to switch to this one too or you will not connect.",
           "deleteConfirmTitle": "Delete \"{name}\"?",
@@ -427,7 +435,7 @@
           "connecting": "Setting up a direct link…",
           "connected": "Direct",
           "failed": "Unavailable, using the server",
-          "failedPublic": "No direct link yet — nothing can be sent"
+          "failedPublic": "Hole punching failed: the public tier only borrows this server to punch through and never relays — nothing can be sent right now"
         },
         "manual": {
           "label": "Pairing Code (no server)",

@@ -31,6 +31,14 @@ export interface PairStatus {
    */
   tier?: PairTier
   /**
+   * 服务器**到底报过**档位没有（`server.welcome` 有没有那个字段）。
+   *
+   * 官方 Cloudflare 中继与旧版自建中继都没有档位这回事（`tier` 会被归一成 `full`），
+   * 配对码模式更是压根没有服务器——界面只有在这里也是 `true` 时才能说「这台服务器说
+   * 你这把密钥是哪一档」。
+   */
+  tierReported?: boolean
+  /**
    * 前端该按多少 Hz 发桌宠快照（§6 / R23）。
    *
    * 上限由 Rust 按**当前生效传输**的额度算好：P2P 与「额度够的自建中继」是 60，

@@ -91,11 +91,18 @@ describe('待确认语音发不出去的原因（R41 / R44）', () => {
       .toBe('pages.main.hints.sendRecordingPublicNotDirect')
     expect(recordingBlockReasonKey({ ...base, tier: 'public', p2p: 'connecting' }))
       .toBe('pages.main.hints.sendRecordingPublicNotDirect')
-    expect(recordingBlockReasonKey({ ...base, tier: 'public', p2p: 'failed' }))
-      .toBe('pages.main.hints.sendRecordingPublicNotDirect')
 
     // 直连通了就照旧能发（这条路是真的端到端）
     expect(recordingBlockReasonKey({ ...base, tier: 'public', p2p: 'connected' })).toBe('')
+  })
+
+  /**
+   * 打洞这一轮已经失败（正在退避重试）与「还在打 / 还没轮到」是两件事：前者等下去没用，
+   * 要用户动手（换服务器 / 换网络），所以文案要写明「当前用的就是公益档密码」。
+   */
+  it('公益档下打洞失败要单独说一句', () => {
+    expect(recordingBlockReasonKey({ ...base, tier: 'public', p2p: 'failed' }))
+      .toBe('pages.main.hints.sendRecordingPublicFailed')
   })
 
   it('公益档也不越过「联机没打开」和「正在发送」这两条', () => {
@@ -126,10 +133,14 @@ describe('聊天窗口「现在发不出去」的原因', () => {
   })
 
   it('公益档在直连建立之前挡住，建立之后放行', () => {
-    for (const p2p of ['off', 'connecting', 'failed'] as const) {
+    for (const p2p of ['off', 'connecting'] as const) {
       expect(outboundBlockKey({ tier: 'public', p2p })).toBe('pages.chat.hints.publicNotDirect')
     }
     expect(outboundBlockKey({ tier: 'public', p2p: 'connected' })).toBe('')
+  })
+
+  it('公益档下打洞失败时，那句话要说明「当前用的就是公益档密码」', () => {
+    expect(outboundBlockKey({ tier: 'public', p2p: 'failed' })).toBe('pages.chat.hints.publicFailed')
   })
 
   it('配对码还没连上时先说配对码那句（公益档那句在那儿是错的）', () => {

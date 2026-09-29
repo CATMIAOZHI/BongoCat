@@ -61,11 +61,19 @@ const RELIABLE_QUEUE_LIMIT: usize = 512;
 /// [`PairManager::outbound_blocked`]）。写给用户看，所以要能说清「下一步做什么」。
 const PUBLIC_TIER_BLOCK_REASON: &str =
     "这台服务器只帮忙打洞（公益档），不转发聊天与文件；等直连建立后再发";
+/// 同上，但直连这一轮**已经试过、没打通**（正在按退避等下一轮）：这会儿用户等下去没有用，
+/// 得动手换服务器或换网络，所以那句话要写明「你现在用的就是公益档密码」。
+const PUBLIC_TIER_FAILED_REASON: &str =
+    "打洞失败：你现在用的是公益档密码（这台服务器只借给你打洞、不中继），所以发不出去；换一台服务器，或请对方换个网络再试";
 /// 可靠队列满了、最旧的一帧被挤掉时，附件那一单的失败原因（见 [`retry_dropped_chat`]）
 const RELIABLE_QUEUE_OVERFLOW_REASON: &str = "发送队列已满，附件没有发出去，可以重试";
 /// 公益档下这一帧**不能**落到中继上（那台服务器只承载信令）、直连又用不了时，
 /// 附件那一单的失败原因。与上面那条分开：用户要看到的下一步动作完全不同。
 const PUBLIC_TIER_LOST_REASON: &str = "这台服务器只帮忙打洞（公益档），不转发文件；附件没有发出去，可以重试";
+/// 同上，但直连这一轮**已经试过、没打通**：这时候「可以重试」是错的下一步——等下去
+/// 不会好，得换服务器或换网络（与 [`PUBLIC_TIER_FAILED_REASON`] 同一个口径）。
+const PUBLIC_TIER_LOST_FAILED_REASON: &str =
+    "打洞失败：你现在用的是公益档密码（这台服务器只借给你打洞、不中继），文件没有发出去；换一台服务器，或请对方换个网络再试";
 /// 一次重连最多补发多少条历史消息，避免对方一上线就被灌满
 const CHAT_RESEND_LIMIT: usize = 100;
 /// 每个 transfer 最多多久报一次进度（§40：进度要有，但别把事件刷爆）
@@ -166,6 +174,12 @@ pub struct PairStatus {
     /// 帧，聊天 / 附件 / 语音 / 快照全都只能在直连上跑。界面据此把发送口收到直连建立
     /// 为止，并说清楚这台服务器是什么（前端的同一道闸见 `outboundBlockKey`）。
     pub tier: RelayTier,
+    /// **这次连接上，服务器到底报过档位没有**（`server.welcome` 有没有那个字段）。
+    ///
+    /// `false` = 官方 Cloudflare 中继、旧版自建中继，或配对码模式（压根没有服务器）：
+    /// 这时 `tier` 只是客户端按缺省 `full` 行事，**不是**服务器说过的话。界面据此决定
+    /// 要不要显示「这台服务器说：你这把密钥是「完全档」/「公益档」」。
+    pub tier_reported: bool,
     /// 配对码（手工信令）这条路的状态。`None` = 当前这条会话不是手工码。
     ///
     /// 它和 `state` / `p2p` 是**互补**的：手工码模式没有中继，所以「对方是否在线」只能由
@@ -241,6 +255,18 @@ impl ManualStatus {
             non_host_candidates: 0,
             error: None,
         }
+    }
+}
+
+/// 公益档下「发不出去」那句话：按这一轮直连的状态挑一条。
+///
+/// 单独抽成函数是因为 [`PairManager::outbound_blocked`] 与 `send` 那条路都要用同一句话
+/// （判据只有一处，说法也只有一处）。
+fn public_tier_block_reason(p2p: P2pState) -> String {
+    if p2p == P2pState::Failed {
+        PUBLIC_TIER_FAILED_REASON.to_string()
+    } else {
+        PUBLIC_TIER_BLOCK_REASON.to_string()
     }
 }
 
@@ -512,6 +538,8 @@ impl PairManager {
                 plaintext: false,
                 // 还没连过：按部署者那一档，连接建立后由 `server.welcome` 纠正
                 tier: RelayTier::Full,
+                // 同上：还没有服务器报过档位
+                tier_reported: false,
                 manual: None,
             }),
             sender: Mutex::new(None),
@@ -653,6 +681,7 @@ impl PairManager {
             // 的（从公益服务器切到普通服务器时，旧值会让界面继续写着「只帮忙打洞」，
             // 也会把数据帧提前放行到一条还不知道档位的连接上）
             status.tier = RelayTier::Full;
+            status.tier_reported = false;
             // 同理，快照上限也回到缺省：新会话还没读到中继广告的额度
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             status.manual = None;
@@ -683,6 +712,7 @@ impl PairManager {
             // 档位同样是这一次连接的事实：断开之后还挂着「公益档」的话，界面会说
             // 「等直连建立就能发」，而真实情况是「还没连上服务器」
             status.tier = RelayTier::Full;
+            status.tier_reported = false;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             status.plaintext = false;
             status.manual = None;
@@ -876,6 +906,7 @@ impl PairManager {
             // 手工码这条路没有服务器，也就没有档位这回事：不写的话上一次那台公益服务器
             // 的档位会留在这里，界面会说「等直连建立就能发」，而这条路的理由是「配对码」
             status.tier = RelayTier::Full;
+            status.tier_reported = false;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
             // §23 的明文提醒说的是「服务器地址」，手工码没有服务器
             status.plaintext = false;
@@ -918,7 +949,7 @@ impl PairManager {
 
         // 公益档：中继那条腿不承载任何数据，所以「能发」的唯一证据就是直连
         if status.tier.is_public() && status.p2p != P2pState::Connected {
-            return Some(PUBLIC_TIER_BLOCK_REASON.to_string());
+            return Some(public_tier_block_reason(status.p2p));
         }
 
         None
@@ -932,6 +963,28 @@ impl PairManager {
         let status = Self::lock(&self.status);
 
         status.tier.is_public() && status.p2p != P2pState::Connected
+    }
+
+    /// 公益档下「这台服务器不转发数据」那句话（按这一轮直连的状态说人话）。
+    ///
+    /// 「还在打洞」与「这一轮已经失败、正在退避重试」对用户是两件事：前者等一会儿就好，
+    /// 后者得动手（换服务器或换网络），而且要说清「你现在用的就是公益档密码」。
+    fn public_tier_block_reason(&self) -> String {
+        let p2p = Self::lock(&self.status).p2p;
+
+        public_tier_block_reason(p2p)
+    }
+
+    /// 公益档下附件那一单的失败原因（同样按这一轮直连的状态挑一句）。
+    ///
+    /// 「还在打洞」时说「可以重试」是对的（下一轮可能就通了）；「这一轮已经失败」时
+    /// 说「可以重试」会把人引向错的下一步，那时要说清「你现在用的是公益档密码」。
+    fn public_tier_lost_reason(&self) -> &'static str {
+        if Self::lock(&self.status).p2p == P2pState::Failed {
+            PUBLIC_TIER_LOST_FAILED_REASON
+        } else {
+            PUBLIC_TIER_LOST_REASON
+        }
     }
 
     /// 可覆盖的实时状态（宠物快照、统计）：拥塞时新数据直接覆盖旧数据
@@ -1221,7 +1274,7 @@ impl PairManager {
         // 里，所以补发放在前端「直连刚建立」那一刻（`usePairState` 里看 `p2p` 的那个
         // watch）：昵称、暂离举牌与对方模型同步都靠它。
         if !kind.is_signal() && self.public_tier_needs_direct() {
-            return Err(PUBLIC_TIER_BLOCK_REASON.to_string());
+            return Err(self.public_tier_block_reason());
         }
 
         let sender = self.sender()?;
@@ -1304,6 +1357,7 @@ impl PairManager {
             // 公益密码或把 `PAIR_MAX_PUBLIC_SESSIONS` 改成 0，公益客户端重连时拿到
             // 403）。
             status.tier = RelayTier::Full;
+            status.tier_reported = false;
         });
 
         self.sink.emit(EVENT_ERROR, json!({ "message": message }));
@@ -2060,7 +2114,7 @@ where
 
     if state.public_tier {
         for envelope in state.take_non_signal() {
-            retry_dropped_chat(manager, state, &envelope, PUBLIC_TIER_LOST_REASON);
+            retry_dropped_chat(manager, state, &envelope, manager.public_tier_lost_reason());
         }
     }
 
@@ -3419,15 +3473,16 @@ fn retry_dropped_chat(
 
 /// 把 [`flush`] 交回来的信封逐个收尾（公益档下没处可去的那批，见 `flush` 的返回值说明）。
 ///
-/// 原因那句话用 [`PUBLIC_TIER_LOST_REASON`]：它要告诉用户「这台服务器只帮忙打洞」，
-/// 而不是「队列满了」——后者会把人引向「等一会儿再试」这个错的下一步。
+/// 原因那句话按这一轮直连的状态挑（见 `PairManager::public_tier_lost_reason`）：它要告诉
+/// 用户「这台服务器只帮忙打洞」，而不是「队列满了」——后者会把人引向「等一会儿再试」
+/// 这个错的下一步。
 fn recover_dropped(
     manager: &Arc<PairManager>,
     state: &mut SessionState,
     dropped: Vec<AppEnvelope>,
 ) {
     for envelope in &dropped {
-        retry_dropped_chat(manager, state, envelope, PUBLIC_TIER_LOST_REASON);
+        retry_dropped_chat(manager, state, envelope, manager.public_tier_lost_reason());
     }
 }
 
@@ -4096,7 +4151,7 @@ where
                     state,
                     transfer_id,
                     TransferOutcome::Failed,
-                    PUBLIC_TIER_LOST_REASON,
+                    manager.public_tier_lost_reason(),
                 );
 
                 return Ok(false);
@@ -4609,8 +4664,18 @@ fn handle_server_frame(
 
             publish_peer(manager, generation, peer_online);
             // 档位跟着连接走（见 `RelayTier`）：界面靠它把聊天 / 附件 / 语音收到直连上，
-            // 并说明「这台服务器只帮忙打洞」
-            manager.publish(generation, |status| status.tier = tier);
+            // 并说明「这台服务器只帮忙打洞」。
+            //
+            // `tier_reported` 与它同时写：`None` = 服务器压根没报（CF 版与旧中继），这时
+            // 行为上照样按 `full` 走，但界面上那句「这台服务器说……」不能说——那是在替
+            // 一台没说过话的服务器发言。
+            let tier_reported = tier.is_some();
+            let tier = tier.unwrap_or(RelayTier::Full);
+
+            manager.publish(generation, |status| {
+                status.tier = tier;
+                status.tier_reported = tier_reported;
+            });
 
             // 中继没广告额度（旧中继）时就用 CF 的缺省推导，语义上「这次连接的有效配置」
             // 永远是确定的，会话层只管照着用
@@ -5421,6 +5486,51 @@ mod tests {
         assert!(failure.message.contains("协议版本"));
         // 致命错误由会话层统一 publish 成 Error，这里不该先广播一个假的连接状态
         assert!(sink.payloads(EVENT_CONNECTION_CHANGED).is_empty());
+    }
+
+    /// 「服务器到底报没报档位」这条事实（`PairStatus::tier_reported`）。
+    ///
+    /// `server.welcome` 带 `tier` 才算服务器报过；不带（CF 版、旧中继）时客户端只按
+    /// `full` 行事，界面上那句「这台服务器说……」靠这个区别。连接结束时（这里是
+    /// `fail_hard` 那条路）必须跟着复位，否则界面会拿上一台服务器的说法解释下一次连接。
+    #[test]
+    fn the_welcome_tier_is_recorded_only_when_the_server_reports_it() {
+        let (manager, _sink) = test_manager();
+        let without = json!({
+            "type": "server.welcome",
+            "protocol": PROTOCOL_VERSION,
+            "peerOnline": false,
+        })
+        .to_string();
+
+        handle_server_frame(&manager, 0, &without).unwrap();
+
+        let status = manager.status();
+
+        assert_eq!(status.tier, RelayTier::Full);
+        assert!(!status.tier_reported, "服务器没报档位时不该说它报过");
+
+        let with = json!({
+            "type": "server.welcome",
+            "protocol": PROTOCOL_VERSION,
+            "peerOnline": false,
+            "tier": "public",
+        })
+        .to_string();
+
+        handle_server_frame(&manager, 0, &with).unwrap();
+
+        let status = manager.status();
+
+        assert_eq!(status.tier, RelayTier::Public);
+        assert!(status.tier_reported, "服务器报了档位就该记下来");
+
+        manager.fail_hard(0, "测试用的失败".to_string());
+
+        let status = manager.status();
+
+        assert!(!status.tier_reported, "连接结束之后不该留着上一次的说法");
+        assert_eq!(status.tier, RelayTier::Full);
     }
 
     #[test]
@@ -7608,6 +7718,14 @@ mod tests {
                 "{state:?} 时也不该放行"
             );
         }
+
+        // 「这一轮已经试过、没打通」（正在按退避等下一轮）要单独说一句：这会儿等下去没有用，
+        // 用户得动手换服务器或换网络，所以文案要写明「你现在用的就是公益档密码」。
+        manager.publish(0, |status| status.p2p = P2pState::Failed);
+
+        let failed = manager.outbound_blocked().expect("公益档没直连时必须挡住");
+
+        assert!(failed.contains("公益档密码"), "实际文案：{failed}");
 
         // 配对码那条路的理由不能被公益档盖掉（两句话说的是不同的事）
         manager.publish(0, |status| {

@@ -416,6 +416,35 @@ const p2pHint = computed(() => {
     : 'pages.preference.pair.p2p.hint'
 })
 
+/**
+ * 「服务器说这把密钥是哪一档」（`server.welcome` 的 `tier`）。
+ *
+ * 档位是**服务器按你交上去的密钥算出来的**，不是客户端自己选的，所以只有连上过才知道。
+ * 而且必须**服务器真的报过**（`tierReported`）：官方 Cloudflare 中继、旧版自建中继都是
+ * 「压根没有档位这回事」，配对码模式更是连服务器都没有——那些情况下 `runtime.tier` 只是
+ * 客户端按缺省行事，替服务器说「你这把密钥是完全档」就是瞎猜。
+ */
+const serverKeyTier = computed(() => {
+  const { tier, tierReported } = pairStore.runtime
+
+  return tierReported ? tier : ''
+})
+
+/**
+ * 服务器密码那一栏的说明：服务器报过档位就把那句话续在后面。
+ *
+ * 中间那段 `serverKeyTierLead` 只为了排版：中文直接接着上一句的句号，英文需要一个空格
+ * （`…chat or files.This server says…` 是拼错的），所以分隔符也交给 i18n。
+ */
+const serverPasswordHint = computed(() => {
+  const base = t('pages.preference.pair.hints.serverPassword')
+  const tier = serverKeyTier.value
+
+  if (!tier) return base
+
+  return `${base}${t('pages.preference.pair.hints.serverKeyTierLead')}${t(`pages.preference.pair.hints.serverKeyTier.${tier}`)}`
+})
+
 const modelOptions = computed(() => {
   return modelStore.models.map((model) => {
     const current = model.id === modelStore.currentModel?.id
@@ -1145,7 +1174,7 @@ const {
     </ProListItem>
 
     <ProListItem
-      :description="$t('pages.preference.pair.hints.serverPassword')"
+      :description="serverPasswordHint"
       :title="$t('pages.preference.pair.labels.serverPassword')"
       vertical
     >

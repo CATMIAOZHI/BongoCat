@@ -20,6 +20,7 @@
         "sendRecordingNotConnected": "还没连上服务器，发不出去",
         "sendRecordingOffline": "对方不在线，等对方回来再发",
         "sendRecordingPublicNotDirect": "这台服务器只帮忙打洞（公益档），不转发语音：等直连建立后再发",
+        "sendRecordingPublicFailed": "打洞失败：你现在用的是公益档密码（只借服务器打洞、不中继），语音发不出去——换一台服务器，或请对方换个网络再试",
         "reRecord": "重新录一条（会丢掉刚才那段）",
         "voicePlaybackFailed": "试听失败：这段录音读不出来",
         "voiceSendFailed": "发送失败：{reason}。这段录音已经删掉，要重新录一段。",
@@ -68,7 +69,9 @@
         "manual": "配对码连接：{state}",
         "manualNotReady": "配对码这条路还没连上对方：等对方猫出现在桌面上就能发了",
         "publicNotDirect": "这台服务器只帮忙打洞（公益档），不转发消息和文件：等上面显示「已直连」就能发了",
+        "publicFailed": "打洞失败：你现在用的是公益档密码（只借服务器打洞、不中继），消息发不出去——换一台服务器，或请对方换个网络再试",
         "blockedTitle": "服务器只帮忙打洞，等直连",
+        "blockedTitlePublicFailed": "打洞失败：公益档只打洞",
         "preview": "查看这张图片",
         "close": "关闭",
         "imageCopied": "图片已复制到剪贴板",
@@ -330,6 +333,11 @@
           "relayUrlEmpty": "服务器地址不能留空：留空这一栏不会生效。要换地址就填新的再点「保存」。",
           "relayUrlCopied": "服务器地址已复制",
           "serverPassword": "用官方 Cloudflare 中继时不用填。自建服务器才要：部署服务器的那个人在服务器上设了一个密码，两个人都得填成同一个，没有它就连不上（挡住陌生人白用）。如果对方给你的是一台「公益服务器」的密码（别人开放出来、只帮大家打洞用的），也填在这一栏：那台服务器只帮你们打洞，不转发聊天与文件。",
+          "serverKeyTier": {
+            "full": "这台服务器说：你这把密钥是「完全档」（打洞 + 中继兜底都能用）。",
+            "public": "这台服务器说：你这把密钥是「公益档」——只借它打洞、不转发聊天与文件，打不通就什么都发不出去。"
+          },
+          "serverKeyTierLead": "",
           "valuesRemembered": "已记住这次填写的值，下次启动会自动用",
           "valuesReplaced": "已记住这次填写的值，并替换掉原来保存的配对密码；旧的那串已经作废，对方也要改成同一串，不然连不上",
           "deleteConfirmTitle": "删除「{name}」？",
@@ -427,7 +435,7 @@
           "connecting": "正在建立直连…",
           "connected": "已直连",
           "failed": "暂时连不上，已用服务器",
-          "failedPublic": "还没打通，什么都发不出去"
+          "failedPublic": "打洞失败：公益档只借服务器打洞、不中继，现在什么都发不出去"
         },
         "manual": {
           "label": "配对码（不用服务器）",

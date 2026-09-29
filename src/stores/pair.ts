@@ -108,8 +108,13 @@ export function recordingBlockReasonKey(input: {
 
   // 公益档：对方在服务器上在线，但**这台服务器不转发数据**——录音发到服务器会被它用
   // 1008 关掉整条连接。所以这一档的判据是「直连建立了没有」，而不是「对方在不在线」。
+  //
+  // 「这一轮打洞已经失败、正在退避重试」要单独说一句：这会儿等下去没有用，得动手
+  // （换一台服务器，或请对方换个网络）；而「正在打 / 还没轮到」等一会儿就好。
   if (input.tier === 'public' && input.p2p !== 'connected') {
-    return 'pages.main.hints.sendRecordingPublicNotDirect'
+    return input.p2p === 'failed'
+      ? 'pages.main.hints.sendRecordingPublicFailed'
+      : 'pages.main.hints.sendRecordingPublicNotDirect'
   }
 
   if (input.peerOnline) return ''
@@ -145,8 +150,12 @@ export function outboundBlockKey(input: {
     return 'pages.chat.hints.manualNotReady'
   }
 
+  // 公益档：同上，「打洞失败」（这一轮没打通、正在退避重试）与「还在打通」分开说——
+  // 前者要告诉用户「你现在用的就是公益档密码」，并给出下一步（换服务器 / 换网络）。
   if (input.tier === 'public' && input.p2p !== 'connected') {
-    return 'pages.chat.hints.publicNotDirect'
+    return input.p2p === 'failed'
+      ? 'pages.chat.hints.publicFailed'
+      : 'pages.chat.hints.publicNotDirect'
   }
 
   return ''
@@ -249,6 +258,13 @@ export interface PairRuntime {
    */
   tier: PairTier
   /**
+   * **这次连接上，服务器到底报过档位没有**（Rust 侧 `PairStatus::tier_reported`）。
+   *
+   * `false` = 官方 Cloudflare 中继、旧版自建中继，或配对码模式：这时 `tier` 只是客户端
+   * 按缺省行事，**不是服务器说过的话**，界面不能替它发言（见偏好页的「服务器说…」）。
+   */
+  tierReported: boolean
+  /**
    * 配对码（手工信令）这条路的状态。`undefined` = 当前会话不是配对码。
    *
    * 它决定界面上一整块面板（生成 / 复制 / 粘贴 / 倒计时）与「现在能不能发消息」，
@@ -335,6 +351,7 @@ export const usePairStore = defineStore('pair', () => {
     connection: 'disabled',
     p2p: 'off',
     tier: 'full',
+    tierReported: false,
     manual: void 0,
     petStateHz: 0,
     plaintext: false,

@@ -607,10 +607,15 @@ pub enum ServerFrame {
             deserialize_with = "deserialize_ice_servers"
         )]
         ice_servers: Vec<IceServer>,
-        /// 这次连接算哪一档（自建中继独有；CF 版与旧版都不发）。缺失或认不出来一律
-        /// 按 `full`，见 [`deserialize_tier`]。
-        #[serde(default = "full_tier", deserialize_with = "deserialize_tier")]
-        tier: RelayTier,
+        /// 这次连接算哪一档（自建中继独有；CF 版与旧版都不发）。
+        ///
+        /// **`None` = 服务器压根没报档位**（缺字段、`null`、认不出来的值），此时调用方
+        /// 按 `full` 行事（见 [`deserialize_tier`]）。保留 `None` 与 `Some(Full)` 的区别，
+        /// 是因为界面上那句「这台服务器说：你这把密钥是「完全档」」**只有服务器真的报过
+        /// 才成立**：官方 Cloudflare 中继与旧版自建中继都没有档位这回事，把它们说成
+        /// 「服务器说你是完全档」是瞎猜（`PairStatus::tier_reported` 就是这件事的事实）。
+        #[serde(default, deserialize_with = "deserialize_tier")]
+        tier: Option<RelayTier>,
     },
     #[serde(rename = "server.peer")]
     Peer {
@@ -645,26 +650,26 @@ impl RelayTier {
     }
 }
 
-fn full_tier() -> RelayTier {
-    RelayTier::Full
-}
-
-/// 宽容地解析 `tier`：缺字段、`null`、别的字符串、甚至一个数字，全部按 `full`。
+/// 宽容地解析 `tier`：缺字段、`null`、别的字符串、甚至一个数字，全部落成 `None`
+/// （调用方按 `full` 行事，但**不算服务器报过档位**）。
 ///
 /// 不能让它解析失败：这会让整条 `server.welcome` 变成「读不出来」，而 welcome 读不出来
 /// 就是一次连接失败。反过来说，把一个**真**公益档认成 `full` 也不是灾难——那台服务器
 /// 会自己在收到数据帧时用 `1008` 拒绝（见 `server-relay/src/relay.rs` 的帧白名单），
 /// 客户端下一轮就会把这条连接重来，只是比「一开始就挡住」多一次重连。
-fn deserialize_tier<'de, D>(deserializer: D) -> Result<RelayTier, D::Error>
+fn deserialize_tier<'de, D>(deserializer: D) -> Result<Option<RelayTier>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = Option::<Value>::deserialize(deserializer)?;
 
-    Ok(match value.as_ref().and_then(Value::as_str) {
-        Some("public") => RelayTier::Public,
-        _ => RelayTier::Full,
-    })
+    Ok(value.as_ref().and_then(Value::as_str).and_then(|text| {
+        match text {
+            "public" => Some(RelayTier::Public),
+            "full" => Some(RelayTier::Full),
+            _ => None,
+        }
+    }))
 }
 
 /// 中继在 `server.welcome` 里广告的限流额度（R20）。
@@ -1381,23 +1386,48 @@ mod tests {
     /// 两种方向都不能出错。认不出来时按 `full`：旧中继（含官方 Cloudflare 版）压根不发
     /// 这个字段，而「认成 public 就什么都不发了」这种降级比忽略一个未知字段严重得多。
     /// （反过来的风险由服务端兜着：真公益档收到数据帧会用 `1008` 拒绝。）
+    ///
+    /// 同时钉住「服务器到底报过没有」：只有认得出的小写 `full` / `public` 才算报过
+    /// （`Some(..)`），界面上「这台服务器说……」那句就靠这个区别，不能把 CF 版或旧中继
+    /// 说成「服务器说你这一档是完全档」。
     #[test]
     fn the_welcome_tier_is_lenient_and_defaults_to_full() {
-        for payload in [
+        for (payload, reported) in [
             // 旧中继：根本没有这个字段
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false }"#,
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false }"#,
+                false,
+            ),
             // 显式 null
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": null }"#,
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": null }"#,
+                false,
+            ),
             // 形状不对：数字
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": 1 }"#,
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": 1 }"#,
+                false,
+            ),
             // 形状不对：对象
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": {} }"#,
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": {} }"#,
+                false,
+            ),
             // 认不出来的取值（将来的档位不该把老客户端打瞎）
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "vip" }"#,
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "vip" }"#,
+                false,
+            ),
             // 大小写敏感：只有小写的 `public` 才算公益档
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "Public" }"#,
-            // 显式的部署者档
-            r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "full" }"#,
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "Public" }"#,
+                false,
+            ),
+            // 显式的部署者档：这一档认得出，所以**算服务器报过**
+            (
+                r#"{ "type": "server.welcome", "protocol": 1, "peerOnline": false, "tier": "full" }"#,
+                true,
+            ),
         ] {
             let frame: ServerFrame = serde_json::from_str(payload)
                 .unwrap_or_else(|error| panic!("{payload} 不该解析失败：{error}"));
@@ -1406,8 +1436,13 @@ mod tests {
                 panic!("应当解析成 server.welcome: {payload}");
             };
 
-            assert_eq!(tier, RelayTier::Full, "解析：{payload}");
-            assert!(!tier.is_public());
+            assert_eq!(
+                tier.unwrap_or(RelayTier::Full),
+                RelayTier::Full,
+                "解析：{payload}"
+            );
+            assert!(!tier.unwrap_or(RelayTier::Full).is_public());
+            assert_eq!(tier.is_some(), reported, "「服务器报过没有」：{payload}");
         }
 
         let frame: ServerFrame = serde_json::from_str(
@@ -1422,8 +1457,8 @@ mod tests {
             panic!("应当解析成 server.welcome");
         };
 
-        assert_eq!(tier, RelayTier::Public);
-        assert!(tier.is_public());
+        assert_eq!(tier, Some(RelayTier::Public));
+        assert!(tier.unwrap_or(RelayTier::Full).is_public());
         // 同一帧里的其它字段照常读出来（档位不参与它们的判定）
         assert!(peer_online);
     }

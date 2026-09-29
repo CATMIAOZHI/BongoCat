@@ -129,7 +129,16 @@ const blocked = computed(() => Boolean(blockKey.value))
  * 这里只放一句短的：完整那句（带「等上面显示『已直连』」）在输入条下面已经有了，
  * 而标题那行是 `truncate` 的，塞不下反而会把有用的后半句截掉。
  */
-const blockState = computed(() => (blocked.value ? t('pages.chat.hints.blockedTitle') : ''))
+const blockState = computed(() => {
+  if (!blocked.value) return ''
+
+  // 公益档下「打洞失败」与「还在打通」不是一回事：前者要用户动手（换服务器 / 换网络），
+  // 所以标题也换一句。判据**从 `blockKey` 读**，不在这里再抄一遍（正文那句在输入条下面
+  // 用的也是同一个 key）：抄一份就会出现「标题说打洞失败、正文说配对码没连上」。
+  const failed = blockKey.value === 'pages.chat.hints.publicFailed'
+
+  return t(failed ? 'pages.chat.hints.blockedTitlePublicFailed' : 'pages.chat.hints.blockedTitle')
+})
 
 /** R42：发送键能不能按——有内容、没超长、不在发送中、没有「发不出去」的硬理由 */
 const sendReady = computed(() => {
