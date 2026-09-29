@@ -29,8 +29,9 @@
 
 ## 仓库边界
 
-- 远端：`origin` = CATMIAOZHI/BongoCat（fork）；上游 = ayangweb/BongoCat，主分支为 `master`（上游没有 `dev` 分支）。
-- 从 `feat/pair-desktop-v1` 分支起，本 fork 在上游 `master` 之上有本地定制（双人联机功能，仅 Windows 范围）。
+- 远端：`origin` = CATMIAOZHI/BongoCat（fork）；上游 = ayangweb/BongoCat，上游主分支为 `master`（上游没有 `dev` 分支）。
+- **本 fork 的主分支是 `main`**（2026-09-29 起是 GitHub 仓库设置里的 default branch，之前那个名字是 `feat/pair-desktop-v1`）：仓库首页、克隆、新建 PR 的默认 base 都落在这一版上，它在上游 `master` 之上带着本地定制（双人联机功能，仅 Windows 范围）。
+- 上游 `master` 只作参照：本地定制不合并上去；向上游贡献照旧另开分支（见下一条）。
 - 除非用户明确要求，不主动同步、对比或合并上游。准备向上游贡献时，先做只读可行性分析（含上游重复 issue/PR 检索），报告需要重新验证的部分，等用户明确许可后再建分支或提 PR。
 - 对外仓库链接、下载、反馈和维护者署名统一为 `CATMIAOZHI/BongoCat` / `CATMIAOZHI`。许可证保留原作者版权。`identifier`（`com.ayangweb.BongoCat`）与系统凭据库 SERVICE 保留以兼容已安装客户端数据；它们不是网络地址。`ayangweb/gilrs` 是实际依赖源，不替换成不存在的 fork。
 - 对方模型自动同步默认开启，只在 presence 中携带 `model: { name, mode, isPreset }`，不发送路径、随机 ID 或文件。内置模型按模式匹配，自定义模型按 `Model.name` 和模式匹配本地已导入列表；导入时保存原始目录名，旧模型在模型卡片点铅笔补填。存储目录末段是随机 ID，不能用它匹配。缺失、未命名或重名时使用自己的模型并提示。用户关闭自动同步后仍可手动选模型。加载串行执行，避免异步覆盖。
