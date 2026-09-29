@@ -59,7 +59,7 @@
 
 ## 提交与发布
 
-- 提交信息遵循 Conventional Commits（`commitlint` 经 `simple-git-hooks` 的 `commit-msg`、`pre-commit` 钩子校验，pre-commit 会跑 `eslint --fix`）。
+- 提交信息遵循 Conventional Commits（`commitlint` 经 `simple-git-hooks` 的 `commit-msg`、`pre-commit` 钩子校验）。pre-commit 跑的是 `lint-staged`，它的 glob 只匹配 `src/**` 里的代码文件——**与仓库自己的 `pnpm lint`（`eslint --fix src`）范围一致**，这条不变量要保住。上游原本是 `"*": "eslint --fix"`（什么都交给 eslint）：`.rs` 只会得到一句 `File ignored because no matching configuration was supplied` 警告，Markdown 会被 `formatters` 里的 prettier 整段重排（中文表格全被对齐、diff 没法看），而且 `server-cloudflare/README.md` 里那段两行 JSON 的示例块本来就解析不过——结果是**每次改文档都只能 `--no-verify`**，钩子形同虚设。
 - 发布用 `pnpm release`（release-it，标签 `v*`），再由 `.github/workflows/release.yml` 构建 Draft Release。CI **只构建 Windows 三个目标**（x64 / x86 / arm64），macOS 与 Linux 已从矩阵里去掉（双人联机只做 Windows，那些包没人用）；要恢复上游的全平台见 workflow 里矩阵旁的注释。**本 fork 自用版不需要配任何 Secret**：推 `v*` 标签（或手动 Run workflow）就出安装包，用的是 GitHub 自带的 `GITHUB_TOKEN`（workflow 里已声明 `permissions: contents: write`），构建时 `--no-sign` 且 `createUpdaterArtifacts: false`、不生成 `latest.json`。想恢复「签名 + 自动更新分发」，按 `release.yml` 末尾的步骤重新配置自有公钥、私钥与插件（旧公钥已移除）。
 - 上游专用的 UpgradeLink 与 Gitee 同步 workflow 已移除；不再访问上游更新服务或携带其 access key。
 - 自建中继（`server-relay/`）的预编译二进制走 `.github/workflows/relay-release.yml`：推 `relay-v*` 标签（如 `relay-v1`）出 Release，或在 Actions 手动跑存 Artifact。**runner 必须留在 ubuntu-22.04**（服务器是 `debian:bookworm-slim`，glibc 2.36；用 24.04 编出来的会报 `GLIBC_2.3x not found`），workflow 里那步 `Check glibc requirement` 把这条钉住。包里除 `bongocat-pair-relay` 还带 `generate-pair`，服务器上不用装 Rust 也能生成服务器密码；下载与校验方式见 `server-relay/README.md` 的「预编译二进制」一节。
