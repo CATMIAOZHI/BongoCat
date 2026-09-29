@@ -19,7 +19,7 @@ use crate::protocol::{
     HEALTH_PATH, MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, Tier,
     WEBSOCKET_VERSION, WS_PATH,
 };
-use crate::relay::{self, Relay, RelayOptions, RoomRejection};
+use crate::relay::{self, Relay, RelayOptions, RoomRejection, ServerKey};
 
 /// 请求头必须在这个时间内读完：只发一个连接、永远不发请求头的客户端不该占住一个任务
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,9 +49,12 @@ pub struct Config {
     /// 部署者自己配了 `PAIR_ICE_SERVERS` 时这里是 `None`：以他的配置为准，内置的不启动、
     /// 也不混进广告里（两份 STUN 同时广告只会让客户端多问一次）。
     pub stun_port: Option<u16>,
-    /// R36：服务器密码的 verifier（`SHA256(derive_server_token(密码))`）。
-    /// 配置里**没有**密码原文，也没有它的任何可逆形态。
-    pub server_verifier: [u8; 32],
+    /// R36：服务器钥匙表。谁能连上这台服务器、以及进来之后算哪一档，全看它；
+    /// 一个变量可以配多把（`;` 分隔），每把的档位由它来自哪个变量决定。
+    ///
+    /// 配置里**没有**密码原文，也没有它的任何可逆形态（只有 `SHA256(derive_server_token)`
+    /// 摘要）——`load_config` 里的局部变量是原文唯一存在过的地方。
+    pub server_keys: Vec<ServerKey>,
     /// 公益档（public tier）的额度。它只放行信令，所以比 `limits` 小得多。
     pub public_limits: Limits,
     /// 公益档同时承载的会话数（`PAIR_MAX_PUBLIC_SESSIONS`）。与 `max_sessions` 分开算：
@@ -61,8 +64,6 @@ pub struct Config {
     pub max_public_per_ip: usize,
     /// 公益档的空闲回收窗口。`None` = 不回收
     pub public_window: Option<Duration>,
-    /// 公益密码的 verifier（`PAIR_PUBLIC_SERVER_PASSWORD`）。`None` = 这台服务器没有公益档
-    pub public_verifier: Option<[u8; 32]>,
     /// 信不信 `X-Forwarded-For`（`PAIR_TRUST_PROXY`）：只有前面站着可信反代时才打开
     pub trust_proxy: bool,
 }
@@ -122,6 +123,71 @@ fn env_positive_usize(name: &str, default: usize) -> Result<usize, String> {
     }
 }
 
+/// 读一个「一把或多把密码」的环境变量（`;` 分隔）。
+///
+/// 同一个变量里的每一把都属于**同一个档位**（完全档看 `PAIR_SERVER_PASSWORD`，公益档看
+/// `PAIR_PUBLIC_SERVER_PASSWORD`），所以档位不写在值里：写进去就要用户记语法，还容易和
+/// 密码里的字符打架。这样配出来的效果是「每把钥匙各给一个人，换人时只撤销一把」。
+///
+/// 空白项（多打的分号、行尾分号）忽略；报错时**只说第几把**，绝不回显密码本身
+/// ——它是秘密，日志或控制台里出现一次就等于泄露。
+fn env_passwords(name: &str, too_short: &str) -> Result<Vec<String>, String> {
+    match env_non_empty(name) {
+        None => Ok(Vec::new()),
+        Some(text) => parse_passwords(name, &text, too_short),
+    }
+}
+
+/// [`env_passwords`] 的纯函数内核：切分 + 校验。
+///
+/// 单独抽出来是为了能被单测钉住——环境变量在测试里是进程全局的，直接测 `load_config`
+/// 既会互相干扰，也会把别的用例的配置搅乱。
+fn parse_passwords(name: &str, text: &str, too_short: &str) -> Result<Vec<String>, String> {
+    let mut passwords: Vec<String> = Vec::new();
+
+    for part in text.split(';') {
+        let password = part.trim();
+
+        if password.is_empty() {
+            continue;
+        }
+
+        // 报「第几把」时数的是**密码**，不是分号切出来的槽位：`a;;短` 里那串短的是第 2 把
+        // 密码（多打的空分号不该把编号顶偏），跨档重复那条报错也用同一套编号。
+        let index = passwords.len() + 1;
+
+        if password.chars().count() < MIN_SERVER_PASSWORD_LENGTH {
+            return Err(format!(
+                "{name} 的第 {index} 把太短：至少要 {MIN_SERVER_PASSWORD_LENGTH} 个字符（{too_short}）；\
+                 多把密码之间用 `;` 分隔",
+            ));
+        }
+
+        if passwords.iter().any(|existing| existing == password) {
+            return Err(format!(
+                "{name} 的第 {index} 把和前面某一把完全一样：重复的那把是白写的，删掉一个"
+            ));
+        }
+
+        passwords.push(password.to_string());
+    }
+
+    Ok(passwords)
+}
+
+/// 两档的清单里有没有**同一把**钥匙，返回它在公益档清单里第几把（1 起）。
+///
+/// 同一把钥匙兼两档会让「这次算哪一档」成为二义，也等于把公益那套限制绕过去了（拿公益
+/// 密码进来的人会掉回完全档，直接用上中继与 TURN），所以 `load_config` 碰到它就拒绝启动。
+/// 单独抽成纯函数是为了能被单测钉住——这条判据在 `load_config` 里，而那个函数读全局
+/// 环境变量，没法在测试里安全地调。
+fn shared_key(full: &[String], public: &[String]) -> Option<usize> {
+    public
+        .iter()
+        .position(|password| full.iter().any(|key| key == password))
+        .map(|index| index + 1)
+}
+
 /// 读环境变量组装配置。
 pub fn load_config() -> Result<Config, String> {
     let limits = Limits {
@@ -155,42 +221,47 @@ pub fn load_config() -> Result<Config, String> {
     // R36：服务器密码是**必填**的。它是「谁能用这台服务器」的唯一门槛：没有它，
     // 任何人只要知道地址就能开一个自己的会话（还会顺走 welcome 里的 TURN 凭据）。
     // 与其允许一个默认开放、随时可能被白嫖的部署，不如启动就报错说清楚怎么设。
-    let server_password = env_non_empty("PAIR_SERVER_PASSWORD").ok_or_else(|| {
-        format!(
+    // 这里可以写多把（`;` 分隔）：每把都是完全档，给出去一把不影响别的。
+    let server_passwords = env_passwords(
+        "PAIR_SERVER_PASSWORD",
+        "太短的门槛挡不住爆破，也挡不住猜",
+    )?;
+
+    if server_passwords.is_empty() {
+        return Err(format!(
             "缺少 PAIR_SERVER_PASSWORD：请在 .env 里设置一个至少 {MIN_SERVER_PASSWORD_LENGTH} \
              字符的服务器密码（可以用 `cargo run --bin generate-pair -- --server` 生成），\
-             填完再重启；客户端要用同一个值填「服务器密码」"
-        )
-    })?;
-
-    if server_password.chars().count() < MIN_SERVER_PASSWORD_LENGTH {
-        return Err(format!(
-            "PAIR_SERVER_PASSWORD 太短：至少要 {MIN_SERVER_PASSWORD_LENGTH} 个字符（太短的\
-             门槛挡不住爆破，也挡不住猜）"
+             填完再重启；客户端要用同一个值填「服务器密码」。要发给多个人，可以写多把，\
+             用 `;` 分隔（每把各给一个人，换人时只撤销一把）"
         ));
     }
 
     // 公益档（可选）。设了它，拿到这个密码的人就借这台服务器打洞：只转发信令、只广告
     // STUN、占自己的名额，占不到部署者那一档的任何东西。
-    let public_password = env_non_empty("PAIR_PUBLIC_SERVER_PASSWORD");
+    // 同样可以写多把（`;` 分隔），每把都是公益档。
+    let public_passwords = env_passwords(
+        "PAIR_PUBLIC_SERVER_PASSWORD",
+        "公益密码是**公开**的，长度是唯一的在线爆破阻力",
+    )?;
 
-    if let Some(password) = &public_password {
-        if password.chars().count() < MIN_SERVER_PASSWORD_LENGTH {
-            return Err(format!(
-                "PAIR_PUBLIC_SERVER_PASSWORD 太短：至少要 {MIN_SERVER_PASSWORD_LENGTH} 个字符\
-                 （公益密码是**公开**的，长度是唯一的在线爆破阻力）"
-            ));
-        }
-
-        // 两个密码相同会让「这次算哪一档」变成二义，也等于把公益那套限制绕过去了
-        if password == &server_password {
-            return Err(
-                "PAIR_PUBLIC_SERVER_PASSWORD 不能和 PAIR_SERVER_PASSWORD 相同：公益档\
-                 与你自己那一档必须是两把不同的钥匙"
-                    .to_string(),
-            );
-        }
+    // 同一把钥匙不能同时属于两档：「这次算哪一档」会成为二义，而且等于把公益那套限制
+    // 绕过去了（拿公益密码进来的人会掉回完全档，直接用上中继与 TURN）。
+    if let Some(index) = shared_key(&server_passwords, &public_passwords) {
+        return Err(format!(
+            "PAIR_PUBLIC_SERVER_PASSWORD 的第 {index} 把和 PAIR_SERVER_PASSWORD 里的一把\
+             相同：公益档与你自己那一档必须是两把不同的钥匙"
+        ));
     }
+
+    let server_keys: Vec<ServerKey> = server_passwords
+        .iter()
+        .map(|password| ServerKey::new(Tier::Full, password))
+        .chain(
+            public_passwords
+                .iter()
+                .map(|password| ServerKey::new(Tier::Public, password)),
+        )
+        .collect();
 
     // 这里**不用** `env_positive_usize`：公益档的 0 有正当含义（关掉这一档，但把密码留着
     // 免得以后又要重新分发），不像 `PAIR_MAX_SESSIONS` 那样一定是配置事故——0 会让它
@@ -201,7 +272,7 @@ pub fn load_config() -> Result<Config, String> {
     )? as usize;
 
     // 0 只打警告、不报错：部署者可能只是暂时关掉公益档，没道理把整套服务器拖死
-    if public_password.is_some() && max_public_sessions == 0 {
+    if !public_passwords.is_empty() && max_public_sessions == 0 {
         eprintln!(
             "提醒：PAIR_PUBLIC_SERVER_PASSWORD 已设置，但 PAIR_MAX_PUBLIC_SESSIONS=0，\
              公益档实际上一个人都进不来"
@@ -216,7 +287,7 @@ pub fn load_config() -> Result<Config, String> {
         stale_after: Duration::from_millis(env_u64("PAIR_STALE_AFTER_MS", DEFAULT_STALE_AFTER_MS)?),
         ice_servers,
         stun_port,
-        server_verifier: auth::server_verifier(&server_password),
+        server_keys,
         public_limits: Limits {
             frames_per_second: env_f64(
                 "PAIR_PUBLIC_MAX_FRAMES_PER_SECOND",
@@ -235,7 +306,6 @@ pub fn load_config() -> Result<Config, String> {
             as usize,
         public_window: (public_window_secs > 0)
             .then(|| Duration::from_secs(public_window_secs)),
-        public_verifier: public_password.as_deref().map(auth::server_verifier),
         trust_proxy: env_bool("PAIR_TRUST_PROXY", false)?,
     })
 }
@@ -260,8 +330,7 @@ impl Config {
             stale_after: self.stale_after,
             ice_servers: self.ice_servers.clone(),
             stun_port,
-            server_verifier: self.server_verifier,
-            public_verifier: self.public_verifier,
+            server_keys: self.server_keys.clone(),
             trust_proxy: self.trust_proxy,
         }
     }
@@ -308,11 +377,15 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     if head.path() == HEALTH_PATH {
         // §28：只说「我活着、协议是 1、需要服务器密码」。**不暴露**任何 Room、deviceId
         // 或密钥信息；`passwordRequired` 是常量，用来让部署者一条 curl 就确认自己装对了
-        // `publicTier` 同理（有没有配公益密码），也是常量
+        // `publicTier` 同理（有没有配公益密码）。`serverKeys` 只报**把数**（完全档 / 公益档
+        // 各配了几把），不带任何能拿去试的东西——部署者配多把时靠它确认自己没写漏。
         let body = format!(
             "{{\"ok\":true,\"protocol\":{PROTOCOL_VERSION},\"mode\":\"multi-pair\",\
-             \"passwordRequired\":true,\"publicTier\":{}}}",
-            relay.has_public_tier()
+             \"passwordRequired\":true,\"publicTier\":{},\
+             \"serverKeys\":{{\"full\":{},\"public\":{}}}}}",
+            relay.has_public_tier(),
+            relay.server_key_count(Tier::Full),
+            relay.server_key_count(Tier::Public)
         );
 
         return write_response(&mut stream, 200, "OK", "application/json", &body)
@@ -606,4 +679,86 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
 /// 对端地址、阶段与状态码——不写 token、不写 ROOM_ID、不写密码。
 fn reject(peer: SocketAddr, reason: &str, status: u16) {
     eprintln!("连接 {peer} 被拒绝：{reason}（HTTP {status}）");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAME: &str = "PAIR_SERVER_PASSWORD";
+    const WHY: &str = "测试用";
+
+    /// 一把密码就是从前那样：行为必须完全不变
+    #[test]
+    fn a_single_password_stays_one_key() {
+        assert_eq!(
+            parse_passwords(NAME, "  my-own-long-password  ", WHY).unwrap(),
+            vec!["my-own-long-password".to_string()]
+        );
+    }
+
+    /// 多把：`;` 分隔，空白项忽略（多打的分号、行尾分号不该让人以为配坏了）
+    #[test]
+    fn several_passwords_are_split_and_trimmed() {
+        assert_eq!(
+            parse_passwords(NAME, "password-for-alice; password-for-bob ;;", WHY).unwrap(),
+            vec![
+                "password-for-alice".to_string(),
+                "password-for-bob".to_string()
+            ]
+        );
+    }
+
+    /// 报错要说清第几把，而且不能把密码回显出来
+    #[test]
+    fn a_short_or_repeated_password_is_rejected_by_index() {
+        let short = parse_passwords(NAME, "long-enough-password;short", WHY).unwrap_err();
+
+        assert!(short.contains("第 2 把"), "{short}");
+        assert!(!short.contains("short"), "报错里不该出现密码：{short}");
+
+        let repeated =
+            parse_passwords(NAME, "password-for-alice;password-for-alice", WHY).unwrap_err();
+
+        assert!(repeated.contains("第 2 把"), "{repeated}");
+        assert!(!repeated.contains("password-for-alice"), "{repeated}");
+    }
+
+    /// 编号数的是**密码**，不是分号切出来的槽位：多打的空分号不该把「第几把」顶偏
+    /// （跨档重复那条报错也用同一套编号，两处读起来要是同一件事）
+    #[test]
+    fn empty_slots_do_not_shift_the_index() {
+        let short = parse_passwords(NAME, ";;long-enough-password;short", WHY).unwrap_err();
+
+        assert!(short.contains("第 2 把"), "{short}");
+    }
+
+    /// 同一把钥匙不能兼两档：两档清单里出现同一串时，要说清是公益档里第几把
+    #[test]
+    fn a_key_may_not_sit_in_both_tiers() {
+        let full = vec!["password-for-alice".to_string(), "password-for-bob".to_string()];
+        let public = vec![
+            "volunteer-1-password".to_string(),
+            "password-for-bob".to_string(),
+        ];
+
+        assert_eq!(shared_key(&full, &public), Some(2));
+        // 两档各管各的（同一档内部重复由 `parse_passwords` 挡，跨档只看交集）
+        assert_eq!(
+            shared_key(
+                &full,
+                &["volunteer-1-password".to_string(), "volunteer-2-password".to_string()]
+            ),
+            None
+        );
+        assert_eq!(shared_key(&[], &public), None);
+        assert_eq!(shared_key(&full, &[]), None);
+    }
+
+    /// 空值 / 只有分号 = 一把都没有（调用方据此判「压根没设过」）
+    #[test]
+    fn an_empty_value_yields_no_keys() {
+        assert!(parse_passwords(NAME, "   ", WHY).unwrap().is_empty());
+        assert!(parse_passwords(NAME, " ; ; ", WHY).unwrap().is_empty());
+    }
 }

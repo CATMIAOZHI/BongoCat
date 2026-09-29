@@ -18,7 +18,8 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use bongocat_pair_relay::relay::{Relay, RelayOptions};
+use bongocat_pair_relay::protocol::Tier;
+use bongocat_pair_relay::relay::{Relay, RelayOptions, ServerKey};
 use bongocat_pair_relay::server::{self, Config};
 use bongocat_pair_relay::{
     auth,
@@ -37,6 +38,9 @@ const TOKEN_C: &str = "token-c";
 const SERVER_PASSWORD: &str = "relay-tests-server-password";
 /// 公益档的密码（只在显式开了公益档的中继上有效）
 const PUBLIC_PASSWORD: &str = "relay-tests-public-password";
+/// 多把钥匙：同一个档配第二把（「每把钥匙各给一个人」）
+const SECOND_SERVER_PASSWORD: &str = "relay-tests-second-full-key-01";
+const SECOND_PUBLIC_PASSWORD: &str = "relay-tests-second-public-key-1";
 
 fn server_token() -> String {
     auth::derive_server_token(SERVER_PASSWORD)
@@ -109,12 +113,11 @@ fn config(
         stale_after,
         ice_servers,
         stun_port,
-        server_verifier: auth::server_verifier(SERVER_PASSWORD),
+        server_keys: vec![ServerKey::new(Tier::Full, SERVER_PASSWORD)],
         public_limits: defaults.public_limits,
         max_public_sessions: defaults.max_public_sessions,
         max_public_per_ip: defaults.max_public_per_ip,
         public_window: defaults.public_window,
-        public_verifier: None,
         trust_proxy: false,
     }
 }
@@ -126,13 +129,16 @@ fn public_config(
     max_public_per_ip: usize,
     window: Option<Duration>,
 ) -> Config {
-    Config {
-        public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
-        max_public_sessions,
-        max_public_per_ip,
-        public_window: window,
-        ..config(Limits::default(), max_sessions, Duration::from_secs(120), None, None)
-    }
+    let mut config = config(Limits::default(), max_sessions, Duration::from_secs(120), None, None);
+
+    config
+        .server_keys
+        .push(ServerKey::new(Tier::Public, PUBLIC_PASSWORD));
+    config.max_public_sessions = max_public_sessions;
+    config.max_public_per_ip = max_public_per_ip;
+    config.public_window = window;
+
+    config
 }
 
 async fn start_relay_with_config(config: Config) -> SocketAddr {
@@ -343,6 +349,11 @@ async fn health_is_public_and_unknown_paths_are_not_found() {
     assert!(response.contains("\"mode\":\"multi-pair\""));
     // R36：部署者一条 curl 就能确认自己装对了（密码是必填项）
     assert!(response.contains("\"passwordRequired\":true"));
+    // 钥匙是把数公开的：部署者配多把时靠它确认自己没写漏（不含任何能拿去试的东西）
+    assert!(
+        response.contains("\"serverKeys\":{\"full\":1,\"public\":0}"),
+        "实际：{response}"
+    );
     assert!(!response.contains(ROOM_A));
 
     let response = raw_request(address, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
@@ -1097,18 +1108,21 @@ async fn the_public_tier_is_announced_with_stun_only() {
             "credential": "coturn-pass"
         }
     ]);
-    let address = start_relay_with_config(Config {
-        ice_servers: Some(ice_servers.clone()),
-        public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
-        ..config(
-            Limits::default(),
-            20,
-            Duration::from_secs(120),
-            None,
-            None,
-        )
-    })
-    .await;
+    let mut settings = config(
+        Limits::default(),
+        20,
+        Duration::from_secs(120),
+        None,
+        None,
+    );
+
+    settings.ice_servers = Some(ice_servers.clone());
+    // 公益档要配一把钥匙才存在（上面那份 `config` 里只有完全档）
+    settings
+        .server_keys
+        .push(ServerKey::new(Tier::Public, PUBLIC_PASSWORD));
+
+    let address = start_relay_with_config(settings).await;
 
     // 部署者那一档：原样透传（连 TURN 凭据一起）
     let mut owner = connect_a(address, "aaaa").await;
@@ -1170,6 +1184,72 @@ async fn an_enabled_public_tier_reports_itself_as_on() {
     let mut guest = connect_public(address, ROOM_B, TOKEN_B, "bbbb").await;
 
     assert_eq!(next_json(&mut guest).await["tier"], "public");
+}
+
+/// 多把钥匙（配置里 `;` 分隔）：同一档可以配好几把，每把都按自己那一档生效。
+///
+/// 这是「每把钥匙各给一个人」的用法：换人时只撤销一把，别人照旧。`/health` 只报把数
+/// （完全档 / 公益档各几把），好让部署者确认自己没写漏。
+#[tokio::test]
+async fn extra_keys_keep_their_own_tier() {
+    let mut settings = public_config(20, 10, 4, None);
+
+    settings
+        .server_keys
+        .push(ServerKey::new(Tier::Full, SECOND_SERVER_PASSWORD));
+    settings
+        .server_keys
+        .push(ServerKey::new(Tier::Public, SECOND_PUBLIC_PASSWORD));
+
+    let address = start_relay_with_config(settings).await;
+    let health = raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+
+    assert!(
+        health.contains("\"serverKeys\":{\"full\":2,\"public\":2}"),
+        "实际：{health}"
+    );
+
+    // 第二把完全档钥匙：照旧能用中继兜底
+    let mut owner = connect_with_server(
+        address,
+        ROOM_A,
+        TOKEN_A,
+        "1",
+        "aaaa",
+        &auth::derive_server_token(SECOND_SERVER_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(next_json(&mut owner).await["tier"], "full");
+
+    // 第二把公益钥匙：照旧只是公益档
+    let mut guest = connect_with_server(
+        address,
+        ROOM_B,
+        TOKEN_B,
+        "1",
+        "bbbb",
+        &auth::derive_server_token(SECOND_PUBLIC_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(next_json(&mut guest).await["tier"], "public");
+
+    // 表里没有的钥匙：照旧 403（多把钥匙不会让门槛变松）
+    assert_eq!(
+        handshake_status_with_server(
+            address,
+            ROOM_C,
+            TOKEN_C,
+            "1",
+            "cccc",
+            &auth::derive_server_token("relay-tests-stranger-key")
+        )
+        .await,
+        403
+    );
 }
 
 /// 公益档只放行信令（kind 8）：塞数据帧会被 1008 关掉，而且**不会**转发到对面

@@ -199,6 +199,30 @@ pub struct Reservation {
 ///
 /// 参数已经有十来项，全平铺进 `new()` 会让每个调用点都变成一串看不出含义的位置参数
 /// （公益档又加了 6 项）；这里一次性收成一个结构，调用点只写关心的字段。
+/// 一把「服务器钥匙」：它的 verifier 与它代表的档位（R36 + 公益档）。
+///
+/// 档位是**钥匙的属性**，不是会话的属性：拿哪把钥匙进来就是哪一档。所以「给不熟的人一把
+/// 只能打洞的钥匙」完全落在配置里，而客户端拿到的档位是这台服务器算出来告诉它的
+/// （`server.welcome` 的 `tier`）——客户端自己不用选，也无从伪造。
+///
+/// 同一档可以配多把（每把给一个人：换人时只撤销一把、别人照旧），但**同一把钥匙不能同时
+/// 属于两档**（`server.rs` 配置阶段就拒绝），否则「这次算哪一档」会成为二义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerKey {
+    pub tier: Tier,
+    /// `SHA256(derive_server_token(密码))`。进程里只有摘要，没有密码原文。
+    pub verifier: [u8; 32],
+}
+
+impl ServerKey {
+    pub fn new(tier: Tier, password: &str) -> Self {
+        Self {
+            tier,
+            verifier: crate::auth::server_verifier(password),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
     /// 部署者那一档的额度（也是它的桶容量）
@@ -220,12 +244,12 @@ pub struct RelayOptions {
     /// 内置 STUN 的 UDP 端口（`None` = 没有内置 STUN，见 `stun.rs`）。有它而 `ice_servers`
     /// 为空时，welcome 里广告 `stun:<客户端连进来用的主机名>:<端口>`。
     pub stun_port: Option<u16>,
-    /// R36：`SHA256(derive_server_token(服务器密码))`。这一版中继**必须**有它：
-    /// 它是「谁能连上这台服务器」的唯一门槛，缺了它任何人都能白用转发与 TURN。
-    /// 与 Room 的 verifier 一样只存摘要——启动之后进程里没有密码原文。
-    pub server_verifier: [u8; 32],
-    /// 公益密码的 verifier（`PAIR_PUBLIC_SERVER_PASSWORD`）。`None` = 这台服务器没有公益档
-    pub public_verifier: Option<[u8; 32]>,
+    /// 服务器钥匙表（R36）：谁能连上这台服务器、以及进来之后算哪一档，全看它。
+    ///
+    /// `PAIR_SERVER_PASSWORD`（完全档）与 `PAIR_PUBLIC_SERVER_PASSWORD`（公益档）都接受
+    /// `;` 分隔的多把；空表 = 谁都不认（会话层单测用得到，真部署走 `server.rs`，那里
+    /// 完全档是**必填**的）。
+    pub server_keys: Vec<ServerKey>,
     /// 信不信 `X-Forwarded-For`（`PAIR_TRUST_PROXY`）。只在前面有可信反代时打开
     pub trust_proxy: bool,
 }
@@ -246,8 +270,7 @@ impl Default for RelayOptions {
             stale_after: Duration::from_millis(protocol::DEFAULT_STALE_AFTER_MS),
             ice_servers: None,
             stun_port: None,
-            server_verifier: [0u8; 32],
-            public_verifier: None,
+            server_keys: Vec::new(),
             trust_proxy: false,
         }
     }
@@ -279,7 +302,21 @@ impl Relay {
     /// 与「开着」是两件事，`/health` 必须报后者——部署者就是拿这个接口确认自己装对了
     /// 没有，报错方向的话他查的是一条不存在的故障。
     pub fn has_public_tier(&self) -> bool {
-        self.options.public_verifier.is_some() && self.options.max_public_sessions > 0
+        self.options.max_public_sessions > 0
+            && self
+                .options
+                .server_keys
+                .iter()
+                .any(|key| key.tier == Tier::Public)
+    }
+
+    /// 这一档配了几把钥匙（启动横幅与 `/health` 共用一份口径）。只数把数，不涉及内容。
+    pub fn server_key_count(&self, tier: Tier) -> usize {
+        self.options
+            .server_keys
+            .iter()
+            .filter(|key| key.tier == tier)
+            .count()
     }
 
     /// 这一档能同时承载多少个会话。公益档的名额与部署者那一档**完全分开**：
@@ -301,28 +338,31 @@ impl Relay {
 
     /// 这次连接带来的服务器凭据算哪一档（R36 + 公益档）。`None` = 凭据不对，拒绝。
     ///
-    /// 恒定时间比较、与长度无关的旁路不成立（两边都是 32 字节摘要）。**两次比较都要跑完
-    /// 再决定**：命中就提前返回会让「命中了哪一档」通过时间差漏出去。
+    /// 恒定时间比较、与长度无关的旁路不成立（两边都是 32 字节摘要）。**每一把都要比完
+    /// 再决定**：命中就提前返回会让「命中了哪一把、哪一档」通过时间差漏出去（钥匙可以配
+    /// 多把之后这一条更要紧：提前返回连「表里有没有这一把」都跟着搜索顺序漏出去）。
     ///
     /// 公益档被关掉（名额 0）时**故意**不认那把钥匙：它就等于「这台服务器没有公益档」，
     /// 于是那些人拿到的是 403「服务器密码不正确」，而不是一条会让客户端无限退避重试的
     /// 503「会话已满」——后者说的是一件没发生的事（名额根本没被占满）。
     pub fn classify_server_token(&self, token: &str) -> Option<Tier> {
         let verifier = auth_verifier(token);
-        let full = constant_time_eq(&verifier, &self.options.server_verifier);
-        let public = self.has_public_tier()
-            && self
-                .options
-                .public_verifier
-                .is_some_and(|expected| constant_time_eq(&verifier, &expected));
+        let public_open = self.has_public_tier();
+        let mut matched = None;
 
-        if full {
-            Some(Tier::Full)
-        } else if public {
-            Some(Tier::Public)
-        } else {
-            None
+        for key in &self.options.server_keys {
+            // 公益档关掉时那把钥匙不参与比较：它等于「这台服务器没有公益档」，判定要
+            // 和「压根没配过」完全一样（见上面那条 403 与 503 的区别）。
+            if key.tier == Tier::Public && !public_open {
+                continue;
+            }
+
+            if constant_time_eq(&verifier, &key.verifier) {
+                matched = Some(key.tier);
+            }
         }
+
+        matched
     }
 
     /// 这次连接的 welcome 里该广告哪些 ICE 服务器。
@@ -1281,7 +1321,10 @@ mod tests {
         stale_after: Duration,
         ice_servers: Option<serde_json::Value>,
         stun_port: Option<u16>,
-        public_verifier: Option<[u8; 32]>,
+        /// 公益档配不配那把固定钥匙（`PUBLIC_PASSWORD`）
+        public_tier: bool,
+        /// 额外的服务器钥匙（`(档位, 密码)`）：多把钥匙那几条用例要它
+        extra_keys: Vec<(Tier, &'static str)>,
         trust_proxy: bool,
     }
 
@@ -1296,9 +1339,20 @@ mod tests {
             stale_after: options.stale_after,
             ice_servers: options.ice_servers,
             stun_port: options.stun_port,
-            // 会话层用不到服务器密码（那是 `server.rs` 在升级之前判的），给一个固定摘要
-            server_verifier: auth::server_verifier(SERVER_PASSWORD),
-            public_verifier: options.public_verifier,
+            // 会话层用不到密码原文（那是 `server.rs` 在升级之前判的），给固定密码的摘要
+            server_keys: {
+                let mut keys = vec![ServerKey::new(Tier::Full, SERVER_PASSWORD)];
+
+                if options.public_tier {
+                    keys.push(ServerKey::new(Tier::Public, PUBLIC_PASSWORD));
+                }
+
+                keys.extend(options.extra_keys.into_iter().map(|(tier, password)| {
+                    ServerKey::new(tier, password)
+                }));
+
+                keys
+            },
             trust_proxy: options.trust_proxy,
         })
     }
@@ -1330,7 +1384,7 @@ mod tests {
         let open = relay_with(Options {
             max_sessions: 20,
             max_public_sessions: 10,
-            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            public_tier: true,
             ..Options::default()
         });
 
@@ -1362,7 +1416,7 @@ mod tests {
         let off = relay_with(Options {
             max_sessions: 20,
             max_public_sessions: 0,
-            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            public_tier: true,
             ..Options::default()
         });
 
@@ -1375,6 +1429,43 @@ mod tests {
         assert_eq!(
             off.classify_server_token(&auth::derive_server_token(SERVER_PASSWORD)),
             Some(Tier::Full)
+        );
+    }
+
+    /// 多把钥匙：同一档可以配好几把（每把给一个人，换人时只撤销一把），每把都按自己
+    /// 那一档算；表里没有的钥匙一律不认（绝不能掉回任何一档）。
+    #[test]
+    fn every_key_carries_its_own_tier() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            max_public_sessions: 10,
+            public_tier: true,
+            extra_keys: vec![
+                (Tier::Full, "relay-unit-tests-second-full-key-01"),
+                (Tier::Public, "relay-unit-tests-second-public-key-1"),
+            ],
+            ..Options::default()
+        });
+
+        assert_eq!(relay.server_key_count(Tier::Full), 2);
+        assert_eq!(relay.server_key_count(Tier::Public), 2);
+
+        for (password, tier) in [
+            (SERVER_PASSWORD, Tier::Full),
+            ("relay-unit-tests-second-full-key-01", Tier::Full),
+            (PUBLIC_PASSWORD, Tier::Public),
+            ("relay-unit-tests-second-public-key-1", Tier::Public),
+        ] {
+            assert_eq!(
+                relay.classify_server_token(&auth::derive_server_token(password)),
+                Some(tier),
+                "{password} 应该是 {tier:?}"
+            );
+        }
+
+        assert_eq!(
+            relay.classify_server_token(&auth::derive_server_token("relay-unit-tests-stranger")),
+            None
         );
     }
 
@@ -2062,7 +2153,7 @@ mod tests {
             max_sessions,
             max_public_sessions,
             max_public_per_ip,
-            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            public_tier: true,
             ..Options::default()
         })
     }
@@ -2358,7 +2449,7 @@ mod tests {
         let relay = relay_with(Options {
             max_sessions: 20,
             ice_servers: Some(servers.clone()),
-            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            public_tier: true,
             ..Options::default()
         });
 
@@ -2379,7 +2470,7 @@ mod tests {
                 "username": "u",
                 "credential": "p"
             }])),
-            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            public_tier: true,
             ..Options::default()
         });
 
@@ -2391,7 +2482,7 @@ mod tests {
         let builtin = relay_with(Options {
             max_sessions: 20,
             stun_port: Some(3479),
-            public_verifier: Some(auth::server_verifier(PUBLIC_PASSWORD)),
+            public_tier: true,
             ..Options::default()
         });
 

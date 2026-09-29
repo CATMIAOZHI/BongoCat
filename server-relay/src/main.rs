@@ -1,8 +1,16 @@
 //! 自建中继入口：读配置、监听、把连接交给 `server`。
 
+use bongocat_pair_relay::protocol::Tier;
 use bongocat_pair_relay::relay::Relay;
 use bongocat_pair_relay::{server, stun};
 use tokio::net::{TcpListener, UdpSocket};
+
+/// 横幅里把「几把钥匙」说成人话。
+///
+/// 完全档与公益档两处都用它：同一个说法只写一遍，以后改口径不会只改一处。
+fn key_count_text(count: usize) -> String {
+    format!("共 {count} 把钥匙")
+}
 
 #[tokio::main]
 async fn main() {
@@ -144,22 +152,27 @@ async fn run() -> Result<(), String> {
         (None, true) => println!("  STUN      使用 PAIR_ICE_SERVERS 里的配置，内置 STUN 未启动"),
         (None, false) => println!("  STUN      未启用：P2P 直连只能在同一局域网内成功"),
     }
-    println!("  服务器密码 PAIR_SERVER_PASSWORD 已生效（摘要形式，进程里没有原文）");
-    println!("            客户端「服务器密码」必须填同一个值，否则连握手都过不去");
+    println!(
+        "  服务器密码 PAIR_SERVER_PASSWORD 已生效：{}（摘要形式，进程里没有原文）",
+        key_count_text(relay.server_key_count(Tier::Full))
+    );
+    println!("            客户端「服务器密码」必须填其中一把，否则连握手都过不去");
+    println!("            一个变量可以写多把，用 `;` 分隔：每把给一个人，换人时只撤销一把");
     // 「配了密码」不等于「开着」：判据只有 `Relay::has_public_tier` 一处（`/health` 与凭据
     // 判定都是它）。横幅自己再写一遍的话，以后那条口径一改，这里就会印出与真实行为相反
     // 的状态——部署者正是拿这份输出确认自己装对了没有。
     if !relay.has_public_tier() {
         // 先判「配了密码但名额为 0」：它也是一种「实际关闭」，但不能和「压根没设过」混为一谈
-        if config.public_verifier.is_some() {
+        if relay.server_key_count(Tier::Public) > 0 {
             println!("  公益档     已配公益密码，但 PAIR_MAX_PUBLIC_SESSIONS=0：实际关闭");
         } else {
             println!("  公益档     未开启（没设 PAIR_PUBLIC_SERVER_PASSWORD）：只有你自己那一档");
         }
     } else {
         println!(
-            "  公益档     已开启（PAIR_PUBLIC_SERVER_PASSWORD）：最多 {} 组、\
+            "  公益档     已开启（PAIR_PUBLIC_SERVER_PASSWORD，{}）：最多 {} 组、\
              每 IP {} 组，{}",
+            key_count_text(relay.server_key_count(Tier::Public)),
             config.max_public_sessions,
             config.max_public_per_ip,
             match config.public_window {
