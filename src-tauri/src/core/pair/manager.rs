@@ -3161,6 +3161,11 @@ fn describe_close(code: Option<u16>) -> PairFailure {
         // 公益档的空闲回收（见 `server-relay` 的 `PAIR_PUBLIC_WINDOW_SECS`）。它不是故障，
         // 也不是「打洞失败」：那台服务器只是把一直没动静的连接收回去，重连即可。
         Some(4005) => "公益服务器的空闲时间到了，连接已自动重来".to_string(),
+        // 公益档「这把钥匙的预算用完了」（见 `server-relay` 的 `PAIR_PUBLIC_KEY_BUDGET_BYTES`）。
+        // 它不是「你发太快」：重连也一样发不出去，要等额度按小时回填、或者找部署者换一把
+        // 钥匙。所以文案里要说清是**这把密钥**的额度，而不是一句笼统的格式错误。
+        Some(4006) => "这台公益服务器给你的额度已用完，等一小时或找服务器部署者换一把公益密钥"
+            .to_string(),
         Some(1008) => "服务器认为数据格式或发送频率异常".to_string(),
         Some(1009) => "一帧数据超过服务器允许的大小".to_string(),
         Some(1011) => "服务器内部错误".to_string(),
@@ -6241,6 +6246,12 @@ mod tests {
             describe_close(Some(1008)).message,
             "服务器认为数据格式或发送频率异常"
         );
+        // 4006 是「这把钥匙的额度用完了」，与 1008「你发太快了」是两件事：前者重连也没用
+        assert_eq!(
+            describe_close(Some(4006)).message,
+            "这台公益服务器给你的额度已用完，等一小时或找服务器部署者换一把公益密钥"
+        );
+        assert!(!describe_close(Some(4006)).fatal);
         assert_eq!(
             describe_close(Some(1009)).message,
             "一帧数据超过服务器允许的大小"

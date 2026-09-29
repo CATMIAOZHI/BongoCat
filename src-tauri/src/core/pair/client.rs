@@ -268,7 +268,14 @@ fn describe_connect_error(error: WsError, sent_server_password: bool) -> PairFai
                 404 => PairFailure::fatal("服务器地址路径不对：应该指向 /ws".to_string()),
                 // §27：容量按「双人联机会话数」算，满了不该显示成一串 HTTP 码；
                 // 也不该 fatal —— 「请稍后再试」意味着名额一被释放就该自己进去
-                503 => PairFailure::transient("服务器双人联机会话已满，请稍后再试".to_string()),
+                //
+                // 准入之后 503 有两个来源（正文不同、状态码相同）：会话名额用完
+                // （`server capacity reached`）与**连接数**达到上限（`server is at its
+                // connection limit`）。后者跟会话无关、已有会话的重连也可能撞上，所以
+                // 文案说「这台服务器忙不过来」而不是「会话已满」——两种都是等一会儿的事。
+                503 => PairFailure::transient(
+                    "服务器暂时忙不过来（会话已满或连接数太多），请稍后再试".to_string(),
+                ),
                 // 公益档的两条新拒绝，都是**这台服务器的配置**造成的，用户改不了，
                 // 所以文案要指向「找部署这台服务器的人」而不是「改你自己的设置」。
                 //
@@ -280,10 +287,13 @@ fn describe_connect_error(error: WsError, sent_server_password: bool) -> PairFai
                      请与对方核对他填的那一串（要么都填部署者密码，要么都填公益密码）"
                         .to_string(),
                 ),
-                // 429：公益档的「同一个 IP 最多几组会话」满了。可重试——别人断开就轮到了
+                // 429：**三种原因共用一个状态码**——公益档的「同一个 IP 最多几组会话」满了、
+                // 这个会话上「正在握手的连接」堆太多、以及「这个地址的失败次数太多」（见
+                // `server-relay` 的准入三道闸）。只有第一种跟公益名额有关，所以文案不能说成
+                // 「公益名额满了」；三者都是可重试的（不是 fatal，按退避自己会好）。
                 429 => PairFailure::transient(
-                    "这台公益服务器的免费名额暂时满了（同一个网络的会话数已达上限），\
-                     请稍后再试"
+                    "服务器暂时不接受这台设备连上来（请求太频繁，或者同一个网络的会话数已达\
+                     上限）：请稍后再试；一直这样请核对服务器地址与密码有没有填错"
                         .to_string(),
                 ),
                 _ => PairFailure::transient(format!(
@@ -407,7 +417,8 @@ mod tests {
     /// §31 点名要求的三条用户可见文案：401 / 503 走 `client.rs`，4003 走 `manager.rs`。
     ///
     /// 这里把状态码 → 文案 → 是否重试一次钉死：401 是「密钥不对」，重试没有意义，
-    /// 必须 fatal；503 是「名额满了」，名额会被别人释放，必须能自动重试。
+    /// 必须 fatal；503 是「这台服务器暂时忙不过来」（会话名额满了，或者连接数达到上限），
+    /// 两种都会过去，必须能自动重试。
     #[test]
     fn http_status_codes_become_readable_messages() {
         let http = |status: u16| {
@@ -452,11 +463,16 @@ mod tests {
 
         let full = describe_connect_error(http(503), false);
 
-        assert_eq!(full.message, "服务器双人联机会话已满，请稍后再试");
+        // 两种 503（会话名额 / 连接数上限）共用这一句：说法要能同时罩住两件事
+        assert_eq!(
+            full.message,
+            "服务器暂时忙不过来（会话已满或连接数太多），请稍后再试"
+        );
         assert!(!full.fatal, "名额会被释放，应当按退避自动重试");
 
         // 公益档的两条新拒绝（`server-relay`）：两边填了不同类型的服务器密码（409），
-        // 或者这个 IP 的公益名额暂时满了（429）
+        // 或者这台服务器暂时不接受（429——公益档的每 IP 名额、同一会话堆积的握手、或者
+        // 这个地址的失败次数太多，三种共用一个码）
         let mismatch = describe_connect_error(http(409), true);
 
         assert!(
@@ -469,7 +485,7 @@ mod tests {
         let limited = describe_connect_error(http(429), true);
 
         assert!(
-            limited.message.contains("免费名额暂时满了"),
+            limited.message.contains("暂时不接受这台设备连上来"),
             "实际：{}",
             limited.message
         );
