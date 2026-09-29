@@ -28,6 +28,21 @@ impl RequestHead {
             .map(|(_, value)| value.as_str())
     }
 
+    /// 同一个头的**所有**行，按出现顺序。
+    ///
+    /// 一个头名可以出现多行，这一点对 `X-Forwarded-For` 是必须知道的：给一个已经存在的
+    /// 头 append 一个值时，Go 的 `net/http`（Caddy 就是它）会把它写成**另一行**，而不是
+    /// 拼进同一行。只看第一行等于把客户端自带的那一行当成了真的——每 IP 限额会被绕开。
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        let name = name.to_ascii_lowercase();
+
+        self.headers
+            .iter()
+            .filter(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
     /// 去掉 query / fragment 的路径
     pub fn path(&self) -> &str {
         self.target.split(['?', '#']).next().unwrap_or_default()

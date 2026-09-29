@@ -1013,13 +1013,19 @@ impl IpKey {
 /// 才认：域名模式里中继只 `expose` 给 Docker 内网、前面站着 Caddy，那一跳可信；direct
 /// 模式把端口发布到公网，那时对端是公网地址、整条头都不看——伪造不进来。
 ///
-/// 取**最后一个**条目：那是我们信任的这一跳自己追加的（Caddy 是 append 而不是
-/// replace），客户端伪造的前缀赢不了。
-pub fn client_ip(peer: SocketAddr, forwarded_for: Option<&str>, trust_proxy: bool) -> IpKey {
+/// 取**所有头行里的最后一项**：那是我们信任的这一跳自己写上去的。两件事缺一不可，头被
+/// 拆成多行只是其中一半：Caddy 是 append（客户端自带的前缀会留在前面），而 Go 的
+/// `net/http` 做 append 时写成**另一行**——只看第一行就等于把客户端伪造的值当成了真实
+/// IP，每 IP 限额被直接绕开（一台机器换着假 IP 就能吃满公益名额）。Caddyfile 那边同时把
+/// 这一项钉死成 `{remote_host}`，两层各管一段：Caddy 永远只写一项，中继永远只认最后一项。
+pub fn client_ip(peer: SocketAddr, forwarded_for: &[&str], trust_proxy: bool) -> IpKey {
     if trust_proxy && is_private_or_loopback(peer.ip()) {
         if let Some(address) = forwarded_for
-            .and_then(|value| value.split(',').next_back())
-            .and_then(|last| last.trim().parse::<IpAddr>().ok())
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .rfind(|item| !item.is_empty())
+            .and_then(|last| last.parse::<IpAddr>().ok())
         {
             return IpKey::from_addr(address);
         }
@@ -2284,29 +2290,45 @@ mod tests {
 
         // 不开开关：永远看 peer
         assert_eq!(
-            client_ip(private_peer, Some("198.51.100.7"), false),
+            client_ip(private_peer, &["198.51.100.7"], false),
             IpKey::from_addr("172.18.0.5".parse().unwrap())
         );
 
         // 开了开关 + 私网 peer：取**最后一个**（可信那一跳自己追加的）
         assert_eq!(
-            client_ip(private_peer, Some("198.51.100.7, 203.0.113.9"), true),
+            client_ip(private_peer, &["198.51.100.7, 203.0.113.9"], true),
+            IpKey::from_addr("203.0.113.9".parse().unwrap())
+        );
+
+        // 同一个头被拆成**多行**时也要取整体最后一项：Go 的 `net/http` 给一个已经存在的头
+        // append 值就是写成另一行，只看第一行等于让客户端伪造的那一行赢
+        assert_eq!(
+            client_ip(private_peer, &["198.51.100.7", "203.0.113.9"], true),
+            IpKey::from_addr("203.0.113.9".parse().unwrap())
+        );
+        // 多行 + 空行 + 两侧空格：一样只看最后那个非空项
+        assert_eq!(
+            client_ip(
+                private_peer,
+                &["198.51.100.7, 192.0.2.1", "", " 203.0.113.9 "],
+                true
+            ),
             IpKey::from_addr("203.0.113.9".parse().unwrap())
         );
 
         // 公网 peer 伪造 XFF：整条头都不看
         assert_eq!(
-            client_ip(public_peer, Some("198.51.100.7"), true),
+            client_ip(public_peer, &["198.51.100.7"], true),
             IpKey::from_addr("203.0.113.9".parse().unwrap())
         );
 
         // 畸形 / 缺失：退回 peer，绝不能因此少算一个 IP（限额会漏）
         assert_eq!(
-            client_ip(private_peer, Some("not-an-ip"), true),
+            client_ip(private_peer, &["not-an-ip"], true),
             IpKey::from_addr("172.18.0.5".parse().unwrap())
         );
         assert_eq!(
-            client_ip(private_peer, None, true),
+            client_ip(private_peer, &[], true),
             IpKey::from_addr("172.18.0.5".parse().unwrap())
         );
     }

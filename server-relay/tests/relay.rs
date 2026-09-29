@@ -174,6 +174,32 @@ async fn connect_with_server(
     device_id: &str,
     server: &str,
 ) -> Result<Client, WsError> {
+    connect_with_forwarded(
+        address,
+        room_id,
+        token,
+        protocol_version,
+        device_id,
+        server,
+        &[],
+    )
+    .await
+}
+
+/// 与 [`connect_with_server`] 相同，但可以再带上 `X-Forwarded-For`：**每一项都写成一行**
+/// （`append` 而不是 `insert`）。
+///
+/// 这个形状是必须的：给一个已经存在的头 append 值，Go 的 `net/http`（Caddy 就是它）会把它
+/// 写成**另一行**，而不是拼进同一行。所以我们读这个头时必须看每一行、并取整体最后一项。
+async fn connect_with_forwarded(
+    address: SocketAddr,
+    room_id: &str,
+    token: &str,
+    protocol_version: &str,
+    device_id: &str,
+    server: &str,
+    forwarded_for: &[&str],
+) -> Result<Client, WsError> {
     let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
 
     {
@@ -188,6 +214,10 @@ async fn connect_with_server(
 
         if !server.is_empty() {
             headers.insert("x-bongo-server", server.parse().unwrap());
+        }
+
+        for value in forwarded_for {
+            headers.append("x-forwarded-for", value.parse().unwrap());
         }
     }
 
@@ -1237,6 +1267,71 @@ async fn the_public_per_ip_limit_only_blocks_new_rooms() {
             .await,
         429
     );
+}
+
+/// 客户端伪造 `X-Forwarded-For` 赢不了：中继只认**最后一项**，那才是我们那一跳（Caddy）写
+/// 上去的地址。
+///
+/// 关键在于这个头会被拆成**多行**（Go 的 `net/http` 给已存在的头 append 值就是写成另一行），
+/// 所以「只看第一行」等于把客户端伪造的那一行当成了真实 IP：每 IP 限额被直接绕开，一台机器
+/// 换着假 IP 就能把公益名额吃满，还能把账记到别人头上让别人吃 429。
+#[tokio::test]
+async fn a_forged_forwarded_for_line_cannot_win() {
+    // `PAIR_TRUST_PROXY=1`（域名模式的 compose 默认就是它），每 IP 只给一组公益名额。
+    // 对端是本机回环——那正是「我们那一跳」的形状，所以这份头才会被信。
+    let config = Config {
+        trust_proxy: true,
+        ..public_config(20, 10, 1, None)
+    };
+    let address = start_relay_with_config(config).await;
+
+    // 伪造行在前、可信行在后：必须按**可信行**记账，所以连得上（这条连接要一直留着，
+    // 会话空掉名额就还回去了）
+    let mut first = connect_with_forwarded(
+        address,
+        ROOM_A,
+        TOKEN_A,
+        "1",
+        "aaaa",
+        &public_token(),
+        &["198.51.100.7", "203.0.113.5"],
+    )
+    .await
+    .unwrap();
+
+    next_json(&mut first).await;
+
+    // 同一台机器换一个伪造值再来：真实 IP 没变，所以被每 IP 限额挡下
+    match connect_with_forwarded(
+        address,
+        ROOM_B,
+        TOKEN_B,
+        "1",
+        "bbbb",
+        &public_token(),
+        &["192.0.2.99", "203.0.113.5"],
+    )
+    .await
+    {
+        Err(WsError::Http(response)) => assert_eq!(response.status().as_u16(), 429),
+        Ok(_) => panic!("伪造的 X-Forwarded-For 绕过了每 IP 限额"),
+        Err(other) => panic!("期望 429，实际 {other:?}"),
+    }
+
+    // 换一个可信值就是另一个 IP：进得来（证明上一条不是因为别的原因被挡）
+    let mut third = connect_with_forwarded(
+        address,
+        ROOM_C,
+        TOKEN_C,
+        "1",
+        "cccc",
+        &public_token(),
+        &["192.0.2.99", "203.0.113.6"],
+    )
+    .await
+    .unwrap();
+
+    next_json(&mut third).await;
 }
 
 /// 两边填了不同类型的密码却进了同一个会话：明确报冲突（409），而不是让一个人有中继兜底、

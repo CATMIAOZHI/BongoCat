@@ -501,11 +501,10 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     // 公益档的每 IP 限额按哪个 IP 算。Caddy 那一跳只在内网，所以域名模式下要靠
     // `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`，compose 已默认打开）；direct 模式对端
     // 就是客户端本身，不需要它。
-    let client = relay::client_ip(
-        peer,
-        head.header("x-forwarded-for"),
-        relay.trust_proxy(),
-    );
+    //
+    // 取的是**这个头的每一行**，不是第一行：它可能被反代拆成多行（见 `RequestHead::header_values`）。
+    let forwarded_for = head.header_values("x-forwarded-for");
+    let client = relay::client_ip(peer, &forwarded_for, relay.trust_proxy());
 
     let reservation = match relay
         .reserve(&room_id, auth::auth_verifier(&token), tier, client)

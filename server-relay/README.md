@@ -34,6 +34,7 @@
 - **一个数据帧都不转发**。公益档的连接只有 `kind 8`（打洞信令 + 保活心跳）能过，别的 kind 一律被服务器用 `1008` 关掉整条连接。所以那一路上没有聊天、没有附件、没有语音、没有桌宠快照与输入统计——那些东西必须走两端之间的直连（WebRTC DataChannel）。
 - **不广告 TURN**。`welcome` 里的 `iceServers` 会被过滤成只剩 STUN（TURN 是按流量计费的，不能给公益档）。内置 STUN 照常给。
 - **自己的名额**。公益档有独立的会话上限（`PAIR_MAX_PUBLIC_SESSIONS`，默认 10）与每 IP 上限（`PAIR_MAX_PUBLIC_PER_IP`，默认 4），**占不到**你自己那一档的 `PAIR_MAX_SESSIONS`；反过来公益档满了也不会影响你。
+- **限额按哪个 IP 算**。域名模式下靠 `X-Forwarded-For`（`PAIR_TRUST_PROXY=1`）：中继取这个头**所有行里的最后一项**——反代追加的才是真的，而 Go 的 `net/http` 给一个已经存在的头 append 值时会写成**另一行**，所以只看第一行会被客户端自己伪造的那一行骗过去（每 IP 限额会被整条绕开）。仓库里的 `Caddyfile` 同时把这一项钉成 `header_up X-Forwarded-For {remote_host}`（**替换**，不是追加），中继收到的因此永远恰好一项、且是 Caddy 自己看到的那个地址。前面若还站着一层 CDN（Cloudflare 之类），这一项会变成 CDN 边缘的地址、所有人挤成同一个 IP：那种部署要么设 `PAIR_MAX_PUBLIC_PER_IP=0` 关掉这一项限额，要么在 Caddyfile 里把 CDN 的真实客户端头（如 `CF-Connecting-IP`）写进这一项。
 - **自己的额度**。默认 10 帧/秒、256 KiB/秒（`PAIR_PUBLIC_MAX_FRAMES_PER_SECOND` / `PAIR_PUBLIC_MAX_BYTES_PER_SECOND`），比正常那一档小得多。
 - **空闲回收**。超过 `PAIR_PUBLIC_WINDOW_SECS`（默认 180 秒）没收到**任何**入站消息就用 `4005` 关掉。诚实客户端每 60 秒发一次心跳，180 秒是三次漏拍。
 - **档位跟着连接走**。填公益密码的人**永远**只是公益档，哪怕他碰巧和一个填了服务器密码的人进了同一个会话——那种情况服务器回 **409**（两个人填的密码不是同一类）。

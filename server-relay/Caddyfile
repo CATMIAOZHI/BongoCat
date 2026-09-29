@@ -6,5 +6,12 @@
 # **不看**系统证书存储，所以裸 IP 与自签证书一律连不上。
 
 {$PAIR_DOMAIN} {
-	reverse_proxy relay:8080
+	reverse_proxy relay:8080 {
+		# 中继的「每 IP 公益名额」靠这条头认客户端，所以口径必须由**我们**决定，不能留在
+		# 客户端的输入里：`header_up` 是**替换**（追加要写 `+X-Forwarded-For`），于是中继
+		# 收到的永远恰好一项，且是 Caddy 自己看到的那个地址。客户端自带的那条到此为止。
+		# 用 `{remote_host}`（不带端口）：中继按 IP 解析，带端口会被判成畸形而退回「代理
+		# 自己的地址」，那样所有公益连接会挤成同一个 IP。
+		header_up X-Forwarded-For {remote_host}
+	}
 }
