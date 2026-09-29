@@ -1018,13 +1018,17 @@ impl IpKey {
 /// `net/http` 做 append 时写成**另一行**——只看第一行就等于把客户端伪造的值当成了真实
 /// IP，每 IP 限额被直接绕开（一台机器换着假 IP 就能吃满公益名额）。Caddyfile 那边同时把
 /// 这一项钉死成 `{remote_host}`，两层各管一段：Caddy 永远只写一项，中继永远只认最后一项。
+///
+/// 取的是**字面意义上的最后一项**（空项也算最后一项）：某一跳留了个尾逗号这种邋遢形状
+/// 会让解析失败、退回对端地址——从严那一侧。要是反过来去往前找最后一个非空项，就等于把
+/// 客户端写的那一项又捡回来了（那正是这条修复要堵的东西）。
 pub fn client_ip(peer: SocketAddr, forwarded_for: &[&str], trust_proxy: bool) -> IpKey {
     if trust_proxy && is_private_or_loopback(peer.ip()) {
         if let Some(address) = forwarded_for
             .iter()
             .flat_map(|value| value.split(','))
+            .next_back()
             .map(str::trim)
-            .rfind(|item| !item.is_empty())
             .and_then(|last| last.parse::<IpAddr>().ok())
         {
             return IpKey::from_addr(address);
@@ -2314,6 +2318,12 @@ mod tests {
                 true
             ),
             IpKey::from_addr("203.0.113.9".parse().unwrap())
+        );
+        // 最后一项本身就是空（某一跳留了个尾逗号）：退回 peer，**不能**往前退到客户端写的
+        // 那一项上——那等于把伪造值又放回来
+        assert_eq!(
+            client_ip(private_peer, &["198.51.100.7", "203.0.113.9,"], true),
+            IpKey::from_addr("172.18.0.5".parse().unwrap())
         );
 
         // 公网 peer 伪造 XFF：整条头都不看
