@@ -68,6 +68,7 @@
         "manual": "配对码连接：{state}",
         "manualNotReady": "配对码这条路还没连上对方：等对方猫出现在桌面上就能发了",
         "publicNotDirect": "这台服务器只帮忙打洞（公益档），不转发消息和文件：等上面显示「已直连」就能发了",
+        "blockedTitle": "服务器只帮忙打洞，等直连",
         "preview": "查看这张图片",
         "close": "关闭",
         "imageCopied": "图片已复制到剪贴板",

@@ -123,8 +123,13 @@ const blockKey = computed(() => {
 
 const blocked = computed(() => Boolean(blockKey.value))
 
-/** 挡住的理由（人话）。放进聊天窗口标题那一行，免得它上面写着「在线」、下面写着发不出去 */
-const blockState = computed(() => (blockKey.value ? t(blockKey.value) : ''))
+/**
+ * 挡住时标题那一行说的话：它原本写着「在线 · 随时聊聊」，而这会儿根本发不出去。
+ *
+ * 这里只放一句短的：完整那句（带「等上面显示『已直连』」）在输入条下面已经有了，
+ * 而标题那行是 `truncate` 的，塞不下反而会把有用的后半句截掉。
+ */
+const blockState = computed(() => (blocked.value ? t('pages.chat.hints.blockedTitle') : ''))
 
 /** R42：发送键能不能按——有内容、没超长、不在发送中、没有「发不出去」的硬理由 */
 const sendReady = computed(() => {

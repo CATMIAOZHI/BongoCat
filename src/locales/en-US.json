@@ -68,6 +68,7 @@
         "manual": "Pairing-code link: {state}",
         "manualNotReady": "The pairing-code link has no server behind it — you can send once your partner's cat shows up",
         "publicNotDirect": "This server only helps you punch through (public tier); it does not relay messages or files — you can send once the P2P line says \"Direct\"",
+        "blockedTitle": "Public server: wait for a direct link",
         "preview": "View this image",
         "close": "Close",
         "imageCopied": "Image copied to the clipboard",
