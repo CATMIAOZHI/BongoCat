@@ -1480,7 +1480,10 @@ impl IpKey {
         // 双栈 socket 上 IPv4 客户端会以 `::ffff:a.b.c.d` 出现，先归一：不归一的话同一个
         // 客户端在两种写法下会被算成两个 IP，限额就漏了
         let address = match address {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
             other => other,
         };
 
@@ -1807,8 +1810,12 @@ mod tests {
         Relay::new(RelayOptions {
             limits: Limits::default(),
             public_limits: defaults.public_limits,
-            public_burst_frames: options.public_burst_frames.unwrap_or(defaults.public_burst_frames),
-            public_burst_bytes: options.public_burst_bytes.unwrap_or(defaults.public_burst_bytes),
+            public_burst_frames: options
+                .public_burst_frames
+                .unwrap_or(defaults.public_burst_frames),
+            public_burst_bytes: options
+                .public_burst_bytes
+                .unwrap_or(defaults.public_burst_bytes),
             public_key_budget: options.public_key_budget.or(defaults.public_key_budget),
             handshake_failures_per_minute: options
                 .handshake_failures_per_minute
@@ -1829,9 +1836,12 @@ mod tests {
                     keys.push(ServerKey::new(Tier::Public, PUBLIC_PASSWORD));
                 }
 
-                keys.extend(options.extra_keys.into_iter().map(|(tier, password)| {
-                    ServerKey::new(tier, password)
-                }));
+                keys.extend(
+                    options
+                        .extra_keys
+                        .into_iter()
+                        .map(|(tier, password)| ServerKey::new(tier, password)),
+                );
 
                 keys
             },
@@ -1856,7 +1866,9 @@ mod tests {
         // 密码原文不是凭据：凭据是它派生出的一串
         assert_eq!(relay.classify_server_token(SERVER_PASSWORD), None);
         assert_eq!(
-            relay.classify_server_token(&auth::derive_server_token("relay-unit-tests-server-password2")),
+            relay.classify_server_token(&auth::derive_server_token(
+                "relay-unit-tests-server-password2"
+            )),
             None
         );
     }
@@ -2515,12 +2527,12 @@ mod tests {
         let relay = relay(1, Duration::from_secs(120));
         let reservation = relay
             .reserve(
-                    ROOM_A,
-                    auth::auth_verifier("token-a"),
-                    Tier::Full,
-                    key_index_for(&relay, Tier::Full),
-                    ip(1)
-                )
+                ROOM_A,
+                auth::auth_verifier("token-a"),
+                Tier::Full,
+                key_index_for(&relay, Tier::Full),
+                ip(1),
+            )
             .await
             .unwrap();
 
@@ -2547,22 +2559,22 @@ mod tests {
         let relay = relay(1, Duration::from_secs(120));
         let first = relay
             .reserve(
-                    ROOM_A,
-                    auth::auth_verifier("token-a"),
-                    Tier::Full,
-                    key_index_for(&relay, Tier::Full),
-                    ip(1)
-                )
+                ROOM_A,
+                auth::auth_verifier("token-a"),
+                Tier::Full,
+                key_index_for(&relay, Tier::Full),
+                ip(1),
+            )
             .await
             .unwrap();
         let second = relay
             .reserve(
-                    ROOM_A,
-                    auth::auth_verifier("token-a"),
-                    Tier::Full,
-                    key_index_for(&relay, Tier::Full),
-                    ip(1)
-                )
+                ROOM_A,
+                auth::auth_verifier("token-a"),
+                Tier::Full,
+                key_index_for(&relay, Tier::Full),
+                ip(1),
+            )
             .await
             .unwrap();
 
@@ -2601,20 +2613,62 @@ mod tests {
         let (id_b, _, _) = join_ok(&relay, ROOM_A, "token-a", "b", &b_tx).await;
 
         for _ in 0..30 {
-            assert_eq!(relay.allow(id_a, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await, None);
+            assert_eq!(
+                relay
+                    .allow(
+                        id_a,
+                        Tier::Full,
+                        key_index_for(&relay, Tier::Full),
+                        1.0,
+                        0.0,
+                        64.0
+                    )
+                    .await,
+                None
+            );
         }
         assert_eq!(
-            relay.allow(id_a, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await,
+            relay
+                .allow(
+                    id_a,
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    1.0,
+                    0.0,
+                    64.0
+                )
+                .await,
             Some(Limited::Connection)
         );
 
         // 另一个 socket 有自己的桶
-        assert_eq!(relay.allow(id_b, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await, None);
+        assert_eq!(
+            relay
+                .allow(
+                    id_b,
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    1.0,
+                    0.0,
+                    64.0
+                )
+                .await,
+            None
+        );
 
         // 已经摘掉的连接不再有桶，也不会被 `entry().or_insert_with()` 重新造出来
         relay.drop_peer(ROOM_A, "b", id_b).await;
         assert_eq!(
-            relay.allow(id_b, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0).await,
+            relay
+                .allow(
+                    id_b,
+                    Tier::Full,
+                    key_index_for(&relay, Tier::Full),
+                    1.0,
+                    0.0,
+                    64.0
+                )
+                .await,
             Some(Limited::Connection)
         );
     }
@@ -2649,9 +2703,16 @@ mod tests {
         let (id_b, _, _) = join_ok_tier(&relay, ROOM_B, "token-b", "b", &b_tx, Tier::Public).await;
         let (id_full, _, _) = join_ok(&relay, ROOM_C, "token-c", "c", &full_tx).await;
 
-        assert_eq!(relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0).await, None);
         assert_eq!(
-            relay.allow(id_b, Tier::Public, public, 1.0, 0.0, 900.0).await,
+            relay
+                .allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0)
+                .await,
+            None
+        );
+        assert_eq!(
+            relay
+                .allow(id_b, Tier::Public, public, 1.0, 0.0, 900.0)
+                .await,
             Some(Limited::KeyBudget),
             "同一把钥匙跨会话共用一个桶：A 花掉之后 B 也发不出去（B 自己那一份还有的是）"
         );
@@ -2662,7 +2723,9 @@ mod tests {
         let second = relay.options.server_keys.len() - 1;
 
         assert_eq!(
-            relay.allow(id_other, Tier::Public, second, 1.0, 0.0, 900.0).await,
+            relay
+                .allow(id_other, Tier::Public, second, 1.0, 0.0, 900.0)
+                .await,
             None,
             "换一把钥匙就是另一份预算，不该被前一把的欠账连坐"
         );
@@ -2670,7 +2733,15 @@ mod tests {
         // 部署者那一档压根不扣这个桶：它照旧按自己的额度走
         for _ in 0..30 {
             assert_eq!(
-                relay.allow(id_full, Tier::Full, key_index_for(&relay, Tier::Full), 1.0, 0.0, 64.0)
+                relay
+                    .allow(
+                        id_full,
+                        Tier::Full,
+                        key_index_for(&relay, Tier::Full),
+                        1.0,
+                        0.0,
+                        64.0
+                    )
                     .await,
                 None
             );
@@ -2697,14 +2768,23 @@ mod tests {
         let (id_a, _, _) = join_ok_tier(&relay, ROOM_A, "token-a", "a", &a_tx, Tier::Public).await;
         let public = key_index_for(&relay, Tier::Public);
 
-        assert_eq!(relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0).await, None);
         assert_eq!(
-            relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0).await,
+            relay
+                .allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0)
+                .await,
+            None
+        );
+        assert_eq!(
+            relay
+                .allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0)
+                .await,
             Some(Limited::KeyBudget),
             "只剩 100 字节，900 的帧装不下"
         );
         assert_eq!(
-            relay.allow(id_a, Tier::Public, public, 1.0, 0.0, 50.0).await,
+            relay
+                .allow(id_a, Tier::Public, public, 1.0, 0.0, 50.0)
+                .await,
             None,
             "被拒的那笔已经还回去了，50 字节的帧仍然装得下"
         );
@@ -2805,11 +2885,7 @@ mod tests {
         let state = relay.state.lock().await;
         let bucket = state.handshake_failures.get(&ip(1)).unwrap();
 
-        assert!(
-            bucket.frames >= -limit,
-            "欠账越过下界了：{}",
-            bucket.frames
-        );
+        assert!(bucket.frames >= -limit, "欠账越过下界了：{}", bucket.frames);
         // 回填到「能再握手」（`frames >= 1`）要 (limit + 1) / (limit / 60) ≈ 62 秒，
         // 与刷了多少次无关
         assert!(bucket.frames <= -limit + 1.0);
@@ -2831,7 +2907,9 @@ mod tests {
             for index in 0..HANDSHAKE_FAILURE_TABLE_SWEEP {
                 let address = IpAddr::from([10, 1, (index >> 8) as u8, index as u8]);
 
-                state.handshake_failures.insert(IpKey::from_addr(address), idle());
+                state
+                    .handshake_failures
+                    .insert(IpKey::from_addr(address), idle());
             }
 
             // 一条早就安静下来的旧账（表顶到阈值之后才插的，所以它一定还在）
@@ -2842,14 +2920,12 @@ mod tests {
 
         // 老地址又失败一次：不插新条目，也就不扫表——旧账还躺着
         assert!(relay.note_handshake_failure(ip(251)).await);
-        assert!(
-            relay
-                .state
-                .lock()
-                .await
-                .handshake_failures
-                .contains_key(&ip(250))
-        );
+        assert!(relay
+            .state
+            .lock()
+            .await
+            .handshake_failures
+            .contains_key(&ip(250)));
 
         // 新地址失败：这才是「表到顶了」的时刻，顺手清一遍
         assert!(relay.note_handshake_failure(ip(252)).await);
@@ -3000,16 +3076,7 @@ mod tests {
         .await;
 
         // 公益档满了，但它占**不到**部署者那一档的位置
-        join_as(
-            &relay,
-            ROOM_B,
-            "token-b",
-            "b1",
-            &full_tx,
-            Tier::Full,
-            ip(1),
-        )
-        .await;
+        join_as(&relay, ROOM_B, "token-b", "b1", &full_tx, Tier::Full, ip(1)).await;
 
         // 于是两档各拒各的：两边都是「自己那一档满了」
         assert_eq!(
@@ -3091,7 +3158,10 @@ mod tests {
                 ip(1)
             )
             .await,
-            Admit::Accepted { peer_online: true, .. }
+            Admit::Accepted {
+                peer_online: true,
+                ..
+            }
         ));
     }
 
@@ -3158,17 +3228,7 @@ mod tests {
         sender: &mpsc::Sender<Message>,
         source_tier: Tier,
     ) -> (u64, bool, oneshot::Receiver<()>) {
-        match join_as(
-            relay,
-            room_id,
-            token,
-            device_id,
-            sender,
-            source_tier,
-            ip(1),
-        )
-        .await
-        {
+        match join_as(relay, room_id, token, device_id, sender, source_tier, ip(1)).await {
             Admit::Accepted {
                 id,
                 peer_online,
@@ -3180,14 +3240,7 @@ mod tests {
 
     /// 当前活着的会话名（只给用例断言用）
     async fn state_rooms(relay: &Arc<Relay>) -> Vec<String> {
-        relay
-            .state
-            .lock()
-            .await
-            .rooms
-            .keys()
-            .cloned()
-            .collect()
+        relay.state.lock().await.rooms.keys().cloned().collect()
     }
 
     /// IPv6 按 /64 归并：同一段里的地址算同一个 IP，别的段算另一个
@@ -3346,10 +3399,7 @@ mod tests {
             protocol::DEFAULT_PUBLIC_BURST_FRAMES,
             "突发给足：一轮 12 帧 / 8 KB 要能一口气发完"
         );
-        assert_eq!(
-            public.bytes,
-            protocol::DEFAULT_PUBLIC_BURST_BYTES
-        );
+        assert_eq!(public.bytes, protocol::DEFAULT_PUBLIC_BURST_BYTES);
         assert!(public.frames > protocol::DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND);
 
         // 持续那一半就是广告出去的那份额度

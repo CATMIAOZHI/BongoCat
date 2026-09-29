@@ -136,7 +136,13 @@ fn public_config(
     max_public_per_ip: usize,
     window: Option<Duration>,
 ) -> Config {
-    let mut config = config(Limits::default(), max_sessions, Duration::from_secs(120), None, None);
+    let mut config = config(
+        Limits::default(),
+        max_sessions,
+        Duration::from_secs(120),
+        None,
+        None,
+    );
 
     config
         .server_keys
@@ -934,7 +940,9 @@ async fn the_public_tier_has_its_own_rate_limit() {
     // 必须是信令（kind 8）：别的 kind 会先被白名单用 1008 关掉，测不到限流这一层
     for _ in 0..3 {
         client
-            .send(Message::Binary(frame(protocol::FRAME_KIND_SIGNAL, 16).into()))
+            .send(Message::Binary(
+                frame(protocol::FRAME_KIND_SIGNAL, 16).into(),
+            ))
             .await
             .unwrap();
     }
@@ -1086,7 +1094,10 @@ async fn the_connection_cap_answers_with_its_own_503() {
     };
     let refused = until_refused(address).await;
 
-    assert!(refused.contains(" 503 "), "连接满了要回 503，实际：{refused}");
+    assert!(
+        refused.contains(" 503 "),
+        "连接满了要回 503，实际：{refused}"
+    );
     assert!(
         refused.contains("server is at its connection limit"),
         "而且要说清是**连接数**满了（不是会话满了），实际：{refused}"
@@ -1135,8 +1146,7 @@ async fn a_flood_of_failed_handshakes_is_429_before_anything_else() {
     );
 
     // 健康检查也在同一道闸后面
-    let health =
-        raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+    let health = raw_request(address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
 
     assert!(health.contains(" 429 "), "实际：{health}");
     assert!(
@@ -1318,13 +1328,7 @@ async fn the_public_tier_is_announced_with_stun_only() {
             "credential": "coturn-pass"
         }
     ]);
-    let mut settings = config(
-        Limits::default(),
-        20,
-        Duration::from_secs(120),
-        None,
-        None,
-    );
+    let mut settings = config(Limits::default(), 20, Duration::from_secs(120), None, None);
 
     settings.ice_servers = Some(ice_servers.clone());
     // 公益档要配一把钥匙才存在（上面那份 `config` 里只有完全档）
@@ -1481,7 +1485,10 @@ async fn a_public_connection_cannot_forward_data_frames() {
         .await
         .unwrap();
 
-    assert_eq!(wait_close(&mut first).await, Some(close_code::PROTOCOL_ERROR));
+    assert_eq!(
+        wait_close(&mut first).await,
+        Some(close_code::PROTOCOL_ERROR)
+    );
     expect_no_binary(&mut second, "公益档对面").await;
 
     // 换个 deviceId 重新进来，这次只发信令：照旧转发
@@ -1536,8 +1543,7 @@ async fn the_public_tier_does_not_consume_the_full_tier_slots() {
 
     // 而第二个**公益**会话才该被拒（满的是它自己那一档）
     assert_eq!(
-        handshake_status_with_server(address, ROOM_C, TOKEN_C, "1", "cccc", &public_token())
-            .await,
+        handshake_status_with_server(address, ROOM_C, TOKEN_C, "1", "cccc", &public_token()).await,
         503
     );
 }
@@ -1553,8 +1559,7 @@ async fn the_public_per_ip_limit_only_blocks_new_rooms() {
     let _second = connect_public(address, ROOM_A, TOKEN_A, "bbbb").await;
 
     assert_eq!(
-        handshake_status_with_server(address, ROOM_B, TOKEN_B, "1", "cccc", &public_token())
-            .await,
+        handshake_status_with_server(address, ROOM_B, TOKEN_B, "1", "cccc", &public_token()).await,
         429
     );
 }
@@ -1682,7 +1687,10 @@ async fn the_public_window_closes_an_idle_connection_with_4005() {
 
     next_json(&mut guest).await;
 
-    assert_eq!(wait_close(&mut guest).await, Some(close_code::PUBLIC_WINDOW));
+    assert_eq!(
+        wait_close(&mut guest).await,
+        Some(close_code::PUBLIC_WINDOW)
+    );
 }
 
 /// 回归：公益档一加，部署者那一档的转发照旧（kind 1 与 kind 6 都能过）

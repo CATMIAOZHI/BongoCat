@@ -11,15 +11,14 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::auth;
 use crate::http::{read_request_head, write_response, write_response_with_headers};
 use crate::protocol::{
-    is_valid_device_id, is_valid_room_id, Limits, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
+    is_valid_device_id, is_valid_room_id, Limits, Tier, DEFAULT_HANDSHAKE_FAILURES_PER_MINUTE,
     DEFAULT_MAX_BYTES_PER_SECOND, DEFAULT_MAX_CHUNKS_PER_SECOND, DEFAULT_MAX_FRAMES_PER_SECOND,
     DEFAULT_MAX_PUBLIC_PER_IP, DEFAULT_MAX_PUBLIC_SESSIONS, DEFAULT_MAX_SESSIONS,
     DEFAULT_PUBLIC_BURST_BYTES, DEFAULT_PUBLIC_BURST_FRAMES, DEFAULT_PUBLIC_KEY_BUDGET_BYTES,
     DEFAULT_PUBLIC_MAX_BYTES_PER_SECOND, DEFAULT_PUBLIC_MAX_FRAMES_PER_SECOND,
     DEFAULT_PUBLIC_WINDOW_SECS, DEFAULT_STALE_AFTER_MS, HEADER_AUTHORIZATION, HEADER_CLIENT,
     HEADER_PROTOCOL, HEADER_ROOM, HEADER_SERVER, HEADER_TIER, HEALTH_PATH,
-    MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, Tier, WEBSOCKET_VERSION,
-    WS_PATH,
+    MIN_SERVER_PASSWORD_LENGTH, PROTOCOL_VERSION, TIER_HEADER_VALUE, WEBSOCKET_VERSION, WS_PATH,
 };
 use crate::relay::{self, IpKey, Relay, RelayOptions, RoomRejection, ServerKey};
 
@@ -121,7 +120,9 @@ fn env_bool(name: &str, default: bool) -> Result<bool, String> {
         Some(text) => match text.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
             "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(format!("{name} 只能是 1/0（或 true/false），实际是 {text:?}")),
+            _ => Err(format!(
+                "{name} 只能是 1/0（或 true/false），实际是 {text:?}"
+            )),
         },
     }
 }
@@ -274,10 +275,8 @@ pub fn load_config() -> Result<Config, String> {
     // 任何人只要知道地址就能开一个自己的会话（还会顺走 welcome 里的 TURN 凭据）。
     // 与其允许一个默认开放、随时可能被白嫖的部署，不如启动就报错说清楚怎么设。
     // 这里可以写多把（`;` 分隔）：每把都是完全档，给出去一把不影响别的。
-    let server_passwords = env_passwords(
-        "PAIR_SERVER_PASSWORD",
-        "太短的门槛挡不住爆破，也挡不住猜",
-    )?;
+    let server_passwords =
+        env_passwords("PAIR_SERVER_PASSWORD", "太短的门槛挡不住爆破，也挡不住猜")?;
 
     if server_passwords.is_empty() {
         return Err(format!(
@@ -335,8 +334,10 @@ pub fn load_config() -> Result<Config, String> {
 
     // 公益档**每把钥匙**的滚动预算（0 = 不设这一层）。记账挂钥匙而不是挂连接 / 房间 /
     // IP 的理由见 `protocol.rs` 里那条常量的注释。
-    let public_key_budget =
-        env_optional_f64("PAIR_PUBLIC_KEY_BUDGET_BYTES", DEFAULT_PUBLIC_KEY_BUDGET_BYTES)?;
+    let public_key_budget = env_optional_f64(
+        "PAIR_PUBLIC_KEY_BUDGET_BYTES",
+        DEFAULT_PUBLIC_KEY_BUDGET_BYTES,
+    )?;
 
     // 握手层每个 IP 的失败速率。它和公益档无关，是**部署者自己那一档**的护栏：拿错密码
     // 刷 `/ws` 的代价本来只是一次摘要比较，真正会被打爆的是日志（排障的唯一证据）。
@@ -374,8 +375,7 @@ pub fn load_config() -> Result<Config, String> {
         max_public_sessions,
         max_public_per_ip: env_u64("PAIR_MAX_PUBLIC_PER_IP", DEFAULT_MAX_PUBLIC_PER_IP as u64)?
             as usize,
-        public_window: (public_window_secs > 0)
-            .then(|| Duration::from_secs(public_window_secs)),
+        public_window: (public_window_secs > 0).then(|| Duration::from_secs(public_window_secs)),
         trust_proxy: env_bool("PAIR_TRUST_PROXY", false)?,
     })
 }
@@ -401,10 +401,7 @@ impl Config {
             // 准入闸不单独配一项：一个会话两条连接，再加一截握手余量。放在这里（而不是
             // `load_config`）是为了让它**跟着名额走**——`max_public_sessions` 在配置阶段
             // 还可能被改动，写死一次就可能小于「按配置本来就该跑得起来的量」。
-            max_connections: derived_max_connections(
-                self.max_sessions,
-                self.max_public_sessions,
-            ),
+            max_connections: derived_max_connections(self.max_sessions, self.max_public_sessions),
             max_public_sessions: self.max_public_sessions,
             max_public_per_ip: self.max_public_per_ip,
             public_window: self.public_window,
@@ -659,9 +656,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     // 用 426 而不是 403：客户端已经把 426 显示成「两边版本不一致：请把它们都升级到
     // 最新版」，那正是这种情况该说的话；而 403 会被显示成「服务器密码不对」，把人
     // 引向完全错误的方向。
-    if tier == Tier::Public
-        && head.header(HEADER_TIER) != Some(TIER_HEADER_VALUE)
-    {
+    if tier == Tier::Public && head.header(HEADER_TIER) != Some(TIER_HEADER_VALUE) {
         reject(&relay, peer, client, "公益档需要新客户端", 426).await;
 
         return write_response(
@@ -717,7 +712,13 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> R
     // §8 / §9 / §27：容量与密钥判定都在升级之前完成，客户端才能按状态码区分
     // 「配对密码不正确」（401）与「服务器会话已满」（503）。
     let reservation = match relay
-        .reserve(&room_id, auth::auth_verifier(&token), tier, key_index, client)
+        .reserve(
+            &room_id,
+            auth::auth_verifier(&token),
+            tier,
+            key_index,
+            client,
+        )
         .await
     {
         Ok(reservation) => reservation,
@@ -896,7 +897,10 @@ mod tests {
     /// 同一把钥匙不能兼两档：两档清单里出现同一串时，要说清是公益档里第几把
     #[test]
     fn a_key_may_not_sit_in_both_tiers() {
-        let full = vec!["password-for-alice".to_string(), "password-for-bob".to_string()];
+        let full = vec![
+            "password-for-alice".to_string(),
+            "password-for-bob".to_string(),
+        ];
         let public = vec![
             "volunteer-1-password".to_string(),
             "password-for-bob".to_string(),
@@ -907,7 +911,10 @@ mod tests {
         assert_eq!(
             shared_key(
                 &full,
-                &["volunteer-1-password".to_string(), "volunteer-2-password".to_string()]
+                &[
+                    "volunteer-1-password".to_string(),
+                    "volunteer-2-password".to_string()
+                ]
             ),
             None
         );
@@ -927,7 +934,10 @@ mod tests {
     fn an_optional_limit_reads_zero_as_off() {
         let name = "PAIR_PUBLIC_KEY_BUDGET_BYTES";
 
-        assert_eq!(parse_optional_f64(name, "16777216").unwrap(), Some(16777216.0));
+        assert_eq!(
+            parse_optional_f64(name, "16777216").unwrap(),
+            Some(16777216.0)
+        );
         assert_eq!(parse_optional_f64(name, " 0 ").unwrap(), None);
         assert_eq!(parse_optional_f64(name, "0.0").unwrap(), None);
     }
