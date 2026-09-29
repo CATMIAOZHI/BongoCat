@@ -2,20 +2,27 @@
 //!
 //! 只负责「连上」，不负责重连、状态机与加解密（那些在 manager.rs）。
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
 #[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::time::Sleep;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::UrlError;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 #[cfg(test)]
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::Error as WsError;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls};
 
 use super::crypto::ROOM_ID_LENGTH;
 use super::protocol::{PROTOCOL_VERSION, TIER_HEADER_VALUE};
 
-pub type PairSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub type PairSocket = WebSocketStream<MaybeTlsStream<SplitFirstWrite<TcpStream>>>;
 
 /// 连接失败的原因。
 ///
@@ -136,6 +143,196 @@ fn is_valid_room_id(room_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// 第一次写只放走多少字节（见 [`SplitFirstWrite`]）。
+///
+/// 只要保证「这一段里绝不含一个完整的 ClientHello」就够了：实测切在最后一个字节也能过
+/// （拦截盒不重组 TCP），所以 32 这个值只是取一段明显残缺的片段，没有精确含义。
+const SPLIT_HEAD_BYTES: usize = 32;
+
+/// 第一段出去之后等多久才写剩下的（见 [`SplitFirstWrite`]）。
+///
+/// 实测：两次写挨在一起会被合并成一个包（4/4 被掐），间隔 ≥ 1ms 就稳定、10ms 更稳；
+/// 客户端到服务器之间往往还有一层 TUN / 代理在转发，所以留到 30ms。它是**一次性**的
+/// （只在建连的第一个 ClientHello 上），不是每帧的成本。
+const SPLIT_GAP: Duration = Duration::from_millis(30);
+
+/// 主机部分是「名字」（域名）而不是 IP 字面量 / `localhost` —— 也就是要不要装那层拆包。
+///
+/// 判定复用地址归一化那套口径（见 [`looks_like_plaintext_host`]）。**它不等于「会不会发
+/// SNI」**：rustls 对 `localhost`、`1.2.3` 这类 DNS 形状的主机是发 SNI 的，只有裸 IP 字面量
+/// 才不发。真正的依据是实测 —— 裸 IP 那条路没有被拦（见 [`SplitFirstWrite`]），拆了只是白加
+/// 一次 [`SPLIT_GAP`]，所以不装。
+fn host_is_a_name(host: &str) -> bool {
+    !host.is_empty() && !looks_like_plaintext_host(host)
+}
+
+/// 把**第一次写**主动拆成两段的流适配器，其余时候原样直通。
+///
+/// 为什么需要它：阿里云会在链路上游拦掉「ClientHello 能整个装进一个 TCP 段」的握手
+/// （未备案的域名走它自己的链路时）。现象是被伪造成客户端的注入 RST，而**端口无关**
+/// （3478 这种没人监听的端口也收到同样一个 RST），所以问题不在服务器上。
+///
+/// 实测出来的判定条件是「ClientHello 能不能装进一个 TCP 段」，阈值正好等于客户端 SYN 里的
+/// `mss 1452`：同一份失败的 ClientHello 逐字节不改、只用 padding 撑到 1454 字节就能过；
+/// 把 hello 主动拆成两次 write（间隔 ≥ 1ms）也能过，而且**切在哪里都行** —— 切在最后一个
+/// 字节（第一段里已经含有完整 SNI）同样过。这说明它不重组 TCP，只是「记录没读完就跳过」。
+///
+/// 所以这里的做法是：第一次写只放走前 [`SPLIT_HEAD_BYTES`] 个字节，隔 [`SPLIT_GAP`]
+/// 再原样写剩下的。TLS 服务端本来就必须容忍握手消息跨记录 / 跨段，服务器侧不需要任何改动。
+///
+/// 有一点要说清楚：**「裸 IP 不用拆」是实测结论，不是机制结论**。拦截的判据（ClientHello
+/// 装不装得进一个 TCP 段）跟 SNI 无关，所以哪天拦截盒改成按 IP / 端口拦，`wss://<裸 IP>`
+/// 那条路也得装上这一层。
+///
+/// 代价：① 每次建连多 [`SPLIT_GAP`]；② 它**依赖「拦截盒不重组 TCP」这个实现细节** ——
+/// 对方升级、或者换一条 MSS 不同的线路，这条路随时可能失效（失效的样子是连接被重置，
+/// 与「服务器没开」区分不开，所以 `server-relay/README.md` 里把这条写给了部署者）。
+/// 这也是**绕开备案拦截而不是解决它**：正规做法是给域名做 ICP 备案。
+///
+/// 它必须 `pub`：类型出现在 [`PairSocket`] 这个别名里（构造仍然只在本模块内）。
+pub struct SplitFirstWrite<S> {
+    inner: S,
+    state: SplitState,
+}
+
+enum SplitState {
+    /// 还没写第一笔：`Some(n)` = 这一笔只放走 `n` 个字节，`None` = 完全不拆（明文、裸 IP）
+    First(Option<usize>),
+    /// 第一段已经出去，等这一觉睡醒再写剩下的
+    Napping(Pin<Box<Sleep>>),
+    /// 拆完了，之后完全直通
+    Done,
+}
+
+impl<S> SplitFirstWrite<S> {
+    fn new(inner: S, head: Option<usize>) -> Self {
+        Self {
+            inner,
+            state: SplitState::First(head.filter(|head| *head > 0)),
+        }
+    }
+}
+
+impl<S> AsyncRead for SplitFirstWrite<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for SplitFirstWrite<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // 先「取走」当前状态：这样下面的分支里既能用掉它，又能重新写回 `this.state`
+        match std::mem::replace(&mut this.state, SplitState::Done) {
+            // 不拆，或者已经拆完了：从这里开始完全直通
+            SplitState::Done | SplitState::First(None) => {
+                Pin::new(&mut this.inner).poll_write(cx, buf)
+            }
+            SplitState::First(Some(head)) => {
+                let head = head.min(buf.len());
+
+                match Pin::new(&mut this.inner).poll_write(cx, &buf[..head]) {
+                    // 首笔还没写出去（发送缓冲满了）：状态原样放回去，下一次接着拆。
+                    // 这里绝不能让它落到 `Done`（`mem::replace` 留下的那个值），否则拆分就
+                    // 静默失效、整份 ClientHello 会一笔发出去。
+                    Poll::Pending => {
+                        this.state = SplitState::First(Some(head));
+
+                        Poll::Pending
+                    }
+                    Poll::Ready(Err(error)) => {
+                        // 一个字节都没写走，状态同样放回去（对称；这条连接其实已经废了）
+                        this.state = SplitState::First(Some(head));
+
+                        Poll::Ready(Err(error))
+                    }
+                    Poll::Ready(Ok(written)) => {
+                        // 一个字节都没接受说明这条连接已经不接受了（`write_all` 会按 WriteZero
+                        // 收尾），这时不必再摆一个定时器出来
+                        if written > 0 {
+                            this.state =
+                                SplitState::Napping(Box::pin(tokio::time::sleep(SPLIT_GAP)));
+                        }
+
+                        Poll::Ready(Ok(written))
+                    }
+                }
+            }
+            SplitState::Napping(mut sleeping) => match sleeping.as_mut().poll(cx) {
+                Poll::Pending => {
+                    // 放回去：waker 已经注册在 `sleeping` 上，醒来接着等
+                    this.state = SplitState::Napping(sleeping);
+
+                    Poll::Pending
+                }
+                Poll::Ready(()) => Pin::new(&mut this.inner).poll_write(cx, buf),
+            },
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// 自己建 TCP（按需装上面那层拆包），再把 WebSocket 升级交给 tokio-tungstenite。
+///
+/// 不能再用 `connect_async`：那条路自己建 TCP、自己决定 TLS 配置，中间插不进适配器。
+/// 但 **TLS 配置不需要自己重写一遍** —— `client_async_tls` 会用它自己的默认连接器
+/// （`rustls-tls-webpki-roots`，ring provider），证书校验口径与改之前逐字一致，也没有多出
+/// 任何依赖。
+async fn open(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+) -> Result<PairSocket, WsError> {
+    let uri = request.uri();
+    let host = uri.host().ok_or(WsError::Url(UrlError::NoHostName))?;
+    let tls = uri.scheme_str() == Some("wss");
+    let port = uri
+        .port_u16()
+        .unwrap_or(if tls { 443 } else { 80 });
+    // IPv6 字面量要连着方括号一起交给 `ToSocketAddrs`（`("[::1]", 8443)` 才是合法的写法）
+    let socket = TcpStream::connect((host, port)).await.map_err(WsError::Io)?;
+
+    // 关掉 Nagle 更稳妥：新连接上没有在途未确认数据，那 32 字节本来就会立刻出去，但 Nagle
+    // 有可能把 30ms 之后的第二段压到 ACK 到达为止（最多一个 RTT）。所以这是**顺带的行为
+    // 变化**、不是拆包的必要条件 —— 原来的 `connect_async` 用的是它自己的默认值
+    // `disable_nagle = false`（开着 Nagle）；它顺带也让 60Hz 的小快照不再被压着等。
+    socket.set_nodelay(true).map_err(WsError::Io)?;
+
+    let split = if tls && host_is_a_name(host) {
+        Some(SPLIT_HEAD_BYTES)
+    } else {
+        None
+    };
+    let stream = SplitFirstWrite::new(socket, split);
+    let (socket, _response) = client_async_tls(request, stream).await?;
+
+    Ok(socket)
+}
+
 pub async fn connect(
     relay_url: &str,
     room_id: &str,
@@ -148,7 +345,7 @@ pub async fn connect(
     let sent_server_password = server_token.is_some_and(|token| !token.trim().is_empty());
     let request = build_request(relay_url, room_id, auth_token, server_token, device_id)?;
 
-    let (socket, _response) = connect_async(request)
+    let socket = open(request)
         .await
         .map_err(|error| describe_connect_error(error, sent_server_password))?;
 
@@ -310,6 +507,11 @@ fn describe_connect_error(error: WsError, sent_server_password: bool) -> PairFai
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use futures_util::future::poll_immediate;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::core::pair::crypto::{
         decode_pair_secret, derive_auth_token, derive_room_id, derive_server_token,
@@ -587,6 +789,273 @@ mod tests {
                 .expect_err("非法 Room 必须被拒绝");
 
             assert!(failure.fatal, "非法 Room 应当是 fatal：{broken:?}");
+        }
+    }
+
+    /// 只记录「每一笔写各写了多少字节」的假流（读侧用不到，直接 Pending）
+    #[derive(Default)]
+    struct Recorder {
+        writes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for Recorder {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Recorder {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.len());
+
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn recorded(writes: &Arc<Mutex<Vec<usize>>>) -> Vec<usize> {
+        writes.lock().unwrap().clone()
+    }
+
+    /// 一次最多只接受 `cap` 字节的假流：用来钉住「首笔被底层短写」这条路径
+    struct ShortWriter {
+        cap: usize,
+        writes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for ShortWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let accepted = this.cap.min(buf.len());
+
+            this.writes.lock().unwrap().push(accepted);
+
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 第一次写被拆成「先一小段、等一会儿、再剩下的」，之后完全直通。
+    ///
+    /// 这条用例是整条修复的形状：拆在**第一笔**上、两段之间**真的有间隔**（不是挨着的两次
+    /// 写，那种会被内核合成一个包）、而且**只拆第一笔**。
+    #[tokio::test]
+    async fn the_first_write_is_split_in_two() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = SplitFirstWrite::new(
+            Recorder {
+                writes: Arc::clone(&writes),
+            },
+            Some(SPLIT_HEAD_BYTES),
+        );
+
+        // 一份 1500 字节的「ClientHello」：刚好超过实测的 1452 阈值
+        let payload = vec![7u8; 1500];
+        let mut writing = Box::pin(stream.write_all(&payload));
+
+        // 只 poll 一次：第一段出去之后就该等着，不能接着把剩下的写出去
+        assert!(
+            poll_immediate(writing.as_mut()).await.is_none(),
+            "第一段之后要等 {SPLIT_GAP:?}，不能紧接着写剩下的"
+        );
+        assert_eq!(recorded(&writes), vec![SPLIT_HEAD_BYTES]);
+
+        tokio::time::sleep(SPLIT_GAP * 2).await;
+
+        assert!(
+            poll_immediate(writing.as_mut()).await.is_some(),
+            "间隔过去了就该把剩下的写完"
+        );
+        assert_eq!(
+            recorded(&writes),
+            vec![SPLIT_HEAD_BYTES, 1500 - SPLIT_HEAD_BYTES]
+        );
+
+        drop(writing);
+
+        // 之后完全直通：这一笔写就是一整笔
+        stream.write_all(&[9u8; 100]).await.unwrap();
+        assert_eq!(
+            recorded(&writes),
+            vec![SPLIT_HEAD_BYTES, 1500 - SPLIT_HEAD_BYTES, 100]
+        );
+    }
+
+    /// 首笔被底层短写（一次只吃 8 字节）时：一个字节都不能丢，「等一会儿」那一拍也不能吞掉
+    #[tokio::test]
+    async fn a_short_first_write_still_splits_and_loses_nothing() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = SplitFirstWrite::new(
+            ShortWriter {
+                cap: 8,
+                writes: Arc::clone(&writes),
+            },
+            Some(SPLIT_HEAD_BYTES),
+        );
+
+        let mut writing = Box::pin(stream.write_all(&[5u8; 100]));
+
+        // 首笔只吃到 8 字节（小于 `SPLIT_HEAD_BYTES`），但它仍然是「第一笔」
+        assert!(
+            poll_immediate(writing.as_mut()).await.is_none(),
+            "首笔出去之后要等 {SPLIT_GAP:?}"
+        );
+        assert_eq!(recorded(&writes), vec![8]);
+
+        tokio::time::sleep(SPLIT_GAP * 2).await;
+
+        assert!(poll_immediate(writing.as_mut()).await.is_some());
+        drop(writing);
+
+        // 1 笔首段 + 92 字节按 cap 分批（11×8 + 1×4）：一笔不多、一笔不少
+        assert_eq!(
+            recorded(&writes),
+            vec![8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4]
+        );
+    }
+
+    /// 明文 / 裸 IP 那条路（`head = None`）完全直通，一笔就是一整笔
+    #[tokio::test]
+    async fn a_connection_without_sni_writes_in_one_go() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = SplitFirstWrite::new(
+            Recorder {
+                writes: Arc::clone(&writes),
+            },
+            None,
+        );
+
+        stream.write_all(&[1u8; 1500]).await.unwrap();
+
+        assert_eq!(recorded(&writes), vec![1500]);
+    }
+
+    /// 适配器不能弄坏流本身：读仍然是读、写仍然是写，一个字节都不能丢
+    #[tokio::test]
+    async fn the_wrapper_still_carries_data_both_ways() {
+        let (client, mut remote) = tokio::io::duplex(4096);
+        let mut stream = SplitFirstWrite::new(client, Some(SPLIT_HEAD_BYTES));
+        let payload = vec![3u8; 1200];
+
+        let sending = tokio::spawn(async move {
+            stream.write_all(&payload).await.unwrap();
+
+            stream
+        });
+
+        let mut got = vec![0u8; 1200];
+
+        remote.read_exact(&mut got).await.unwrap();
+
+        let mut stream = sending.await.unwrap();
+        let mut reply = [0u8; 4];
+
+        remote.write_all(b"pong").await.unwrap();
+        stream.read_exact(&mut reply).await.unwrap();
+
+        assert_eq!(got, vec![3u8; 1200]);
+        assert_eq!(&reply, b"pong");
+    }
+
+    /// 只有主机是「名字」的连接才装拆包：域名拆，裸 IP / 本机不拆（免得白加一次延迟）
+    #[test]
+    fn only_host_names_are_worth_splitting() {
+        assert!(host_is_a_name("relaycat.waterraincat.com"));
+        assert!(host_is_a_name("cat.example.com"));
+        // 「三段数字」不是 IP（与地址归一化同一套口径）
+        assert!(host_is_a_name("1.2.3"));
+
+        assert!(!host_is_a_name("47.109.69.191"));
+        assert!(!host_is_a_name("127.0.0.1"));
+        assert!(!host_is_a_name("[::1]"));
+        assert!(!host_is_a_name("localhost"));
+        assert!(!host_is_a_name(""));
+    }
+
+    /// 真机探针：域名那条路能不能过中间那层拦截盒（默认跳过）。
+    ///
+    /// 必须在**被拦的那台机器上**跑才有意义：
+    /// ```powershell
+    /// $env:BONGO_PAIR_E2E_TLS_RELAY = "https://relaycat.waterraincat.com"
+    /// cargo test --manifest-path src-tauri/Cargo.toml --lib pair::client -- --ignored --nocapture
+    /// ```
+    ///
+    /// 判据是「握手有没有走到中继」，不是「有没有连上会话」：这里用的是随便填的 room 与
+    /// 配对密码，所以正常结局是「拿到中继的 101」或者「被中继按 4xx 拒掉」——两者都说明
+    /// ClientHello 已经过去了。没过去的样子是**传输层**错误：被拦是连接被重置
+    /// （`connection reset`），证书没配好是 TLS 报错（`invalid peer certificate`）。
+    ///
+    /// 同一个地址还会用**老路子**（`connect_async`，不拆包）再试一次，只打印、不断言：
+    /// 它就是这条修复的对照组。
+    #[tokio::test]
+    #[ignore = "需要真实服务器，见用例说明"]
+    async fn a_domain_relay_gets_past_the_inline_box() {
+        let Ok(relay) = std::env::var("BONGO_PAIR_E2E_TLS_RELAY") else {
+            eprintln!("跳过：未设置 BONGO_PAIR_E2E_TLS_RELAY");
+
+            return;
+        };
+        let relay = relay.trim().to_string();
+        let room_id = "a".repeat(ROOM_ID_LENGTH);
+
+        {
+            use tokio_tungstenite::connect_async;
+
+            let request = build_request(&relay, &room_id, "probe", None, "probe").unwrap();
+
+            match connect_async(request).await {
+                Ok(_) => println!("对照组（不拆包）：连上了——这条链路现在没被拦"),
+                Err(WsError::Http(response)) => {
+                    println!("对照组（不拆包）：到达中继（HTTP {}）", response.status())
+                }
+                Err(error) => println!("对照组（不拆包）：{error}"),
+            }
+        }
+
+        let request = build_request(&relay, &room_id, "probe", None, "probe").unwrap();
+
+        match open(request).await {
+            Ok(_) => println!("拆包之后：握手成功（拿到了中继的 101）"),
+            Err(WsError::Http(response)) => {
+                println!("拆包之后：到达中继（HTTP {}）", response.status())
+            }
+            Err(error) => panic!("拆包之后握手还是没走完（多半仍被拦，或证书不对）: {error}"),
         }
     }
 }
