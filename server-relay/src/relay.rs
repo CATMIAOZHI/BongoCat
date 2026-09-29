@@ -57,7 +57,7 @@ struct PairRoom {
     /// 这个会话是**创建它的那条连接**的档位（决定它占哪一份名额）。
     ///
     /// 档位定在 Room 上而不是「每条连接各自算」，是为了让名额归属唯一：同一个会话的
-    /// 两个人必须用同一类凭据——填错了会被 403 挡住，而不是让一个人有中继兜底、另一个人
+    /// 两个人必须用同一类凭据——填错了会被 409 挡住，而不是让一个人有中继兜底、另一个人
     /// 什么都没有。
     tier: Tier,
     /// 创建这个会话时那条连接来自哪个 IP（IPv6 按 /64 归并）。公益档的每 IP 限额与它
@@ -171,7 +171,7 @@ enum Admit {
 pub enum RoomRejection {
     /// 同名的 Room 已经存在，但这次带来的 token 摘要对不上 → 401
     AuthMismatch,
-    /// 同名的 Room 已经存在，但这次的档位与创建时不同（两边填了不同类型的密码）→ 403
+    /// 同名的 Room 已经存在，但这次的档位与创建时不同（两边填了不同类型的密码）→ 409
     TierMismatch,
     /// 这是一个新 Room，而服务器已经承载了 `PAIR_MAX_SESSIONS` 个 → 503
     Capacity,
@@ -743,7 +743,16 @@ impl Relay {
             Some(room) => room.pending = room.pending.saturating_sub(1),
             // 理论上到不了：`reserve` 刚刚创建或命中过这个 Room。真被并发的清理摘掉时
             // 就地按同一份 verifier 重建——名额在 `reserve` 那一侧已经算过，这里不重复判定。
+            //
+            // 但**每 IP 的账要跟着记上**：`sweep` 摘掉一个公益 Room 时会对那个 IP
+            // `saturating_sub` 一次，重建时不补记的话这份账就比配置更松（减到 0 之后
+            // 后面几组白送）。会话名额是按 Room 现数出来的，所以只有这一份独立的计数
+            // 需要在这里对齐。
             None => {
+                if tier == Tier::Public {
+                    *state.public_rooms_per_ip.entry(ip).or_default() += 1;
+                }
+
                 state.rooms.insert(
                     room_id.to_string(),
                     PairRoom {

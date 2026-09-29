@@ -1211,8 +1211,15 @@ impl PairManager {
         // 整条连接）。信令那一类（kind 8）例外——它正是这一档唯一允许走服务器的东西。
         //
         // 挡住而不是放行，是为了让上层能按自己的语义收尾：聊天会退回 `pending`（对方
-        // 下次上线时再试），presence / 快照这类连续值本来就会重发，前端的 `.catch` 也
-        // 只丢一句日志。这与配对码那条路的处理方式一致，只是那条路走的是命令层。
+        // 下次上线时再试），快照有输入就发、统计每 30 秒一次，所以那两类自己会恢复；
+        // 前端的 `.catch` 也只丢一句日志。这与配对码那条路的处理方式一致，只是那条路
+        // 走的是命令层。
+        //
+        // **presence 是这里的唯一例外**：它只在对方上线 / 切暂离 / 改昵称这类事件上
+        // 发一次（边沿触发），被挡掉就再没有别的地方会重发。公益档下 `peerOnline` 来自
+        // 中继的 `server.peer`，早在直连建立之前就翻真了——那一次正好落在被挡的窗口
+        // 里，所以补发放在前端「直连刚建立」那一刻（`usePairState` 里看 `p2p` 的那个
+        // watch）：昵称、暂离举牌与对方模型同步都靠它。
         if !kind.is_signal() && self.public_tier_needs_direct() {
             return Err(PUBLIC_TIER_BLOCK_REASON.to_string());
         }
@@ -1291,6 +1298,12 @@ impl PairManager {
             status.last_error = Some(message.clone());
             status.p2p = P2pState::Off;
             status.pet_state_hz = DEFAULT_PET_STATE_HZ;
+            // 档位同样是**这一次连接**的事实，`start()` / `disconnect()` 也复位它。
+            // 走到这里这条连接已经结束，界面上不该还挂着「公益档」——否则聊天窗口会
+            // 拿这一档的理由去解释一个其实来自 `last_error` 的失败（例如部署者换了
+            // 公益密码或把 `PAIR_MAX_PUBLIC_SESSIONS` 改成 0，公益客户端重连时拿到
+            // 403）。
+            status.tier = RelayTier::Full;
         });
 
         self.sink.emit(EVENT_ERROR, json!({ "message": message }));

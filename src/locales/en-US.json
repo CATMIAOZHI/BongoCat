@@ -67,7 +67,7 @@
         "queued": "Saved for later ({state}) — it goes out once connected",
         "manual": "Pairing-code link: {state}",
         "manualNotReady": "The pairing-code link has no server behind it — you can send once your partner's cat shows up",
-        "publicNotDirect": "This server only helps you punch through (public tier); it does not relay messages or files — you can send once it says \"Direct\"",
+        "publicNotDirect": "This server only helps you punch through (public tier); it does not relay messages or files — you can send once the P2P line says \"Direct\"",
         "preview": "View this image",
         "close": "Close",
         "imageCopied": "Image copied to the clipboard",
@@ -420,13 +420,13 @@
         "p2p": {
           "label": "P2P Channel",
           "hint": "If a direct link works, pet state and input stats travel directly between the two computers instead of through the server. If it fails everything falls back to the server unchanged.",
-          "hintPublic": "This is a public server: it only helps the two of you punch through and does not relay chat, voice or attachments — so until the link is up (shown as \"Direct\"), seeing your partner online is all you get. Your own server can be opened to others too: just set a public password on it.",
+          "hintPublic": "This is a public server: it only helps the two of you punch through and does not relay chat, voice or attachments — so until the link is up (shown as \"Direct\"), seeing your partner online is all you get. If it never connects, switch to another server or ask your partner to use a different network (this tier has no relay to fall back on). Your own server can be opened to others too: just set a public password on it.",
           "publicTier": "Public tier",
           "off": "Not established",
           "connecting": "Setting up a direct link…",
           "connected": "Direct",
           "failed": "Unavailable, using the server",
-          "failedPublic": "Not through yet — nothing can be sent"
+          "failedPublic": "No direct link yet — nothing can be sent"
         },
         "manual": {
           "label": "Pairing Code (no server)",

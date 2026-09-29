@@ -203,6 +203,19 @@ export function usePairState() {
   }
 
   /**
+   * 「现在真的能发了」：presence、统计与一帧当前活动各同步一次（§20 / §25）。
+   *
+   * 两个时刻都要它：对方刚上线，以及**直连刚建立**——公益档与配对码这两条路在直连之前
+   * 一个数据帧都发不出去（见 `stores/pair.ts` 的 `outboundBlockKey`），而这两种情况下
+   * 「对方在线」都可能来得比直连早。
+   */
+  const syncPeerNow = () => {
+    sendPresence(store.settings.presence)
+    sendStats()
+    sendSnapshot(true)
+  }
+
+  /**
    * 还按着东西时把同一份快照再发一次：对方猫的 TTL 才不至于把还按着的键/爪子放下来。
    *
    * 重算一遍再发：这段时间里发送侧自己的状态可能变了（比如某个键到了按住上限），
@@ -387,9 +400,20 @@ export function usePairState() {
     if (!online) return
 
     // §20 / §25：刚连上先同步一次 presence 与统计，再发一帧当前活动
-    sendPresence(store.settings.presence)
-    sendStats()
-    sendSnapshot(true)
+    syncPeerNow()
+  })
+
+  /**
+   * 直连刚建立时也要补一次。
+   *
+   * presence 是**边沿触发**的：只在对方上线 / 切暂离 / 改昵称这类事件上发一次，不像快照
+   * （有输入就发）和统计（每 30 秒一次）会自己恢复。公益档下 `peerOnline` 来自中继的
+   * `server.peer`，早在直连建立之前就翻真了——那一次 presence 正好落在被挡的窗口里，
+   * 此后没有任何东西会再发它，于是昵称、暂离举牌与对方模型同步在整个会话里都不生效。
+   * 判据与那道闸一致（两边都看 `p2p`）。
+   */
+  watch(() => store.runtime.p2p, (state, previous) => {
+    if (state === 'connected' && previous !== 'connected') syncPeerNow()
   })
 
   watch(() => store.settings.privacy.shareInputStats, () => {

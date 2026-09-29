@@ -146,41 +146,43 @@ async fn run() -> Result<(), String> {
     }
     println!("  服务器密码 PAIR_SERVER_PASSWORD 已生效（摘要形式，进程里没有原文）");
     println!("            客户端「服务器密码」必须填同一个值，否则连握手都过不去");
-    match (&config.public_verifier, config.max_public_sessions) {
-        // 先判「配了密码但名额为 0」：它也是一种「实际关闭」，不该被上面那一支吃掉
-        (Some(_), 0) => {
+    // 「配了密码」不等于「开着」：判据只有 `Relay::has_public_tier` 一处（`/health` 与凭据
+    // 判定都是它）。横幅自己再写一遍的话，以后那条口径一改，这里就会印出与真实行为相反
+    // 的状态——部署者正是拿这份输出确认自己装对了没有。
+    if !relay.has_public_tier() {
+        // 先判「配了密码但名额为 0」：它也是一种「实际关闭」，但不能和「压根没设过」混为一谈
+        if config.public_verifier.is_some() {
             println!("  公益档     已配公益密码，但 PAIR_MAX_PUBLIC_SESSIONS=0：实际关闭");
+        } else {
+            println!("  公益档     未开启（没设 PAIR_PUBLIC_SERVER_PASSWORD）：只有你自己那一档");
         }
-        (Some(_), sessions) => {
-            println!(
-                "  公益档     已开启（PAIR_PUBLIC_SERVER_PASSWORD）：最多 {sessions} 组、\
-                 每 IP {} 组，{}",
-                config.max_public_per_ip,
-                match config.public_window {
-                    Some(window) => format!(
-                        "空闲 {:.0} 秒回收，只转发信令与 STUN，不广告 TURN",
-                        window.as_secs_f64()
-                    ),
-                    None => "没有空闲回收，只转发信令与 STUN，不广告 TURN".to_string(),
-                }
-            );
-            println!(
-                "            额度       {:.0} 帧/秒 · {:.0} KiB/秒（只有信令）",
-                config.public_limits.frames_per_second,
-                config.public_limits.bytes_per_second / 1024.0
-            );
-            println!(
-                "            真实 IP    {}",
-                if config.trust_proxy {
-                    "信 X-Forwarded-For（PAIR_TRUST_PROXY=1）：每 IP 限额按真实客户端算"
-                } else {
-                    "不看 X-Forwarded-For：在反代后面时所有公益连接会算成同一个 IP"
-                }
-            );
-        }
-        (None, _) => println!(
-            "  公益档     未开启（没设 PAIR_PUBLIC_SERVER_PASSWORD）：只有你自己那一档"
-        ),
+    } else {
+        println!(
+            "  公益档     已开启（PAIR_PUBLIC_SERVER_PASSWORD）：最多 {} 组、\
+             每 IP {} 组，{}",
+            config.max_public_sessions,
+            config.max_public_per_ip,
+            match config.public_window {
+                Some(window) => format!(
+                    "空闲 {:.0} 秒回收，只转发信令与 STUN，不广告 TURN",
+                    window.as_secs_f64()
+                ),
+                None => "没有空闲回收，只转发信令与 STUN，不广告 TURN".to_string(),
+            }
+        );
+        println!(
+            "            额度       {:.0} 帧/秒 · {:.0} KiB/秒（只有信令）",
+            config.public_limits.frames_per_second,
+            config.public_limits.bytes_per_second / 1024.0
+        );
+        println!(
+            "            真实 IP    {}",
+            if config.trust_proxy {
+                "信 X-Forwarded-For（PAIR_TRUST_PROXY=1）：每 IP 限额按真实客户端算"
+            } else {
+                "不看 X-Forwarded-For：在反代后面时所有公益连接会算成同一个 IP"
+            }
+        );
     }
     println!("  配对密码  本进程**没有**任何配对密码：那是每一对用户自己的凭据");
     println!("  提醒      中继不保存聊天与文件，只做转发");

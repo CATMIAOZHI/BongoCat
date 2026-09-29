@@ -123,6 +123,9 @@ const blockKey = computed(() => {
 
 const blocked = computed(() => Boolean(blockKey.value))
 
+/** 挡住的理由（人话）。放进聊天窗口标题那一行，免得它上面写着「在线」、下面写着发不出去 */
+const blockState = computed(() => (blockKey.value ? t(blockKey.value) : ''))
+
 /** R42：发送键能不能按——有内容、没超长、不在发送中、没有「发不出去」的硬理由 */
 const sendReady = computed(() => {
   return Boolean(draft.value.trim()) && !tooLong.value && !sending.value && !blocked.value
@@ -260,6 +263,10 @@ function handleWheel(event: WheelEvent) {
 }
 
 async function handleSend() {
+  // 被挡住的时候连回车也不要发：`sendReady` 只管住了发送键，而 `@keydown.enter` 走的是
+  // 这条路。放它过去只会从 Rust 那边弹回一条红字，说的其实是同一件事（而那句是中文）。
+  if (blocked.value) return
+
   if (!draft.value.trim() || tooLong.value || sending.value) return
 
   sending.value = true
@@ -542,7 +549,7 @@ onMounted(async () => {
           {{ pairStore.runtime.peerName || $t('pages.chat.labels.peer') }}
         </div>
         <div class="chat-presence mt-0.5 truncate text-[10px] color-[#c1bbc9]">
-          {{ manualState || pairState || $t('pages.chat.hints.connected') }}
+          {{ manualState || blockState || pairState || $t('pages.chat.hints.connected') }}
         </div>
       </div>
 

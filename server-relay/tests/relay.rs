@@ -858,6 +858,42 @@ async fn the_rate_limit_closes_with_1008() {
     );
 }
 
+/// 公益档的额度是**它自己那一份**（`PAIR_PUBLIC_MAX_FRAMES_PER_SECOND` /
+/// `PAIR_PUBLIC_MAX_BYTES_PER_SECOND`），和部署者那一档分开配。
+///
+/// 桶确实按档位建（`relay.rs` 里的 `Bucket::full(self.limits_for(tier), now)`），但额度
+/// 本身只在 welcome 的广告值和 `limits_for` 上被断言过——把桶写成部署者那一档的额度，
+/// 别的用例一条都不会红。这一条真拿公益连接把额度打穿。
+#[tokio::test]
+async fn the_public_tier_has_its_own_rate_limit() {
+    // 公益档只给 2 帧/秒：第 3 帧必然超限（部署者那一档仍是 `Limits::default()`，远大于此）
+    let config = Config {
+        public_limits: Limits {
+            frames_per_second: 2.0,
+            chunks_per_second: 2.0,
+            bytes_per_second: 1024.0 * 1024.0,
+        },
+        ..public_config(20, 10, 4, None)
+    };
+    let address = start_relay_with_config(config).await;
+    let mut client = connect_public(address, ROOM_A, TOKEN_A, "aaaa").await;
+
+    next_json(&mut client).await;
+
+    // 必须是信令（kind 8）：别的 kind 会先被白名单用 1008 关掉，测不到限流这一层
+    for _ in 0..3 {
+        client
+            .send(Message::Binary(frame(protocol::FRAME_KIND_SIGNAL, 16).into()))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        wait_close(&mut client).await,
+        Some(close_code::PROTOCOL_ERROR)
+    );
+}
+
 #[tokio::test]
 async fn the_relay_answers_pings() {
     let address = start_relay(Limits::default(), Duration::from_secs(120)).await;
