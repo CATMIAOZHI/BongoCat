@@ -11,7 +11,8 @@
 #      域名 A 记录指向这台机器
 #   3. docker compose up -d
 #   4. 自查：curl https://<你的域名>/health 应当打印
-#      {"ok":true,"protocol":1,"mode":"multi-pair","passwordRequired":true}
+#      {"ok":true,"protocol":1,"mode":"multi-pair","passwordRequired":true,"publicTier":false,
+#       "serverKeys":{"full":1,"public":0}}（`publicTier` / `serverKeys` 看你配了什么）
 #   5. 把「服务器地址（https://<你的域名>）+ 服务器密码 + 配对密码」三个值一起发给对方，
 #      两边客户端都填这三项
 #
@@ -45,6 +46,7 @@ services:
       # 公益档（可选）：设了公益密码，别人就能拿它借这台服务器打洞（只转发信令、
       # 不中继数据、不广告 TURN），名额与额度都算自己的、占不到上面那一档。
       # 留空 = 没有公益档。密码 ≥ 16 字符，且**不能**和 PAIR_SERVER_PASSWORD 相同。
+      # 两个密码变量都能写多把（`;` 分隔），每把各给一个人；同一把不能跨档。
       PAIR_PUBLIC_SERVER_PASSWORD: ${PAIR_PUBLIC_SERVER_PASSWORD:-}
       PAIR_MAX_PUBLIC_SESSIONS: ${PAIR_MAX_PUBLIC_SESSIONS:-}
       PAIR_MAX_PUBLIC_PER_IP: ${PAIR_MAX_PUBLIC_PER_IP:-}
