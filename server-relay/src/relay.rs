@@ -119,6 +119,34 @@ const PUBLIC_WS_WRITE_BUFFER: usize = 256 * 1024;
 /// 公益档每把钥匙的预算按多长时间回填（`DEFAULT_PUBLIC_KEY_BUDGET_BYTES` 说的是「每小时」）。
 const KEY_BUDGET_WINDOW_SECS: f64 = 3600.0;
 
+/// 一帧最多能等多久（见 `Relay::allow`、`WaitBudget`）。
+///
+/// 超过它就还是照旧断开（`4006`）：那说明额度配得比回填速度还紧，等下去只会把连接挂死。
+/// 这个数其实由**客户端**定，不是由我们定：等待期间我们**不读**这条连接、靠 TCP 背压当
+/// 限速，而客户端每一次 `sink.send` 外面套着 `SEND_TIMEOUT`（10 秒，见 `pair/manager.rs`）
+/// ——等过 10 秒，客户端看到的是「发送超时」并把整条会话重启，那比一句说得清的 `4006` 差
+/// 得多（原因看不见，用户只会看到反复重连）。5 秒给「帧本身还要传一会儿」留了余量，同时
+/// 远小于中继自己的空闲回收（公益档 180 秒 / 完全档 300 秒，都是 4005）与客户端等中继
+/// Pong 的窗口（`2 × 心跳` = 120 秒）。
+///
+/// 它管的是**整帧**而不是单轮：同一把钥匙上还有别的会话在抢额度时，每一轮等待都合法、却
+/// 能一直睡下去，所以累计等待由 `WaitBudget` 扣这份预算（见 `serve` 的读循环；扣的是**实际
+/// 睡的那个数**，含下面那个下限）。
+const KEY_BUDGET_WAIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// 等待的最小步长：差几纳秒时 `Duration::from_secs_f64` 会截断成 0，不兜一下就是空转。
+///
+/// 它同时会被算进 [`WaitBudget`] 的账（见那里的注释）：预算钉的是墙钟上界，所以每轮实地
+/// 睡出去多少就扣多少，不能只扣「报出来的等待」。
+const KEY_BUDGET_WAIT_FLOOR: Duration = Duration::from_millis(1);
+
+/// [`Bucket::wait_for`] 能报出来的时长上限。
+///
+/// 只为挡住天文数字（`Duration::from_secs_f64` 在超出 `u64::MAX` 秒时会 panic），所以它
+/// **必须**大于 `KEY_BUDGET_WAIT_LIMIT`：不然「要等很久」会被夹到恰好等于等待上限，
+/// 于是每一轮都等到上限、又还是装不下，变成永远等下去。
+const KEY_BUDGET_WAIT_REPORT_CAP_SECS: f64 = 86_400.0;
+
 /// 「连接数已达上限」那行日志的抑制窗口。
 ///
 /// 走到那一步说明服务器已经满负荷，而满负荷时连接尝试只会更多——不抑制的话这行会自己把
@@ -271,15 +299,43 @@ impl Bucket {
         self.frames >= 0.0 && self.chunks >= 0.0 && self.bytes >= 0.0
     }
 
-    /// 把 [`Self::take`] 刚扣掉的那笔还回去。
+    /// 这一笔**现在**装不下时，还要等多久才装得下（`None` = 等多久都装不下）。
     ///
-    /// 只有**不随连接消失**的桶用得上（公益档那把钥匙的预算）：它记的账跨连接，所以
-    /// 「先扣再判、不回滚」会一直挂在那里（每次「重连 + 发一帧」都多记一笔），而按连接的
-    /// 桶不需要它——那个桶与连接同生共死，欠账跟着连接一起没了。
-    fn refund(&mut self, frames: f64, chunks: f64, bytes: f64) {
-        self.frames += frames;
-        self.chunks += chunks;
-        self.bytes += bytes;
+    /// 与 [`Self::take`] 的判据完全对称（三维都要 `>= 0`），差别是它**不扣、也不**把「已经
+    /// 过去的那段时间」写回桶里：调用方拿到时长自己等，等完再真的扣一次。之所以需要它，
+    /// 是因为钥匙那份预算**用完不该断连接**——回填速度本身就是限速，等一等就能接着传
+    /// （见 `Relay::allow`）。
+    ///
+    /// `None` 只在「这一笔要的量超过桶的容量」时出现：那件事等多久都不会变，只能拒绝。
+    fn wait_for(&self, now: Instant, frames: f64, chunks: f64, bytes: f64) -> Option<Duration> {
+        let quota = self.quota;
+        let elapsed = now.duration_since(self.updated_at).as_secs_f64();
+
+        let seconds = |cap: f64, rate: f64, have: f64, need: f64| -> Option<f64> {
+            let missing = need - (have + elapsed * rate).min(cap);
+
+            if missing <= 0.0 {
+                return Some(0.0);
+            }
+
+            // 容量比要的量还小（或者这一维根本不补水）：等多久都装不下
+            if need > cap || rate <= 0.0 {
+                return None;
+            }
+
+            Some(missing / rate)
+        };
+
+        let frames = seconds(quota.frames_cap, quota.frames_rate, self.frames, frames)?;
+        let chunks = seconds(quota.chunks_cap, quota.chunks_rate, self.chunks, chunks)?;
+        let bytes = seconds(quota.bytes_cap, quota.bytes_rate, self.bytes, bytes)?;
+
+        Some(Duration::from_secs_f64(
+            frames
+                .max(chunks)
+                .max(bytes)
+                .min(KEY_BUDGET_WAIT_REPORT_CAP_SECS),
+        ))
     }
 
     /// 把欠账钉在下界上（只抬不压）。
@@ -297,8 +353,9 @@ impl Bucket {
 /// 一个连接被限流拦下时，是**哪个桶**不够了。
 ///
 /// 分开是因为这两件事该说不同的话：`Connection` 是「你自己这一秒发太快了」，缓一下就好；
-/// `KeyBudget` 是「这台服务器发给你的那把钥匙，这一小时的额度用完了」——它不是这一帧
-/// 的问题，等到下一小时才有用。关闭码也跟着分开（`1008` / `4006`），客户端才能给出两句
+/// `KeyBudget` 是「这台服务器发给你的那把钥匙，额度用完得等了」——它不是这一帧的问题，
+/// 而且**等不起**（见 `KEY_BUDGET_WAIT_LIMIT`：要么这一帧比整份额度还大，要么回填慢到
+/// 等下去只会把连接挂死）。关闭码也跟着分开（`1008` / `4006`），客户端才能给出两句
 /// 不同的话，而不是一句笼统的「格式错误」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Limited {
@@ -324,6 +381,74 @@ impl Limited {
             Self::Connection => close_code::PROTOCOL_ERROR,
             Self::KeyBudget => close_code::KEY_BUDGET,
         }
+    }
+}
+
+/// 一帧的准入结果（见 `Relay::allow`）。
+///
+/// 「要不要等」与「要不要断开」是两件事，所以这里有三个答案：**钥匙**那份预算用完了是
+/// **等**（回填速度就是限速），而连接自己那一档、以及「等下去也没有意义」的两件事才是断开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Allowance {
+    /// 现在就放行
+    Pass,
+    /// 现在装不下，但等这么久之后就能装下
+    Wait(Duration),
+    /// 这一帧发不出去：断开，`limited` 说明是哪个桶、用哪个关闭码
+    Refuse(Limited),
+}
+
+impl Allowance {
+    /// 把「要不要等」与**整帧**的等待预算合起来（见 [`WaitBudget`]）：预算够就返回**实际该睡**
+    /// 的时长，不够就换成「等不起」的拒绝（4006）。
+    ///
+    /// 抽成一个方法是为了让这一步能在单测里直接跑：留在读循环里就只能搭两条真连接、靠「谁先
+    /// 醒来谁拿额度」的竞态去撞，撞到还要五秒以上。
+    fn step(self, budget: &mut WaitBudget) -> Self {
+        match self {
+            Self::Wait(wait) => match budget.take(wait) {
+                Some(wait) => Self::Wait(wait),
+                None => Self::Refuse(Limited::KeyBudget),
+            },
+            other => other,
+        }
+    }
+}
+
+/// 一帧的**总**等待预算（见 `KEY_BUDGET_WAIT_LIMIT`）。
+///
+/// 只看「这一轮要等多久」不够：同一把钥匙上若还有别的会话在持续吃额度，被压住的这条每轮
+/// 都只等一小会儿（每轮都合法），却会一直睡下去——既不放行、也不 `4006`，而且内层等待不
+/// 回到外层 `select!`，空闲回收在这期间也碰不到它。所以按**整帧**扣一份总预算。
+///
+/// 扣的必须**就是**调用方接下来会睡的那个时长（所以下限 [`KEY_BUDGET_WAIT_FLOOR`] 在这里
+/// 就抬好）：不然「报出来不到 1 毫秒、实际每轮睡 1 毫秒」的那些轮次每轮都少扣一点，累计
+/// 睡出来的墙钟时间会超过这份预算——预算是拿来钉住墙钟上界的，不能只钉住报出来的数字。
+#[derive(Debug)]
+struct WaitBudget {
+    left: Duration,
+}
+
+impl WaitBudget {
+    fn new(limit: Duration) -> Self {
+        Self { left: limit }
+    }
+
+    /// 扣掉这一次要等的时间（返回值就是**实际该睡多久**，已经抬到 [`KEY_BUDGET_WAIT_FLOOR`]）；
+    /// 不够就 `None`（调用方据此走 `4006`）。
+    ///
+    /// 正好等于剩余预算也放行：`KEY_BUDGET_WAIT_LIMIT` 说的是「最多等这么久」，不是
+    /// 「必须小于」。
+    fn take(&mut self, wait: Duration) -> Option<Duration> {
+        let wait = wait.max(KEY_BUDGET_WAIT_FLOOR);
+
+        if wait > self.left {
+            return None;
+        }
+
+        self.left -= wait;
+
+        Some(wait)
     }
 }
 
@@ -492,6 +617,12 @@ pub struct RelayOptions {
     pub server_keys: Vec<ServerKey>,
     /// 完全档**每把钥匙**的滚动预算（`PAIR_FULL_KEY_BUDGET_BYTES`，`None` = 不设这一层）
     pub full_key_budget: Option<f64>,
+    /// 每把钥匙那份预算按多长时间回填（默认 [`KEY_BUDGET_WINDOW_SECS`]，一小时）。
+    ///
+    /// 它同时就是长期速率：桶先装一次量、之后按这个窗口回填（用完是**限速**，不是断开，
+    /// 见 `Relay::allow`）。写成一个可改的字段而不是直接用常量，是为了让测试能把窗口压到
+    /// 一秒，把那条等待的路跑成一条快用例；真部署永远是这个常量。
+    pub key_budget_window: Duration,
     /// 限时 TURN 凭据的共享密钥（`PAIR_TURN_SECRET`）。`None` = `PAIR_ICE_SERVERS` 原样透传，
     /// 也就是用那份配置里写死的静态凭据（与旧版行为一致）
     pub turn_secret: Option<String>,
@@ -528,6 +659,7 @@ impl Default for RelayOptions {
             stun_port: None,
             server_keys: Vec::new(),
             full_key_budget: Some(DEFAULT_FULL_KEY_BUDGET_BYTES),
+            key_budget_window: Duration::from_secs_f64(KEY_BUDGET_WINDOW_SECS),
             turn_secret: None,
             turn_ttl: Duration::from_secs(protocol::DEFAULT_TURN_TTL_SECS),
             trust_proxy: false,
@@ -750,7 +882,11 @@ impl Relay {
             Tier::Public => self.options.public_key_budget,
         }?;
 
-        Some(Quota::bytes_only(budget, budget / KEY_BUDGET_WINDOW_SECS))
+        // 窗口写 0 会算出 `inf` 的回填速度，那一层就**静默失效**了（限额全没），所以兜到
+        // 一秒：它不是部署配置（真部署固定一小时），只有测试会改它。
+        let window = self.options.key_budget_window.as_secs_f64().max(1.0);
+
+        Some(Quota::bytes_only(budget, budget / window))
     }
 
     /// 这一档的空闲回收窗口（`None` = 不回收）。判据两档一样，只是窗口各配各的。
@@ -1091,7 +1227,7 @@ impl Relay {
         let window = self.window_for(tier);
         let mut idle_deadline = window.map(|window| tokio::time::Instant::now() + window);
 
-        loop {
+        'session: loop {
             // 把截止时刻拷出来（`Option<Instant>` 是 `Copy`）：`select!` 那一支要借它，
             // 另一支要可变借 `idle_deadline`，同一个变量同时借两次过不了借用检查
             let idle_at = idle_deadline;
@@ -1211,22 +1347,63 @@ impl Relay {
                     };
                     let frame_bytes = bytes.len() as f64;
 
-                    if let Some(limit) = self
-                        .allow(id, tier, key_index, 1.0, chunks, frame_bytes)
-                        .await
-                    {
+                    let mut limited = None;
+                    // 整帧的总等待预算，不是单轮：同一把钥匙上的别的会话在抢额度时，每一轮
+                    // 都等得着、却能一直睡下去（见 `WaitBudget`）
+                    let mut wait_budget = WaitBudget::new(KEY_BUDGET_WAIT_LIMIT);
+
+                    // 额度：装得下就转发，装不下就**等**（钥匙那份预算用完了只是限速——回填
+                    // 速度就是速度上限；见 `Allowance`）。等待期间**不读**这条连接，TCP 背压
+                    // 自然会把发送方压到同一个速度，这正是限速本身。
+                    loop {
+                        // 「整帧等过头也是等不起」这一步在 `Allowance::step` 里：预算不够就
+                        // 直接换成 4006（再等下去，客户端会先以「发送超时」的名义把会话重启，
+                        // 原因反而看不见，见 `KEY_BUDGET_WAIT_LIMIT`）
+                        let allowance = self
+                            .allow(id, tier, key_index, 1.0, chunks, frame_bytes)
+                            .await
+                            .step(&mut wait_budget);
+
+                        match allowance {
+                            Allowance::Pass => break,
+                            Allowance::Refuse(limit) => {
+                                limited = Some(limit);
+
+                                break;
+                            }
+                            Allowance::Wait(wait) => {
+                                // `wait` 就是实际该睡的时长（下限已经在 `take` 里抬过）。
+                                // 等的时候只认「被顶替」这一个信号：`idle` 交给下一轮
+                                // `select!`（等待有上界，见 `WaitBudget`）
+                                tokio::select! {
+                                    _ = &mut ejected => break 'session,
+                                    _ = tokio::time::sleep(wait) => {}
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(limit) = limited {
                         // 「这把钥匙的预算用完了」和「你自己发太快」是两件事，而关闭帧里的
                         // 原因客户端只按关闭码翻译、看不到。这里替部署者记一行：不然
                         // 「我的额度突然没了」在日志里只剩一条「会话已释放」，谁也说不清
                         // 是哪把钥匙、更看不出是不是有人在夹带。
+                        //
+                        // 这一行只在「等不起」时才出现（见 `KEY_BUDGET_WAIT_LIMIT`）：额度
+                        // 用完本身是**限速**（等一等接着传，连日志都不会有），这里说明的是
+                        // 「等下去也没有意义」——回填速度相对这一帧太小，再等只是把连接挂死。
                         if limit == Limited::KeyBudget {
                             println!(
-                                "[{}] {}第 {} 把钥匙的预算已用完（device {device_id}）：\
-                                 这条连接被关掉；拿同一把钥匙的别的会话也会跟着被拒，\
-                                 要等回填（每小时一份额度）",
+                                "[{}] {}第 {} 把钥匙的额度已用完，而且等不起（device {device_id}）：\
+                                 {} 秒内等不到这一帧——这一帧比整份额度还大，\
+                                 或者回填慢到等下去只会把连接挂死。这条连接被关掉；\
+                                 拿同一把钥匙的别的会话一样发不出去。要么等额度回填，\
+                                 要么换一把钥匙，要么把额度（PAIR_FULL_KEY_BUDGET_BYTES / \
+                                 PAIR_PUBLIC_KEY_BUDGET_BYTES）调大",
                                 room_fingerprint(&room_id),
                                 tier_text(tier),
-                                key_index + 1
+                                key_index + 1,
+                                KEY_BUDGET_WAIT_LIMIT.as_secs()
                             );
                         }
 
@@ -1493,11 +1670,20 @@ impl Relay {
         }
     }
 
-    /// 扣这一帧的额度。`None` = 放行；`Some(_)` = 被哪个桶拦下了（调用方据此关连接）。
+    /// 这一帧能不能放行、要不要等、还是该断开（见 `Allowance`）。
     ///
-    /// 公益档要过两道：这条连接自己的桶（按档位建的那个），和**这把钥匙**的滚动预算。
-    /// 顺序是「先自己的、后钥匙的」，而且钥匙那份拒掉的一笔要立刻还回去——它记的账不随
-    /// 连接消失，不还就等于每拒一帧都白记一笔（见 `Bucket::refund`）。
+    /// 两条闸的分工：
+    ///
+    /// - **这条连接自己**那一档（按档位建、容量 = 速率）仍然**断开**。它是「这一秒发太多」
+    ///   的自保闸，诚实客户端按自己的节奏走、碰不到它；而在这里等待也没有意义——一秒之后
+    ///   它还是发这么快。
+    /// - **这把钥匙**的滚动预算改成**等待**。它的回填速度本身就是限速（那个桶按
+    ///   `key_budget_window` 回填，默认一小时），所以「等一等再接着发」正是要的行为：
+    ///   大文件因此能慢慢传完，而不是被 `4006` 断开。只有「等下去也没有意义」的两件事仍然
+    ///   拒绝——这一帧要的量超过整个桶的容量，或者要等超过 `KEY_BUDGET_WAIT_LIMIT`。
+    ///
+    /// 两笔额度**一起扣**：账目要等于真的转发出去的字节，所以等待那条路上什么都没先扣
+    /// （否则重试一次就扣两次）。
     async fn allow(
         &self,
         id: u64,
@@ -1506,39 +1692,50 @@ impl Relay {
         frames: f64,
         chunks: f64,
         bytes: f64,
-    ) -> Option<Limited> {
+    ) -> Allowance {
         let budget = self.key_budget_quota(tier);
         let mut state = self.state.lock().await;
         let now = Instant::now();
+        let State {
+            buckets,
+            key_budgets,
+            ..
+        } = &mut *state;
 
         // 已经不在名单里的连接不再有桶：`entry().or_insert_with()` 会把桶重建出来，
         // 被摘掉的对端再发一帧就永久留下一条残留。这里直接拒绝，让读循环退出。
-        let Some(bucket) = state.buckets.get_mut(&id) else {
-            return Some(Limited::Connection);
+        let Some(connection) = buckets.get_mut(&id) else {
+            return Allowance::Refuse(Limited::Connection);
         };
 
-        if !bucket.take(now, frames, chunks, bytes) {
-            return Some(Limited::Connection);
+        if connection.wait_for(now, frames, chunks, bytes) != Some(Duration::ZERO) {
+            return Allowance::Refuse(Limited::Connection);
         }
 
-        // 再叠一道「这把钥匙的预算」（额度按档位取，见 `key_budget_quota`）；
         // 这一档没配这一层（`None`）到这儿就是放行
-        if let Some(quota) = budget {
-            let budget = state
-                .key_budgets
-                .entry(key_index)
-                .or_insert_with(|| Bucket::new(quota, now));
+        let Some(quota) = budget else {
+            connection.take(now, frames, chunks, bytes);
 
-            if !budget.take(now, frames, chunks, bytes) {
-                // 这一帧不会被转发出去，那把钥匙上就不该留这笔账：这张表不随连接消失，
-                // 欠账会一份份攒起来（见 `Bucket::refund`）
-                budget.refund(frames, chunks, bytes);
+            return Allowance::Pass;
+        };
 
-                return Some(Limited::KeyBudget);
-            }
+        let key = key_budgets
+            .entry(key_index)
+            .or_insert_with(|| Bucket::new(quota, now));
+        let wait = key.wait_for(now, frames, chunks, bytes);
+
+        if wait == Some(Duration::ZERO) {
+            connection.take(now, frames, chunks, bytes);
+            key.take(now, frames, chunks, bytes);
+
+            return Allowance::Pass;
         }
 
-        None
+        match wait {
+            Some(wait) if wait <= KEY_BUDGET_WAIT_LIMIT => Allowance::Wait(wait),
+            // `None` = 额度配得比一帧还小；`Some(更久)` = 等不起。两者都只能断开
+            _ => Allowance::Refuse(Limited::KeyBudget),
+        }
     }
 
     /// 这个 IP 现在还能不能做一次握手（`PAIR_HANDSHAKE_FAILURES_PER_MINUTE`）。
@@ -2085,6 +2282,9 @@ mod tests {
         /// 额外的服务器钥匙（`(档位, 密码)`）：多把钥匙那几条用例要它
         extra_keys: Vec<(Tier, &'static str)>,
         trust_proxy: bool,
+        /// 钥匙那份预算的回填窗口（真部署固定是一小时；单测压到一秒，好把「等待」那条路
+        /// 跑成一条快用例）
+        key_budget_window: Option<Duration>,
     }
 
     fn relay_with(options: Options) -> Arc<Relay> {
@@ -2092,6 +2292,9 @@ mod tests {
 
         Relay::new(RelayOptions {
             limits: Limits::default(),
+            key_budget_window: options
+                .key_budget_window
+                .unwrap_or(defaults.key_budget_window),
             public_limits: defaults.public_limits,
             public_burst_frames: options
                 .public_burst_frames
@@ -2429,21 +2632,151 @@ mod tests {
         assert_eq!(admitted_after_refill, 29);
     }
 
-    /// 还回去的那一笔就真的回到池子里了：合计桶不随连接消失，所以「被拒的帧不留账」
-    /// 只能靠 [`Bucket::refund`] 做到（按连接的桶不需要它，那个桶跟连接一起没）
+    /// [`Bucket::wait_for`] 与 [`Bucket::take`] 的判据对称：装得下就是 0，要等就报时长，
+    /// 容量不够就是 `None`；而且它**只问不扣**，问过之后桶的状态一点没变。
     #[test]
-    fn a_refund_puts_the_tokens_back() {
+    fn wait_for_is_the_mirror_of_take() {
         let start = Instant::now();
-        let mut bucket = Bucket::new(Quota::steady(Limits::default()), start);
+        let quota = Quota::bytes_only(1_000.0, 100.0);
+        let mut bucket = Bucket::new(quota, start);
 
-        assert!(bucket.take(start, 1.0, 0.0, 1_024.0));
-        assert!(bucket.take(start, 1.0, 0.0, 1_024.0));
-        assert!(!bucket.take(start, 1.0, 0.0, Limits::default().bytes_per_second));
+        // 满桶：现在就装得下
+        assert_eq!(
+            bucket.wait_for(start, 1.0, 0.0, 1_000.0),
+            Some(Duration::ZERO)
+        );
 
-        // 把刚才那笔大的还回去，桶回到「扣两次小的」之后的状态
-        bucket.refund(1.0, 0.0, Limits::default().bytes_per_second);
+        assert!(bucket.take(start, 1.0, 0.0, 1_000.0));
 
-        assert!(bucket.take(start, 1.0, 0.0, 1_024.0));
+        // 花光之后：差 1_000 字节、每秒回填 100，就是要等 10 秒
+        assert_eq!(
+            bucket.wait_for(start, 1.0, 0.0, 1_000.0),
+            Some(Duration::from_secs(10))
+        );
+        // 中途问一次：回填了一半，等的时间也减半
+        assert_eq!(
+            bucket.wait_for(start + Duration::from_secs(5), 1.0, 0.0, 1_000.0),
+            Some(Duration::from_secs(5))
+        );
+        // 过了一个回填窗口就补满了
+        assert_eq!(
+            bucket.wait_for(start + Duration::from_secs(10), 1.0, 0.0, 1_000.0),
+            Some(Duration::ZERO)
+        );
+        // 比容量还大的一笔：等多久都装不下（`None` 唯一的来源）
+        assert_eq!(bucket.wait_for(start, 1.0, 0.0, 1_001.0), None);
+
+        // 「只问不扣」也一并钉住（`allow` 的重试就是靠它：问完再等，等到了才真扣一次，
+        // 不然重试一次就多扣一笔）
+        let fresh = Bucket::new(quota, start);
+        let _ = fresh.wait_for(start + Duration::from_secs(5), 1.0, 0.0, 500.0);
+
+        assert_eq!(fresh.bytes, 1_000.0, "`wait_for` 一个字节都不该扣");
+        assert_eq!(
+            fresh.updated_at, start,
+            "`wait_for` 也不该推进 `updated_at`"
+        );
+    }
+
+    /// [`WaitBudget`] 管的是**整帧**能等多久：每轮扣一次，扣不动就是「等不起」（走 4006）。
+    ///
+    /// 没有它的话，同一把钥匙上还有别的会话在抢额度时，被压住的这条每轮都只等一小会儿、
+    /// 却会一直睡下去——既不放行也不拒绝；而且它待在 `serve` 的内层循环里，空闲回收在这
+    /// 期间也碰不到它。
+    ///
+    /// 扣的就是**实际该睡**的时长（下限在这里抬好），所以「报出来的等待不到 1 毫秒」的那些
+    /// 轮次也各扣足 1 毫秒：不然上界只钉住报出来的数字，累计睡出来的墙钟时间可以远超预算。
+    #[test]
+    fn a_wait_budget_bounds_the_whole_frame() {
+        // 正好等于预算是允许的（说的是「最多等这么久」，不是「必须小于」）
+        let mut exact = WaitBudget::new(KEY_BUDGET_WAIT_LIMIT);
+
+        assert_eq!(
+            exact.take(KEY_BUDGET_WAIT_LIMIT),
+            Some(KEY_BUDGET_WAIT_LIMIT)
+        );
+        assert_eq!(exact.take(Duration::from_millis(1)), None, "预算已经用光");
+
+        // 分几次扣满也一样
+        let mut split = WaitBudget::new(Duration::from_secs(5));
+
+        assert_eq!(
+            split.take(Duration::from_secs(2)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            split.take(Duration::from_secs(2)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(split.take(Duration::from_secs(2)), None, "只剩 1 秒");
+        assert_eq!(
+            split.take(Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(split.take(Duration::ZERO), None, "用光之后连下限都扣不动");
+
+        // 零等待也扣下限：返回值就是调用方要睡的那个数
+        let mut floor = WaitBudget::new(Duration::from_millis(3));
+
+        assert_eq!(floor.take(Duration::ZERO), Some(KEY_BUDGET_WAIT_FLOOR));
+        assert_eq!(
+            floor.take(Duration::from_micros(1)),
+            Some(KEY_BUDGET_WAIT_FLOOR)
+        );
+        assert_eq!(
+            floor.take(KEY_BUDGET_WAIT_FLOOR),
+            Some(KEY_BUDGET_WAIT_FLOOR)
+        );
+        assert_eq!(floor.take(Duration::ZERO), None, "3 毫秒刚好用光");
+
+        // 「每轮只要等几微秒」也不会把一帧拖成无穷：那些轮次各按 1 毫秒记账，
+        // 所以轮数与累计睡的时间都是有界的
+        let mut tiny = WaitBudget::new(Duration::from_secs(5));
+        let mut slept = Duration::ZERO;
+        let mut rounds = 0_u64;
+
+        while let Some(wait) = tiny.take(Duration::from_micros(1)) {
+            slept += wait;
+            rounds += 1;
+        }
+
+        assert_eq!(rounds, 5_000, "每轮都得扣足下限，轮数因此有界");
+        assert_eq!(slept, Duration::from_secs(5), "累计睡的时间不超过预算");
+    }
+
+    /// 「整帧等过头」这一步真的会把等待换成拒绝（4006），而不是接着睡或直接放行。
+    ///
+    /// 这就是读循环里 `step` 那一次的决策：单轮等待都在上限之内，但一轮轮累计过去，
+    /// 预算用光的那一轮必须变成 `Refuse(Limited::KeyBudget)`。`Pass` 与别的 `Refuse` 都要
+    /// 原样穿过（它们与等待无关）。
+    #[test]
+    fn a_spent_wait_budget_turns_a_wait_into_a_refusal() {
+        let mut budget = WaitBudget::new(Duration::from_secs(5));
+        let wait = Duration::from_secs(2);
+
+        // 前两轮等得着（各自都在上限之内）
+        assert_eq!(
+            Allowance::Wait(wait).step(&mut budget),
+            Allowance::Wait(wait)
+        );
+        assert_eq!(
+            Allowance::Wait(wait).step(&mut budget),
+            Allowance::Wait(wait)
+        );
+
+        // 只剩 1 秒，换不成「接着睡」——这一帧到此为止
+        assert_eq!(
+            Allowance::Wait(wait).step(&mut budget),
+            Allowance::Refuse(Limited::KeyBudget),
+            "预算用光之后不能再等"
+        );
+
+        // 另外两个答案不受预算影响
+        assert_eq!(Allowance::Pass.step(&mut budget), Allowance::Pass);
+        assert_eq!(
+            Allowance::Refuse(Limited::Connection).step(&mut budget),
+            Allowance::Refuse(Limited::Connection)
+        );
     }
 
     #[test]
@@ -2925,7 +3258,7 @@ mod tests {
                         64.0
                     )
                     .await,
-                None
+                Allowance::Pass
             );
         }
         assert_eq!(
@@ -2939,7 +3272,7 @@ mod tests {
                     64.0
                 )
                 .await,
-            Some(Limited::Connection)
+            Allowance::Refuse(Limited::Connection)
         );
 
         // 另一个 socket 有自己的桶
@@ -2954,7 +3287,7 @@ mod tests {
                     64.0
                 )
                 .await,
-            None
+            Allowance::Pass
         );
 
         // 已经摘掉的连接不再有桶，也不会被 `entry().or_insert_with()` 重新造出来
@@ -2970,7 +3303,7 @@ mod tests {
                     64.0
                 )
                 .await,
-            Some(Limited::Connection)
+            Allowance::Refuse(Limited::Connection)
         );
     }
 
@@ -2978,8 +3311,13 @@ mod tests {
     ///
     /// 按连接、按房间、按 IP 记账都能被绕开（房间是客户端用配对密码推出来的、一空就没了；
     /// 换配对密码就是新房间；IP 会连坐同一个 NAT，在 IPv6 上还软），只有钥匙是部署者发出去
-    /// 的、拿钥匙的人换不掉。这一条把三件事一起钉住：同一把钥匙跨**会话**共用、另一把钥匙
-    /// 自己那一份不动、部署者那一档完全不扣这个桶。
+    /// 的、拿钥匙的人换不掉。这一条把四件事一起钉住：同一把钥匙跨**会话**共用、另一把钥匙
+    /// 自己那一份不动、部署者那一档完全不扣这个桶、以及**额度用完不会当场断**。
+    ///
+    /// 这里的额度取得极小（一次性 1000 字节），于是回填速率只有 0.28 B/s：一帧 900 字节
+    /// 要等十几分钟，远超 `KEY_BUDGET_WAIT_LIMIT`。所以这一条看到的正是那个「等不起」的
+    /// 分支——仍然拒。而「等一小会儿接着传」那条路要真跑出来就得把回填窗口压下来，
+    /// 那是会话层单测才做得到的事（见 `a_spent_key_budget_waits_instead_of_cutting`）。
     #[tokio::test]
     async fn the_public_budget_is_per_key_not_per_room() {
         let relay = relay_with(Options {
@@ -2989,7 +3327,8 @@ mod tests {
             public_tier: true,
             // 第二把公益钥匙（键的顺序是「完全档那一批，然后公益档那一批」，所以它是第 3 把）
             extra_keys: vec![(Tier::Public, SECOND_PUBLIC_KEY)],
-            // 预算小到一眼能数清：1000 字节一次性，回填速率是它的 1/3600，测试里等于没有
+            // 预算小到一眼能数清：1000 字节一次性（回填速率 0.28 B/s，测试里约等于没有，
+            // 所以「等」一定超上限——这正是这条用例要的「等不起」那一支）
             public_key_budget: Some(1000.0),
             ..Options::default()
         });
@@ -3008,14 +3347,15 @@ mod tests {
             relay
                 .allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0)
                 .await,
-            None
+            Allowance::Pass
         );
         assert_eq!(
             relay
                 .allow(id_b, Tier::Public, public, 1.0, 0.0, 900.0)
                 .await,
-            Some(Limited::KeyBudget),
-            "同一把钥匙跨会话共用一个桶：A 花掉之后 B 也发不出去（B 自己那一份还有的是）"
+            Allowance::Refuse(Limited::KeyBudget),
+            "同一把钥匙跨会话共用一个桶：A 花掉之后 B 也得等（B 自己那一份还有的是），\
+             而这里等不起，所以是拒绝"
         );
 
         // 另一把公益钥匙自己那一份没被动过：它是**另一个**会话，且换了一把钥匙
@@ -3027,7 +3367,7 @@ mod tests {
             relay
                 .allow(id_other, Tier::Public, second, 1.0, 0.0, 900.0)
                 .await,
-            None,
+            Allowance::Pass,
             "换一把钥匙就是另一份预算，不该被前一把的欠账连坐"
         );
 
@@ -3044,17 +3384,18 @@ mod tests {
                         64.0
                     )
                     .await,
-                None
+                Allowance::Pass
             );
         }
     }
 
-    /// 被预算拒掉的那一帧**不在钥匙上留账**。
+    /// 没转发出去的那一帧**不在钥匙上留账**。
     ///
     /// 钥匙那张表不随连接消失，所以「先扣再判、不回滚」在这里会变成会累加的欠账（每次
-    /// 「重连 + 发一帧」都多记一笔）。这一条用字节那一维把它钉住：剩余 100 字节时，一个
-    /// 900 字节的帧该被拒，而那笔钱必须立刻还回来——紧接着那个 50 字节的小帧装得下剩下的
-    /// 100，就该放行。没有 `refund` 的话它会被误伤。
+    /// 「重连 + 发一帧」都多记一笔）。现在这件事是**结构性**的：扣减只发生在真的要转发
+    /// 那一刻（`Relay::allow` 先问 `wait_for`，两条不转发的路都不扣），没有「先扣了再还」
+    /// 这回事。这一条把它钉在行为上——剩余 100 字节时，一个 900 字节的帧要等十几分钟
+    /// （超过等待上限，于是被拒），而紧接着那个 50 字节的小帧仍然装得下剩下的那 100。
     #[tokio::test]
     async fn a_frame_the_budget_refuses_leaves_no_debt() {
         let relay = relay_with(Options {
@@ -3073,21 +3414,80 @@ mod tests {
             relay
                 .allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0)
                 .await,
-            None
+            Allowance::Pass
         );
         assert_eq!(
             relay
                 .allow(id_a, Tier::Public, public, 1.0, 0.0, 900.0)
                 .await,
-            Some(Limited::KeyBudget),
-            "只剩 100 字节，900 的帧装不下"
+            Allowance::Refuse(Limited::KeyBudget),
+            "只剩 100 字节，900 的帧要等十几分钟——等不起"
         );
         assert_eq!(
             relay
                 .allow(id_a, Tier::Public, public, 1.0, 0.0, 50.0)
                 .await,
-            None,
-            "被拒的那笔已经还回去了，50 字节的帧仍然装得下"
+            Allowance::Pass,
+            "被拒的那笔根本没扣过，50 字节的帧仍然装得下剩下的 100"
+        );
+    }
+
+    /// 钥匙那份额度用完了是**等到装得下**，不是断开——回填速度就是速度上限。
+    ///
+    /// 这一条把回填窗口压到一秒，好让「等」在测试里跑得出来：1000 字节的额度一帧就花光，
+    /// 紧接着那帧要先等一小会儿才装得下，而那个时长落在 `KEY_BUDGET_WAIT_LIMIT` 之内，
+    /// 因此报的是 `Allowance::Wait`（不是 `Refuse`）；真等过去之后同一帧就该放行——大文件
+    /// 因此能慢慢传完，而不是被 `4006` 断在半路。最后钉住 `wait_for` 的 `None`：比整份额度
+    /// 还大的一帧，等多久都不会变，只能拒绝。
+    #[tokio::test]
+    async fn a_spent_key_budget_waits_instead_of_cutting() {
+        let relay = relay_with(Options {
+            max_sessions: 20,
+            max_public_sessions: 10,
+            public_tier: true,
+            public_key_budget: Some(1_000.0),
+            // 一秒回填一整份：0.8 秒的等待因此是个毫秒级的数，用例不会真的坐等
+            key_budget_window: Some(Duration::from_secs(1)),
+            ..Options::default()
+        });
+        let (a_tx, _a_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (id, _, _) = join_ok_tier(&relay, ROOM_A, "token-a", "a", &a_tx, Tier::Public).await;
+        let public = key_index_for(&relay, Tier::Public);
+
+        // 第一帧 900 字节：额度花得只剩 100
+        assert_eq!(
+            relay.allow(id, Tier::Public, public, 1.0, 0.0, 900.0).await,
+            Allowance::Pass
+        );
+
+        // 第二帧差 800 字节，按每秒 1000 回填就是 0.8 秒——在等待上限之内，所以是「等」
+        let wait = match relay.allow(id, Tier::Public, public, 1.0, 0.0, 900.0).await {
+            Allowance::Wait(wait) => wait,
+            other => panic!("额度用完该是等待（限速），不是 {other:?}"),
+        };
+
+        assert!(
+            wait > Duration::ZERO && wait <= KEY_BUDGET_WAIT_LIMIT,
+            "0.8 秒的等待该落在等待上限之内，实际 {wait:?}（上限 {:?}）",
+            KEY_BUDGET_WAIT_LIMIT
+        );
+
+        // 等够了就装得下：这就是限速本身——慢一点，但不会被切断
+        tokio::time::sleep(wait).await;
+
+        assert_eq!(
+            relay.allow(id, Tier::Public, public, 1.0, 0.0, 900.0).await,
+            Allowance::Pass,
+            "等过去之后同一帧就该放行"
+        );
+
+        // 一帧比整份额度还大：`wait_for` 报 `None`，等多久都没意义 → 拒
+        assert_eq!(
+            relay
+                .allow(id, Tier::Public, public, 1.0, 0.0, 1_001.0)
+                .await,
+            Allowance::Refuse(Limited::KeyBudget),
+            "比容量还大的一帧等不出来"
         );
     }
 
@@ -3746,20 +4146,21 @@ mod tests {
             .position(|key| key.verifier == crate::auth::server_verifier(SECOND_FULL_KEY))
             .expect("第二把完全钥匙");
 
-        // 1000 字节的预算：一帧 900 字节过，再来一帧就撞上
+        // 1000 字节的预算：一帧 900 字节过，再来一帧就要等十几分钟（回填 0.28 B/s），
+        // 超过等待上限，于是被拒
         assert_eq!(
             relay.allow(id, Tier::Full, first, 1.0, 0.0, 900.0).await,
-            None
+            Allowance::Pass
         );
         assert_eq!(
             relay.allow(id, Tier::Full, first, 1.0, 0.0, 900.0).await,
-            Some(Limited::KeyBudget)
+            Allowance::Refuse(Limited::KeyBudget)
         );
 
         // 另一把钥匙有自己的桶（「一把钥匙一个人」的另一面：额度不共享）
         assert_eq!(
             relay.allow(id, Tier::Full, second, 1.0, 0.0, 900.0).await,
-            None
+            Allowance::Pass
         );
 
         // `0` = 不设这一层：回到「只按连接自己的额度算」
@@ -3775,7 +4176,7 @@ mod tests {
             unlimited
                 .allow(b_id, Tier::Full, first, 1.0, 0.0, 900.0)
                 .await,
-            None
+            Allowance::Pass
         );
     }
 

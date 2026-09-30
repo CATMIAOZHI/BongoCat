@@ -984,9 +984,12 @@ async fn send_and_settle(client: &mut Client, message: Message) {
 /// 会话共用一个桶，另一把钥匙不受影响。
 ///
 /// 与上一条的区别：那一条是「这条连接自己发太快」（关 1008），这一条是「同一把钥匙的
-/// 两个**不同会话**合起来把它用光了」（关 4006）。它必须在真连接上验——`Config::relay_options`
-/// 有没有把这一项折进会话层、关闭码是不是 4006、另一把钥匙是不是真的不受影响，只有跑到
-/// 这一步才看得出来。
+/// 两个**不同会话**合起来把它用光了」。它必须在真连接上验——`Config::relay_options`
+/// 有没有把这一项折进会话层、另一把钥匙是不是真的不受影响，只有跑到这一步才看得出来。
+///
+/// 这一条的额度取得极小（2000 字节 ⇒ 回填只有约 0.55 B/s）：用完之后的等待要十几分钟，
+/// 超过 `KEY_BUDGET_WAIT_LIMIT`，也就是**等不起**——所以它仍然关 4006。额度用完只是
+/// **限速**那条路由下一条用例钉住（它把额度配成「正好一帧」，等待因此只有一秒多）。
 #[tokio::test]
 async fn the_public_key_budget_is_shared_by_two_sessions_of_one_key() {
     let mut config = public_config(20, 10, 4, None);
@@ -1048,6 +1051,64 @@ async fn the_public_key_budget_is_shared_by_two_sessions_of_one_key() {
     }
 
     expect_silence(&mut other, "拿另一把公益钥匙的连接").await;
+}
+
+/// 钥匙那份额度用完**不当场断**：等一小会儿接着传（这就是「用完限速」）。
+///
+/// 这一条必须在真连接上验：等待发生在 `Relay::serve` 的读循环里（等待期间**不读**这条
+/// 连接，TCP 背压就是限速本身），而单测只到 `Relay::allow` 那一层，看不到它接没接好。
+///
+/// 数字全是配出来的，没有为测试改生产代码：把额度设成**正好一帧 24 KiB**，那一发就把桶
+/// 花光；接着那个 14 字节的小帧这时要等 `3600 × 14 / 24590` ≈ 2 秒才装得下，仍在 5 秒
+/// 的等待上限之内。老行为会当场用 4006 关掉这条连接（对端也就永远收不到那一帧），新行为
+/// 是睡一下再把它转过去——所以这里既断言「转到了」，也断言「真的等了」。
+#[tokio::test]
+async fn a_spent_key_budget_slows_a_public_connection_instead_of_cutting_it() {
+    let big = frame(protocol::FRAME_KIND_SIGNAL, 24 * 1024);
+    let mut config = public_config(20, 10, 4, None);
+
+    // 额度正好等于这一帧：发完它，这把钥匙的桶就空了
+    config.public_key_budget = Some(big.len() as f64);
+
+    let address = start_relay_with_config(config).await;
+
+    // 同一个 Room 的两条公益连接：一条发、一条收（要看到「真的转过去了」）
+    let mut sender = connect_public(address, ROOM_A, TOKEN_A, "aaaa").await;
+    let mut peer = connect_public(address, ROOM_A, TOKEN_A, "bbbb").await;
+
+    next_json(&mut sender).await;
+    next_json(&mut peer).await;
+    // 后进来的那条上线时，先来的会收到一条公告
+    next_json(&mut sender).await;
+
+    send_and_settle(&mut sender, Message::Binary(big.clone().into())).await;
+
+    assert_eq!(next_binary(&mut peer).await, big, "第一帧该照常转发");
+
+    // 额度已经用完：这一帧不是被拒，而是等一小会儿之后被转发出去
+    let small = frame(protocol::FRAME_KIND_SIGNAL, 0);
+    let started = std::time::Instant::now();
+
+    sender
+        .send(Message::Binary(small.clone().into()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_binary(&mut peer).await,
+        small,
+        "额度用完只是限速：这一帧该等到装得下之后转过去，而不是把连接关掉"
+    );
+    // 而且它是**等到**才过去的：额度只剩 0、小帧 14 字节，按每秒 6.8 字节回填 ≈ 2 秒。
+    // 没有「等」这一环（比如把 `Allowance::Wait` 当成 `Pass`）的话这里立刻就到，断言会红
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "额度用完该被压到回填速度上（这一帧要等约 2 秒），实际只用了 {:?}",
+        started.elapsed()
+    );
+
+    // 连接还开着（真被 4006 关掉的话，这里立刻会收到那条关闭帧，而不是安静超时）
+    expect_silence(&mut sender, "额度用完之后的发送方").await;
 }
 
 /// **未鉴权的半开连接一条真实额度都不占**（审计里的 P0-1）。

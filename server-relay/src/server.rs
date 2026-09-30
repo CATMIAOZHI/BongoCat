@@ -509,6 +509,9 @@ impl Config {
             stun_port,
             server_keys: self.server_keys.clone(),
             full_key_budget: self.full_key_budget,
+            // 回填窗口不是配置项：它是一个内部常量（额度「一次装多少」与「长期多快」都由
+            // 它换算），只有会话层的单测会把窗口压到一秒（见 `RelayOptions::key_budget_window`）
+            key_budget_window: RelayOptions::default().key_budget_window,
             turn_secret: self.turn_secret.clone(),
             turn_ttl: self.turn_ttl,
             trust_proxy: self.trust_proxy,
