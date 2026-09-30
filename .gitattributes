@@ -1,0 +1,32 @@
+# 换行符口径（2026-09-30）：文本一律 LF。
+#
+# 仓库里的文本**一直是** LF——`git ls-files --eol` 全是 `i/lf`。Windows 上看到的 CRLF 只是
+# 本机 `core.autocrlf=true` 检出时写出来的，而且同一个文件被不同工具追加行时会变成
+# 「一半 CRLF、一半 LF」的混合文件（`server-relay/README.md`、`src-tauri/src/lib.rs` 之前
+# 就是这样）。把口径钉在仓库层面，就不必每台机器、每个编辑器各写一套，也不必在改
+# Markdown / `.env.example` / AGENTS.md 时手工保持 CRLF。
+#
+# 规则：文本 LF；Windows 脚本（`.bat` / `.cmd` / `.ps1`）例外，保持 CRLF。
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源：明确写出来，别让启发式偶尔猜错（猜错 = 整个文件被当文本转换，直接损坏）。
+# `src-tauri/nsis/installer.nsi` 是纯 ASCII、**必须 LF**（见 AGENTS.md），所以它走上面那条
+# 默认规则，不要给它加 CRLF 例外。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.wav binary
+*.flac binary
+*.moc3 binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary

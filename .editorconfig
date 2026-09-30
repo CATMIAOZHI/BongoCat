@@ -1,0 +1,23 @@
+# 编辑器端的同一套口径（仓库端的兜底是 `.gitattributes`）：保存时就写 LF，省得再出现
+# 「一半 CRLF、一半 LF」的混合文件。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Markdown 的行尾两个空格是有意的（硬换行），别让编辑器替你删掉
+[*.md]
+trim_trailing_whitespace = false
+
+# Rust 按 rustfmt：4 空格
+[*.rs]
+indent_size = 4
+
+# Windows 脚本保持 CRLF（与 `.gitattributes` 一致）
+[*.{bat,cmd,ps1}]
+end_of_line = crlf

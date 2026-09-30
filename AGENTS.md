@@ -28,6 +28,7 @@
 - `src-tauri/`：Rust 后端；`src-tauri/src/plugins/` 下是本仓库自带的本地插件（`admin-status`、`window`）。
 - `src-tauri/assets/models`：内置猫咪模型；`scripts/`：图标生成、发布等脚本。
 - `public/`：静态资源；`src/locales/`：多语言文案。
+- **换行符统一为 LF**（`.gitattributes` 的 `* text=auto eol=lf` + `.editorconfig`，2026-09-30）：仓库里的文本本来就是 LF（`i/lf`），之前 Windows 工作区里的 CRLF、以及被不同工具追加出来的「一半 CRLF、一半 LF」混合文件，只是本机 `core.autocrlf=true` 写出来的。所以改 Markdown / `.env.example` / 本文件这类文件时**不需要**再手工保持 CRLF，也不必再核对 CRLF 行数；`*.bat` / `*.cmd` / `*.ps1` 是唯一例外（保持 CRLF），而 `src-tauri/nsis/installer.nsi` 必须 LF。改完如果 `git status` 出现「内容没变却报已修改」的文件，那是索引里缓存的旧文件大小（换行变更会改变字节数），对那几个路径跑一次 `git add` 刷新即可。
 
 ## 仓库边界
 
