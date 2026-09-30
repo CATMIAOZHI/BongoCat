@@ -24,6 +24,7 @@ import { usePeerModel } from '@/composables/usePeerModel'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
 import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
+import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { pairStateKey, usePairStore } from '@/stores/pair'
 import { isImage } from '@/utils/is'
@@ -62,11 +63,29 @@ const GAP_MIN_MS = 16
 const GAP_MAX_MS = 1000
 /** 指针变化小于它就跳过重绘（量化步长是 0.02，这个阈值远小于它） */
 const POINTER_EPSILON = 0.001
+/**
+ * 这一窗的插值循环最多按 60fps 走（见 [`frameLoop`]）。
+ *
+ * `requestAnimationFrame` 跟的是**显示器刷新率**：165Hz 的屏就是每秒 165 次，而这一帧里要做
+ * `Object.values` 与路径拆分这类分配。对方快照本身最多 60Hz、本机那份平滑也是 60fps，再密
+ * 只是白烧一个窗口的 CPU（还要和全屏游戏 + 推流抢资源）。插值是按 `dt` 收敛的，跳帧不改变
+ * 它收敛到哪，只改变中间经过几个点。
+ */
+const FRAME_INTERVAL_MS = 1000 / 60
+/**
+ * 比目标间隔早这么多毫秒也照渲染（见 [`frameLoop`]）。
+ *
+ * `Date.now()` 在 Chromium 里是**整数毫秒**，而 60Hz 的 rAF 间隔是 16.67ms —— 取整之后测出来
+ * 是 16，`16 < 16.67` 就成了「还没到」，于是一帧渲染、一帧跳过，实际掉到约 40fps 且间隔
+ * 33ms / 17ms 交替（看得出顿）。留 1ms 余量把这个取整误差吃掉：60Hz 屏回到每一帧都渲染。
+ */
+const FRAME_INTERVAL_TOLERANCE_MS = 1
 
 const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
 const modelStore = useModelStore()
 const peerModel = usePeerModel()
+const catStore = useCatStore()
 const modelLoadFailed = ref(false)
 const { handleMouseRatio, handleKeyChange, handleMouseChange, handlePress, handleRelease } = useModel()
 
@@ -93,6 +112,8 @@ let appliedKey: string | undefined
 let appliedX = Number.NaN
 let appliedY = Number.NaN
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
+/** 上一轮插值循环的时刻，只用来按 `FRAME_INTERVAL_MS` 抽帧 */
+let lastLoopAt = Number.NEGATIVE_INFINITY
 let soundFailed = false
 /**
  * R37：已经按进本窗口模型的远端键名（归一化之后的）。
@@ -391,6 +412,12 @@ function renderRemoteSnapshot() {
 function frameLoop() {
   frameHandle = requestAnimationFrame(frameLoop)
 
+  const now = Date.now()
+
+  if (now - lastLoopAt < FRAME_INTERVAL_MS - FRAME_INTERVAL_TOLERANCE_MS) return
+
+  lastLoopAt = now
+
   renderRemoteSnapshot()
 }
 
@@ -456,6 +483,15 @@ watch(() => modelStore.currentModel, () => {
 })
 
 watch(() => pairStore.settings.remoteCat.scale, applySize)
+
+/*
+ * 这一窗的模型渲染也一样按设置里的「最大帧率」走。
+ *
+ * 渲染循环是 pixi `Application` **自己的** ticker，每个窗口各一份，所以只在猫咪窗口设是
+ * 不够的：对方猫窗口会一直按显示器刷新率渲染（165Hz 的屏就是 165fps）。这里只是**读**那份
+ * 跨窗口同步的设置并转给本窗的 live2d，不写任何共享 store（R11 的约束照旧）。
+ */
+watch(() => catStore.model.maxFPS, live2d.setMaxFPS, { immediate: true })
 
 watch(() => pairStore.settings.remoteCat.alwaysOnTop, setAlwaysOnTop, { immediate: true })
 

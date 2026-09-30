@@ -37,6 +37,18 @@ export const usePairStatsStore = defineStore('pair-stats', () => {
      * 拿得到，所以由 `App.vue`（猫咪窗口里是 `usePairState`）显式启动，见 `markPairStatsLoaded`。
      */
     autoStart: false,
+    /**
+     * 落盘改成尾随防抖 1 秒（`debounce` 是「停手 1 秒后才写」，不是「每秒写一次」）。
+     *
+     * 这个 store 每敲一次键、每点一下鼠标就变一次——打游戏时是持续的，而默认策略是「一变就写
+     * 一次 JSON 文件」（`saveOnChange`）。改成防抖之后，连续操作期间一个字节都不落盘，停手 1 秒
+     * 才写一次；省下的是持续的 IO 与序列化（游戏 + 推流时这些资源更要紧）。
+     *
+     * 代价是**硬崩 / 强杀**会丢掉从「上一次写盘」到崩溃之间这一整段计数（正常退出不受影响：
+     * `save_on_exit` 会先丢弃挂起的防抖再立刻写一次）。统计是纯累计数字，这个代价可以接受。
+     */
+    saveStrategy: 'debounce',
+    saveInterval: 1000,
   },
 })
 

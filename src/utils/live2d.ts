@@ -18,6 +18,8 @@ Config.MouseFollow = false
 class Live2d {
   private app: Application | null = null
   public model: Live2DSprite | null = null
+  /** 设置里那个「最大帧率」的值。可能比 `app` 先到（`main` 页的 watch 是 immediate） */
+  private maxFPS: number | null = null
 
   constructor() { }
 
@@ -28,6 +30,8 @@ class Live2d {
 
     this.app = new Application()
 
+    const app = this.app
+
     /*
      * 画布跟着**它所在的那块区域**走，而不是整个窗口。
      *
@@ -35,12 +39,15 @@ class Live2d {
      * 摆猫会把猫整体往下推一个浮层的高度、底部被裁掉。对方猫咪窗口与单机时这块区域就是
      * 整个窗口，行为不变。
      */
-    return this.app.init({
+    return app.init({
       view: view ?? void 0,
       resizeTo: view?.parentElement ?? window,
       backgroundAlpha: 0,
       autoDensity: true,
       resolution: devicePixelRatio,
+    }).then(() => {
+      // `ticker` 要等 `init` 之后才在，所以这里补一次（见 `setMaxFPS`）
+      if (this.maxFPS !== null) app.ticker.maxFPS = this.maxFPS
     })
   }
 
@@ -141,7 +148,26 @@ class Live2d {
   }
 
   public setMaxFPS(fps: number) {
+    this.maxFPS = fps
+
+    /*
+     * 渲染循环是 pixi `Application` **自己的** ticker（`sharedTicker` 默认 false、`autoStart`
+     * 默认 true），所以只设 `Ticker.shared.maxFPS` 等于这个设置项完全不生效：猫会一直按显示器
+     * 刷新率渲染（144/165Hz 的屏就是 144/165fps），白占一格合成通道，和全屏游戏 + 推流抢 GPU。
+     *
+     * `Ticker.shared` 那份也要设：本机的鼠标插值挂在它上面（`useDevice`）。
+     */
     Ticker.shared.maxFPS = fps
+
+    /*
+     * `ticker` 是 pixi 的 `TickerPlugin` 在 `Application.init()` **内部**才挂上去的，而 `this.app`
+     * 在 `initApp` 开头就赋值了——这两者之间正好可能打进来一次跨窗口的设置同步（用户刚打开
+     * 设置页改帧率）。所以要判的是 `ticker` 而不是 `app`：那个窗口期里补设由 `init()` 的
+     * `.then()` 负责（`this.maxFPS` 上面已经存下了）。
+     */
+    const ticker = this.app?.ticker
+
+    if (ticker) ticker.maxFPS = fps
   }
 }
 

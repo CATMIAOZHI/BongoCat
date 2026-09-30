@@ -2,8 +2,9 @@ use rdev::{Event, EventType, listen};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime, command};
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,6 +23,24 @@ pub struct DeviceEvent {
 }
 
 static IS_LISTENING: AtomicBool = AtomicBool::new(false);
+
+/// 鼠标移动的「最新那个坐标」（`f64` 的位模式）与「有新值」标志。
+///
+/// 钩子回调跑在**系统输入的关键路径**上：`rdev` 是在低层钩子过程里**同步**调用我们的回调的
+/// （它 `windows/listen.rs` 里就是先 `callback(event)`、之后才 `CallNextHookEx`），所以回调
+/// 里干的每一件事都直接加在下一次鼠标移动的延迟上。原来这里是「每一次移动 → `json!` 建一份
+/// 值 → `emit`（序列化成字符串、拼一小段 JS 源码、`PostMessageW` 到窗口线程）」，1000Hz 的
+/// 鼠标就是每秒上千次。而下游要的只是**最新那一个坐标**：本机那只会跟着 60fps 的插值走，
+/// 联机快照本来就被 `petStateHz` 限到 60Hz。
+///
+/// 所以钩子里只做三次原子写，由一个 60Hz 的循环合并后发一次（见 [`coalesce_mouse_moves`]）。
+static MOUSE_X: AtomicU64 = AtomicU64::new(0);
+static MOUSE_Y: AtomicU64 = AtomicU64::new(0);
+static MOUSE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 鼠标位置合并后往上发的频率（Hz）。与前端那份平滑（`useDevice` 的 `Ticker`，60fps）对齐，
+/// 高于它只是白跑。
+const MOUSE_EMIT_HZ: u64 = 60;
 
 /// rdev 的原始键名 → 平台键码（Windows 上就是虚拟键码 `vkCode`）。
 ///
@@ -45,6 +64,14 @@ pub async fn start_device_listening<R: Runtime>(app_handle: AppHandle<R>) -> Res
 
     IS_LISTENING.store(true, Ordering::SeqCst);
 
+    // 合并鼠标移动的那条线程（见 `MOUSE_X` 的注释）：与钩子线程分开，钩子只负责记坐标。
+    //
+    // 这次 spawn **必须**排在上面 `store(true)` 之后：新线程每次循环都先读 `IS_LISTENING`，
+    // 排在前面就有机会读到 `false` 直接退出（那是这条线程唯一的退出路径）。
+    let coalescer = app_handle.clone();
+
+    std::thread::spawn(move || coalesce_mouse_moves(coalescer));
+
     let callback = move |event: Event| {
         // 键码只在键盘事件上有意义（鼠标事件上是 0）。`platform_code` 在 Windows 上就是
         // `vkCode`，键名与下面 emit 给前端的是同一个（`{:?}` 出来的枚举名）
@@ -66,10 +93,24 @@ pub async fn start_device_listening<R: Runtime>(app_handle: AppHandle<R>) -> Res
                 kind: DeviceEventKind::MouseRelease,
                 value: json!(format!("{:?}", button)),
             },
-            EventType::MouseMove { x, y } => DeviceEvent {
-                kind: DeviceEventKind::MouseMove,
-                value: json!({ "x": x, "y": y }),
-            },
+            EventType::MouseMove { x, y } => {
+                // 这里**不能**直接发（见 `MOUSE_X` 的注释）：只记坐标，最后置一次标志就返回。
+                //
+                // 三个原子写之间**不**保证「合并线程读到的 x 与 y 来自同一次移动」——读者可能在
+                // 两次写之间插进来，于是拿到拼接的一对。写者只有钩子这一个线程、两次写相隔几纳秒，
+                // 读者 16ms 才读一次：单次写落进读者那两次 load 之间的概率是「几纳秒 ÷ 16ms」，
+                // 一拍里有十几次写，所以每拍约是它的十几倍——仍然约万分之一，而偏差最多是一次移动
+                // 的位移（平稳移动时 1px，甩鼠标时可以是几 px）。
+                //
+                // 要彻底消除得做 seqlock（写者先写一个奇/偶版本号），最省的写法是在钩子里加两次
+                // 普通 Release 写——x86 上就是两条 `mov`，不需要读改写或额外的 fence。即便如此也
+                // 不值得：为一个看不出来的偏差，再往系统输入的关键路径上加东西。
+                MOUSE_X.store(x.to_bits(), Ordering::Relaxed);
+                MOUSE_Y.store(y.to_bits(), Ordering::Relaxed);
+                MOUSE_PENDING.store(true, Ordering::Release);
+
+                return;
+            }
             EventType::KeyPress(key) => DeviceEvent {
                 kind: DeviceEventKind::KeyboardPress,
                 value: json!(format!("{:?}", key)),
@@ -87,6 +128,38 @@ pub async fn start_device_listening<R: Runtime>(app_handle: AppHandle<R>) -> Res
     listen(callback).map_err(|err| format!("Failed to listen device: {:?}", err))?;
 
     Ok(())
+}
+
+/// 把钩子记下的坐标按 [`MOUSE_EMIT_HZ`] 合并后发出去（见 [`MOUSE_X`] 的注释）。
+///
+/// 「有变化才发」而不是「每拍都发」：鼠标不动的时候一帧都不发（每拍仍会醒一次、做一次原子交换，
+/// 那是可以忽略的开销）。位置没变时前端本来也不会看到任何区别（插值早就稳定在同一个点上）。
+fn coalesce_mouse_moves<R: Runtime>(app_handle: AppHandle<R>) {
+    let interval = Duration::from_millis(1000 / MOUSE_EMIT_HZ);
+
+    loop {
+        // 这条线程与进程同寿（`rdev::listen` 是消息循环，不返回），留个退出条件给以后可能加的
+        // 「停止监听」——现在没人会把它置回 false。
+        if !IS_LISTENING.load(Ordering::SeqCst) {
+            return;
+        }
+
+        std::thread::sleep(interval);
+
+        if !MOUSE_PENDING.swap(false, Ordering::Acquire) {
+            continue;
+        }
+
+        let event = DeviceEvent {
+            kind: DeviceEventKind::MouseMove,
+            value: json!({
+                "x": f64::from_bits(MOUSE_X.load(Ordering::Relaxed)),
+                "y": f64::from_bits(MOUSE_Y.load(Ordering::Relaxed)),
+            }),
+        };
+
+        let _ = app_handle.emit("device-changed", &event);
+    }
 }
 
 /// `keys` 里有没有还按着的键（Windows 上查 `GetAsyncKeyState`）。
