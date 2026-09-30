@@ -370,8 +370,10 @@ impl Limited {
     fn reason(self) -> &'static str {
         match self {
             Self::Connection => "rate limit exceeded",
-            // 客户端只按关闭码翻译，这一串是给中继日志与 curl 看的
-            Self::KeyBudget => "key budget exhausted",
+            // 客户端只按关闭码翻译（`frame.code`），这一串只随关闭帧发出去——能看到的只有抓包
+            // 与 curl 这类 WS 客户端，中继自己的日志走的是另一处 `println!`。额度用完本身只是
+            // **限速**（见 `Allowance`），走到这里都是「等不起」，所以这句要带上那半句
+            Self::KeyBudget => "key budget exhausted, and waiting it out would not help",
         }
     }
 

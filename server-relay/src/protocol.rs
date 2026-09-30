@@ -267,10 +267,12 @@ pub mod close_code {
     /// `DEFAULT_FULL_WINDOW_SECS`）。两档共用这一个码：客户端要做的事完全一样
     /// （重连），而它无从知道对面那一档的窗口是哪一个数。
     pub const IDLE: u16 = 4005;
-    /// 这把钥匙的滚动预算用完了（**不是**「你发太快」，见 `DEFAULT_PUBLIC_KEY_BUDGET_BYTES` /
-    /// `DEFAULT_FULL_KEY_BUDGET_BYTES`）。它与 `1008`（自己的额度不够）分开，客户端才能说出
-    /// 「这台服务器给你的额度用完了」
-    /// 而不是一句笼统的格式错误。
+    /// 这把钥匙的滚动预算用完了**而且等不起**（**不是**「你发太快」，见
+    /// `DEFAULT_PUBLIC_KEY_BUDGET_BYTES` / `DEFAULT_FULL_KEY_BUDGET_BYTES`）。额度用完之后
+    /// 中继本来会等着这一帧装得下再转发（回填速度就是速度上限），走到这个码说明等不起了：
+    /// 这一帧比整份额度还大，或者等待越过了 `KEY_BUDGET_WAIT_LIMIT`。它与 `1008`（自己的
+    /// 额度不够）分开，客户端才能说出「这台服务器给你的额度用完了」而不是一句笼统的格式
+    /// 错误。
     pub const KEY_BUDGET: u16 = 4006;
     /// 协议 / 帧格式错误
     pub const PROTOCOL_ERROR: u16 = 1008;
