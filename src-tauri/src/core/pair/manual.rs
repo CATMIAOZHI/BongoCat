@@ -67,15 +67,20 @@ pub const CODE_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// 这里只放 `stun:`：`turn:` 只能来自中继的广告（自建中继配了 coturn 时），在本地清单里
 /// 接受 `turn:` 会让「填错一行就把中继的 TURN 顶掉」这种事发生。
 ///
+/// **每条都带 `stun:` 前缀**（用户自己填的那份不带也行，见 [`normalize_stun_url`]）：这一份
+/// 是**直接当 ICE 地址**用的，而 webrtc 见到没有 scheme 的地址会报 `unknown scheme type`、
+/// 让整条 `PeerConnection` 都建不起来——手工码模式留空设置时用的就是这一份（中继那条路有
+/// `p2p::normalize_ice_servers` 兜底），所以前缀必须写在这儿。
+///
 /// `stun1.douyucdn.cn:3478` 两轮实测都超时，是死端口，**不要**加回来；
 /// `stun.l.google.com:19302` 国内 UDP 常受干扰，只在帮助文案里当示例。
 pub const DEFAULT_STUN_URLS: [&str; 6] = [
-    "stun.miwifi.com:3478",
-    "stun.hitv.com:3478",
-    "stun.chat.bilibili.com:3478",
-    "stun.douyucdn.cn:18000",
-    "stun1.douyucdn.cn:18000",
-    "stun.cloudflare.com:3478",
+    "stun:stun.miwifi.com:3478",
+    "stun:stun.hitv.com:3478",
+    "stun:stun.chat.bilibili.com:3478",
+    "stun:stun.douyucdn.cn:18000",
+    "stun:stun1.douyucdn.cn:18000",
+    "stun:stun.cloudflare.com:3478",
 ];
 
 /// 一份清单最多几条。够了就够：每个 STUN 服务器都会给同一条 NAT 映射出一份 srflx 候选，
@@ -429,7 +434,11 @@ pub fn parse_stun_urls(text: &str) -> StunList {
 }
 
 /// 一行地址的归一化与校验，见 [`parse_stun_urls`]。
-fn normalize_stun_url(line: &str) -> Result<String, String> {
+///
+/// 也**直接**给中继那条路用（`p2p.rs` 的 `normalize_ice_url`）：中继广告过来的地址可能是
+/// 部署者随手写的 `host:port`，那里遇到没有 scheme 的条目就交给这里补 `stun:`——校验口径
+/// 与用户自己填的那份完全一致，省得两处各写一套。
+pub(super) fn normalize_stun_url(line: &str) -> Result<String, String> {
     let lower = line.to_ascii_lowercase();
 
     if lower.starts_with("turn:") || lower.starts_with("turns:") {
@@ -837,5 +846,22 @@ mod tests {
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         assert_eq!(parsed.urls.len(), DEFAULT_STUN_URLS.len());
         assert_eq!(stun_ice_servers(&parsed.urls)[0].urls, vec!["stun:stun.miwifi.com:3478".to_string()]);
+    }
+
+    /// 默认清单是**被直接当成 ICE 地址**发出去的（[`StunList::effective`] 与 [`stun_ice_servers`]
+    /// 都原样透传、不做归一化），所以六条都必须自带 `stun:`：少一个前缀，webrtc 就会报
+    /// `unknown scheme type`，让整条 `PeerConnection` 建不起来（`p2p.rs` 的
+    /// `normalize_ice_servers` 能替部署者兜住，但这一份是我们自己写的，不该靠它兜）。
+    ///
+    /// **别拿上面那条当替代**：它走 [`parse_stun_urls`]，而那个函数会把前缀补上——把这里六条
+    /// 前缀全删掉，它照样全绿（这正是加这一条的原因）。
+    #[test]
+    fn every_default_stun_url_carries_its_own_scheme() {
+        for url in DEFAULT_STUN_URLS {
+            assert!(
+                url.starts_with("stun:"),
+                "`{url}` 少了 `stun:` 前缀——这一份不做归一化，直接当 ICE 地址用",
+            );
+        }
     }
 }

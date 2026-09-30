@@ -18,7 +18,9 @@
 //!
 //! 一轮协商的形状：双方各自发 `hello` → **deviceId 字典序小的一方发起 offer**
 //! （避免双方同时 offer 的 glare）→ 交换 SDP 与 ICE candidate → `pet-state` 通道打开。
-//! 失败就隔 [`RETRY_DELAY`] 重来；收到对端新的 `hello`（说明对端重连了）立刻重开一轮。
+//! 失败就隔 [`RETRY_DELAY`] 重来；收到对端新的 `hello`（说明对端重连了）立刻重开一轮——
+//! 除非**连着几轮连 `PeerConnection` 都没建起来**（那是配置本身有问题，重开也不会好），
+//! 那时按 [`retry_delay`] 踩刹车，见 [`Leg::start`]。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,13 +123,11 @@ fn candidate_stats(description: &str) -> (usize, usize) {
 }
 
 /// 协商现场写进日志时用的 ICE 服务器描述：只写地址，凭据一律不进日志。
-///
-/// `turn:user:pass@host` 这种把凭据塞进 URL 的写法也要挡住，所以 '@' 之前的部分全部丢掉。
 fn describe_ice_servers(servers: &[IceServer]) -> String {
-    let urls: Vec<&str> = servers
+    let urls: Vec<String> = servers
         .iter()
         .flat_map(|server| server.urls.iter())
-        .map(|url| url.trim())
+        .map(|url| describe_ice_url(url.trim()))
         .filter(|url| !url.is_empty())
         .collect();
 
@@ -135,10 +135,154 @@ fn describe_ice_servers(servers: &[IceServer]) -> String {
         return "没有（只有 host 候选）".to_string();
     }
 
-    urls.iter()
-        .map(|url| url.rsplit('@').next().unwrap_or(url))
-        .collect::<Vec<_>>()
-        .join(", ")
+    urls.join(", ")
+}
+
+/// 一条 ICE 地址的日志形态。
+///
+/// `turn:user:pass@host` 这种把凭据塞进 URL 的写法也要挡住，所以 '@' 之前的部分全部丢掉。
+fn describe_ice_url(url: &str) -> String {
+    url.rsplit('@').next().unwrap_or(url).to_string()
+}
+
+/// 把中继广告过来的 ICE 条目修成 webrtc 能解析的形状，结果见 [`FixedIceServers`]。
+///
+/// 部署者把 `PAIR_ICE_SERVERS` 写成 `stun.miwifi.com:3478`（少了 `stun:` 前缀）是很自然的
+/// 写法，而中继是**原样透传**的；webrtc 那边遇到没有 scheme 的地址会直接报
+/// `unknown scheme type` —— 那不是「这一条不可用」，而是**整条 `PeerConnection` 都建不起来**：
+/// P2P 永远连不上（退回中继还能用，但每重开一轮都要再失败一次，日志跟着刷，见 2026-09-29
+/// 16:24 那段）。所以这里宽容一点：没有 scheme 的按 `stun:host[:port]` 补上（校验口径复用
+/// `manual.rs` 那一份），补不了的才丢，并且**把丢掉的原样报出来**（去凭据之后）——静默丢会
+/// 让用户以为「配了六个」实际只有五个。
+///
+/// 最后一道闸问的是 **webrtc 自己那个判定**（[`RTCIceServer::urls`]，与建 `PeerConnection` 时
+/// 调用的是同一个方法，见 `rtc` 里的 `RTCPeerConnection::new`）：它会拦下解析不了的地址，也会
+/// 拦下**没配 `username` / `credential` 的 `turn:` 条目**（`ErrNoTurnCredentials`）。留着任何
+/// 一条都是同样的下场——整条 `PeerConnection` 建不起来——所以这里逐条过、逐条丢，判定交给库
+/// 而不是自己再写一套形状校验：能留什么、会拦什么只有一个出处，两边不会分叉。
+fn normalize_ice_servers(servers: Vec<IceServer>) -> FixedIceServers {
+    let mut fixed = FixedIceServers {
+        servers: Vec::new(),
+        prefixed: Vec::new(),
+        prefixed_with_credentials: false,
+        dropped: Vec::new(),
+    };
+
+    for server in servers {
+        let credentialed = !server.username.is_empty() || !server.credential.is_empty();
+        let mut urls: Vec<String> = Vec::new();
+
+        for url in &server.urls {
+            let trimmed = url.trim();
+
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let (url, guessed_scheme) = match normalize_ice_url(trimmed) {
+                Some(normalized) => normalized,
+                None => {
+                    fixed.dropped.push(describe_ice_url(trimmed));
+
+                    continue;
+                }
+            };
+
+            // 同一条地址在同一个 `IceServer` 里重复没有意义（webrtc 会各试一次）
+            if urls.iter().any(|known| known.eq_ignore_ascii_case(&url)) {
+                continue;
+            }
+
+            // 逐条问 webrtc 收不收（见函数注释）：它说不行的，留着就是整条腿建不起来
+            if !ice_url_is_accepted(&url, &server) {
+                fixed.dropped.push(describe_ice_url(trimmed));
+
+                continue;
+            }
+
+            if guessed_scheme {
+                fixed.prefixed.push(describe_ice_url(trimmed));
+
+                // `stun:` 上不认凭据，这份凭据会被悄悄丢掉——补前缀的日志之外再单说一句
+                if credentialed {
+                    fixed.prefixed_with_credentials = true;
+                }
+            }
+
+            urls.push(url);
+        }
+
+        if urls.is_empty() {
+            continue;
+        }
+
+        fixed.servers.push(IceServer {
+            urls,
+            username: server.username.clone(),
+            credential: server.credential.clone(),
+        });
+    }
+
+    fixed
+}
+
+/// [`normalize_ice_servers`] 的结果：修好的条目 + 两类要报出来的原地址。
+struct FixedIceServers {
+    /// 可以交给 webrtc 的条目
+    servers: Vec<IceServer>,
+    /// 少了 scheme、被这里补成 `stun:` 的原地址
+    prefixed: Vec<String>,
+    /// 那些补过前缀的条目里，有带着 `username` / `credential` 的（`stun:` 上不会用到它们）
+    prefixed_with_credentials: bool,
+    /// webrtc 解析不了、被丢掉的原地址（去凭据之后）
+    dropped: Vec<String>,
+}
+
+/// 这一条地址 webrtc 收不收——**与建连接时同一个判定**（见 [`normalize_ice_servers`]）。
+///
+/// 一条 `turn:` 地址合不合法要看同一个条目里的 `username` / `credential`，所以判定必须带上
+/// 条目本身，不能只看地址。
+fn ice_url_is_accepted(url: &str, server: &IceServer) -> bool {
+    RTCIceServer {
+        urls: vec![url.to_string()],
+        username: server.username.clone(),
+        credential: server.credential.clone(),
+    }
+    .urls()
+    .is_ok()
+}
+
+/// 一条 ICE 地址的归一化，见 [`normalize_ice_servers`]。
+///
+/// 返回（归一化后的地址，是不是这里补的 `stun:` 前缀）。
+///
+/// 有认得的 scheme（`stun:` / `stuns:` / `turn:` / `turns:`）时只做两件事——把 `scheme://rest`
+/// 收成 `scheme:rest`（webrtc 的解析器见到 `//` 直接报错）、scheme 折成小写；主机、端口、
+/// `?transport=` 与凭据本身一个字符都不动（那是中继给的，改它等于改中继的行为）。没有 scheme
+/// 的交给 `manual::normalize_stun_url` 按 `host[:port]` 补 `stun:`（缺端口按 3478）；补不了
+/// （IPv6 字面量、带空格或斜杠、端口不是数字……）返回 `None`，由调用方丢掉并报出来。
+fn normalize_ice_url(url: &str) -> Option<(String, bool)> {
+    let lower = url.to_ascii_lowercase();
+
+    for scheme in ["stun", "stuns", "turn", "turns"] {
+        if !lower.starts_with(&format!("{scheme}:")) {
+            continue;
+        }
+
+        // prefix 一定是 ASCII，按字节切不会切坏后面的主机名
+        let rest = url[scheme.len() + 1..].trim();
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+
+        if rest.is_empty() {
+            return None;
+        }
+
+        return Some((format!("{scheme}:{rest}"), false));
+    }
+
+    super::manual::normalize_stun_url(url)
+        .ok()
+        .map(|url| (url, true))
 }
 
 /// 候选的日志描述：类型 + 协议 + 地址。
@@ -250,6 +394,9 @@ impl P2pLink {
     /// `ice_servers` 来自 `server.welcome` 的广告（R21）：自建中继默认给它内置的 STUN；
     /// 空表示只有 host candidate（Cloudflare 版不广告任何东西）。手工码模式没有中继，
     /// 传进来的是用户在设置里自己填的那份公益 STUN（见 `manual.rs`）。
+    ///
+    /// 传进来的地址会先过一遍 [`normalize_ice_servers`]（补 `stun:` 前缀 / 丢掉 webrtc 不肯
+    /// 解析的那些），所以调用方不需要自己保证格式。
     pub fn spawn(device_id: String, ice_servers: Vec<IceServer>) -> (Self, P2pEvents) {
         let (input, incoming) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
@@ -310,9 +457,37 @@ async fn drive(
     events: mpsc::UnboundedSender<P2pEvent>,
     writable: Arc<AtomicBool>,
 ) {
+    // 中继广告过来的地址先修一遍（见 [`normalize_ice_servers`]）：少一个 `stun:` 前缀就能让
+    // 整条 `PeerConnection` 建不起来，而不是只让那一条不可用
+    let fixed = normalize_ice_servers(ice_servers);
+
+    // 补前缀也要留一行：部署者据此才知道自己那份 `PAIR_ICE_SERVERS` 漏写了前缀（补是宽容，
+    // 但静默补等于把「配置里有错」这件事藏起来）
+    if !fixed.prefixed.is_empty() {
+        info!(
+            "P2P：{} 条 ICE 地址没写 stun: 前缀，已按 stun: 补上（{}）",
+            fixed.prefixed.len(),
+            fixed.prefixed.join(", "),
+        );
+    }
+
+    if fixed.prefixed_with_credentials {
+        warn!(
+            "P2P：其中有条目带着 username / credential，而 stun: 上用不到凭据——如果它本来是 TURN，请写成 turn:主机:端口"
+        );
+    }
+
+    if !fixed.dropped.is_empty() {
+        warn!(
+            "P2P：丢掉 {} 条 webrtc 解析不了的 ICE 地址（{}）——前缀、端口、TURN 凭据都要写在同一条目里",
+            fixed.dropped.len(),
+            fixed.dropped.join(", "),
+        );
+    }
+
     let mut leg = Leg {
         device_id,
-        ice_servers,
+        ice_servers: fixed.servers,
         driver,
         events,
         peer_ready: false,
@@ -329,6 +504,9 @@ async fn drive(
         writable,
         remote_ready: false,
         buffered_candidates: Vec::new(),
+        last_build_at: None,
+        build_failures: 0,
+        deferred_until: None,
     };
     let mut retry_at: Option<tokio::time::Instant> = None;
     // 连续失败了几轮：决定下一轮等多久。通道开了、或对端重新 hello 时清零。
@@ -341,6 +519,14 @@ async fn drive(
     let driver = leg.driver.clone();
 
     loop {
+        // 上一轮里 `Leg::start` 若踩了刹车，它把「什么时候再来」写进 `deferred_until`——在这里
+        // 接到本循环自己的重试定时器上。放在 `select!` **之前**、且只此一处：`start` 的四个
+        // 调用点（`begin` / `handle(Hello)` / `handle(Offer)` / 下面 `_ = retry`）都落在上一轮
+        // 里，一处 pickup 就能全覆盖，不会漏掉某条路径
+        if let Some(at) = leg.deferred_until.take() {
+            retry_at = Some(at);
+        }
+
         let retry = async {
             match retry_at {
                 Some(at) => tokio::time::sleep_until(at).await,
@@ -490,6 +676,16 @@ struct Leg {
     remote_ready: bool,
     /// 远端描述还没设好时收到的 candidate 先攒着
     buffered_candidates: Vec<RTCIceCandidateInit>,
+    /// 上一次真的去建 `PeerConnection` 的时刻，与「连着几轮连 PC 都没建起来」的计数。
+    ///
+    /// 建不起来说明**配置本身**有问题（不是网络），而重开一轮的触发点全在外部（对端的
+    /// `hello`、重新贴一次回码）：不踩刹车就会变成「对端每 hello 一次、我们重建一次」的风暴
+    /// ——日志里 2026-09-29 16:24:05–16:24:30 那 26 秒 22 轮就是这么来的（当时中继广告的地址少了
+    /// `stun:` 前缀，每一轮都死在 `unknown scheme type` 上）。这两个字段只服务那一个刹车。
+    last_build_at: Option<tokio::time::Instant>,
+    build_failures: u32,
+    /// 刹车把这一轮推迟到什么时候：驱动循环读走它、接到自己的重试定时器上（见 [`Leg::start`]）
+    deferred_until: Option<tokio::time::Instant>,
 }
 
 impl Leg {
@@ -598,7 +794,12 @@ impl Leg {
         let _ = self.events.send(P2pEvent::Signal(signal));
     }
 
-    /// 处理一条对端信令。返回 `true` 表示这一轮（重新）开始了，驱动循环据此清掉待重试。
+    /// 处理一条对端信令。返回 `true` 表示这一轮**真的开了**（`PeerConnection` 建起来了），
+    /// 驱动循环据此清掉待重试与失败计数。
+    ///
+    /// 连 PC 都没建起来时返回 `false`：那种失败说明配置本身有问题、重开一轮不会变好，而
+    /// 「返回 true」会把驱动循环的退避**重置**——对端每 hello 一次就重置一次，正是那次风暴的
+    /// 另一半原因（见 `last_build_at` 的注释）。
     async fn handle(&mut self, signal: PairSignalPayload) -> bool {
         match signal {
             PairSignalPayload::Hello {
@@ -622,7 +823,9 @@ impl Leg {
                 self.reset().await;
                 self.start().await;
 
-                true
+                // 建起来了才算「这一轮开了」：建不起来时 `start` 已经把这次失败记进
+                // `build_failures`（或者踩了刹车），退避不该被这次 hello 清掉
+                self.build_failures == 0
             }
             PairSignalPayload::Offer { description } => {
                 if self.peer.is_none() {
@@ -717,7 +920,38 @@ impl Leg {
     }
 
     /// 建一条 `PeerConnection`。发起方还会建 `pet-state` 通道并发 offer。
+    ///
+    /// 连着几轮建不起来时会**踩刹车**：这一轮被推迟到 [`retry_delay`] 允许的时刻（写进
+    /// `deferred_until`，由驱动循环接到自己的重试定时器上），见 `last_build_at` 的注释。
+    /// 手工码模式不踩——它的重开完全由用户点出来（重新出码 / 重新贴码），本来就该立刻试，
+    /// 而静默重建还会把对方手里的那串码作废。
+    ///
+    /// 两个已知的、可接受的副作用：刹车期间对端来的那封 offer 会被消费掉（这一轮本来就谈不成，
+    /// 打不通时不会更糟）；被动方也会跟着退避重开一轮 `PeerConnection`（它不发 offer、不换码，
+    /// 只是多一次绑定与一行日志）——「被动方不自己重试」那条说的是发起 offer，不是这里。
     async fn start(&mut self) {
+        if !self.manual && self.build_failures > 0 {
+            if let Some(at) = self.last_build_at {
+                let wait = retry_delay(self.build_failures - 1);
+
+                if at.elapsed() < wait {
+                    // 每次被推迟都打一行（没有「只打一次」的守卫：`start` 每轮最多调一次，
+                    // 而循环顶部那次 pickup 每次都把 `deferred_until` 收走，所以守卫恒真、
+                    // 只会是一处死条件）。这一行的频率由「对端 hello 来得多快」决定，退避把
+                    // 自发的重试卡在 ≥5 秒——误配时它一秒可能来几行，那正是要看见的信号。
+                    info!(
+                        "P2P 连着 {} 轮没建起连接，{} 秒内不再重建",
+                        self.build_failures,
+                        wait.as_secs(),
+                    );
+
+                    self.deferred_until = Some(at + wait);
+
+                    return;
+                }
+            }
+        }
+
         // 一轮协商的现场：有了这一行，事后才能看出「什么时候开始连、用的哪些服务器」
         info!(
             "P2P 开始协商（{}）：ICE 服务器 {} 个 [{}]",
@@ -729,6 +963,8 @@ impl Leg {
             self.ice_servers.len(),
             describe_ice_servers(&self.ice_servers),
         );
+
+        self.last_build_at = Some(tokio::time::Instant::now());
 
         let configuration = RTCConfigurationBuilder::new()
             .with_ice_servers(self.ice_servers.iter().map(to_rtc_ice_server).collect())
@@ -769,11 +1005,16 @@ impl Leg {
                 Ok(peer) => Arc::new(peer),
                 Err(error) => {
                     warn!("P2P 建连失败: {error}");
+                    self.build_failures = self.build_failures.saturating_add(1);
                     self.fail();
 
                     return;
                 }
             };
+
+        // 建起来了：刹车复位（下一轮真要失败时重新从 5 秒起算）
+        self.build_failures = 0;
+        self.deferred_until = None;
 
         self.peer = Some(Arc::clone(&peer));
         self.remote_ready = false;
@@ -1105,6 +1346,343 @@ mod tests {
             "relay udp 203.0.113.7"
         );
         assert_eq!(describe_candidate("   "), "候选收集结束");
+    }
+
+    /// 2026-09-29 那次风暴的回归钉。中继广告过来的地址少了 `stun:` 前缀时，webrtc 会报
+    /// `unknown scheme type` 并且**整条 `PeerConnection` 都建不起来**（不是「这一条不用」），
+    /// 于是 P2P 永远连不上、还会跟着对端的 hello 一轮一轮重建。
+    ///
+    /// 现在这些条目一律补上前缀、一个都不丢——日志里那句「ICE 服务器 N 个」也就名副其实。
+    /// 补过的那几条另有一行日志把它们报出来（`prefixed`）：宽容是为了能用，报出来是为了
+    /// 部署者知道自己那份 `PAIR_ICE_SERVERS` 漏写了前缀。
+    #[test]
+    fn ice_urls_without_a_scheme_get_stun_prefixed_instead_of_killing_the_round() {
+        let relay_advertised = vec![IceServer {
+            urls: [
+                "stun.miwifi.com:3478",
+                "stun.chat.bilibili.com",
+                "stun.douyucdn.cn:18000",
+                "223.5.5.5",
+            ]
+            .iter()
+            .map(|url| url.to_string())
+            .collect(),
+            username: String::new(),
+            credential: String::new(),
+        }];
+
+        let fixed = normalize_ice_servers(relay_advertised);
+
+        assert!(fixed.dropped.is_empty(), "{:?}", fixed.dropped);
+        assert_eq!(fixed.servers.len(), 1);
+        assert_eq!(
+            fixed.servers[0].urls,
+            vec![
+                "stun:stun.miwifi.com:3478",
+                "stun:stun.chat.bilibili.com:3478",
+                "stun:stun.douyucdn.cn:18000",
+                "stun:223.5.5.5:3478",
+            ]
+        );
+        assert_eq!(
+            fixed.prefixed,
+            vec![
+                "stun.miwifi.com:3478",
+                "stun.chat.bilibili.com",
+                "stun.douyucdn.cn:18000",
+                "223.5.5.5",
+            ]
+        );
+        // 这一条没有凭据：不该顺手报一句「凭据用不上」
+        assert!(!fixed.prefixed_with_credentials);
+    }
+
+    /// 已经有 scheme 的条目只做两件事：把 `scheme://rest` 收成 `scheme:rest`（webrtc 的解析器
+    /// 见到 `//` 直接报错）、scheme 折成小写。**主机、端口、`?transport=` 与凭据本身一个字符
+    /// 都不动**——那是中继给的，改它等于改中继的行为。同一个 `IceServer` 里重复的地址只留一条。
+    #[test]
+    fn ice_entries_that_already_have_a_scheme_keep_their_host_port_and_credentials() {
+        let servers = vec![
+            IceServer {
+                urls: vec![
+                    "turn:cat.example.com:3478?transport=udp".to_string(),
+                    "turns:cat.example.com:5349".to_string(),
+                    "stun://stun.cloudflare.com:3478".to_string(),
+                    "TURN:cat.example.com:3478".to_string(),
+                ],
+                username: "pair-user".to_string(),
+                credential: "s3cret".to_string(),
+            },
+            IceServer {
+                urls: vec![
+                    "stun:1.1.1.1:3478".to_string(),
+                    "STUN:1.1.1.1:3478".to_string(),
+                ],
+                username: String::new(),
+                credential: String::new(),
+            },
+        ];
+
+        let fixed = normalize_ice_servers(servers);
+
+        assert!(fixed.dropped.is_empty(), "{:?}", fixed.dropped);
+        assert!(fixed.prefixed.is_empty(), "{:?}", fixed.prefixed);
+        assert_eq!(fixed.servers.len(), 2);
+        assert_eq!(
+            fixed.servers[0].urls,
+            vec![
+                "turn:cat.example.com:3478?transport=udp",
+                "turns:cat.example.com:5349",
+                "stun:stun.cloudflare.com:3478",
+                // 大写 scheme 折成小写（`STUN:` 那条是靠上面那个去重才没出现的，别拿它当证据）
+                "turn:cat.example.com:3478",
+            ]
+        );
+        assert_eq!(fixed.servers[0].username, "pair-user");
+        assert_eq!(fixed.servers[0].credential, "s3cret");
+        assert_eq!(fixed.servers[1].urls, vec!["stun:1.1.1.1:3478"]);
+    }
+
+    /// 补过前缀、而所在条目又带着 `username` / `credential` 时要单独说一句：`stun:` 上不认
+    /// 凭据，那份凭据会被悄悄丢掉；它本来多半是 TURN，写全 `turn:主机:端口` 才是本意。
+    #[test]
+    fn a_scheme_less_entry_that_carries_credentials_is_reported_as_such() {
+        let servers = vec![IceServer {
+            urls: vec!["cat.example.com:3478".to_string()],
+            username: "pair-user".to_string(),
+            credential: "s3cret".to_string(),
+        }];
+
+        let fixed = normalize_ice_servers(servers);
+
+        assert!(fixed.dropped.is_empty(), "{:?}", fixed.dropped);
+        assert_eq!(fixed.servers.len(), 1);
+        assert_eq!(fixed.servers[0].urls, vec!["stun:cat.example.com:3478"]);
+        assert_eq!(fixed.prefixed, vec!["cat.example.com:3478"]);
+        assert!(fixed.prefixed_with_credentials);
+    }
+
+    /// 「认得的 scheme」不等于「webrtc 肯解析」：端口不是数字或超出范围、没带方括号的 IPv6
+    /// （解析器会把它当成端口）、`stun:` 上带 query、地址里还有 `//`…… **任何一条**留着都会让
+    /// 整条 `PeerConnection` 建不起来，所以在交给它之前就丢掉。
+    ///
+    /// 带方括号的 IPv6 是合法的（中继既可能广告域名，也可能广告 `[2001:db8::1]`），别一起丢。
+    #[test]
+    fn ice_urls_webrtc_cannot_parse_are_dropped_instead_of_killing_the_round() {
+        let servers = vec![IceServer {
+            urls: [
+                "stun:cat.example.com:abc",
+                "stun:cat.example.com:65536",
+                "stun:2001:db8::1",
+                "stun:cat.example.com:3478?transport=udp",
+                "stun:cat.example.com//3478",
+                "stun:[2001:db8::1]:3478",
+            ]
+            .iter()
+            .map(|url| url.to_string())
+            .collect(),
+            username: String::new(),
+            credential: String::new(),
+        }];
+
+        let fixed = normalize_ice_servers(servers);
+
+        assert_eq!(fixed.servers.len(), 1);
+        assert_eq!(fixed.servers[0].urls, vec!["stun:[2001:db8::1]:3478"]);
+        assert_eq!(
+            fixed.dropped,
+            vec![
+                "stun:cat.example.com:abc",
+                "stun:cat.example.com:65536",
+                "stun:2001:db8::1",
+                "stun:cat.example.com:3478?transport=udp",
+                "stun:cat.example.com//3478",
+            ]
+        );
+    }
+
+    /// `turn:` / `turns:` 要配同一个条目里的 `username` / `credential`（webrtc 的
+    /// `RTCIceServer::urls` 会报 `ErrNoTurnCredentials`），否则整条 `PeerConnection` 建不起来。
+    /// 没配凭据时只丢那一条 `turn:`，同条目里的 STUN 照样留着。
+    #[test]
+    fn a_turn_url_without_credentials_is_dropped_but_kept_when_the_entry_has_them() {
+        let without = vec![IceServer {
+            urls: vec![
+                "turn:cat.example.com:3478".to_string(),
+                "stun:cat.example.com:3478".to_string(),
+            ],
+            username: String::new(),
+            credential: String::new(),
+        }];
+
+        let fixed = normalize_ice_servers(without);
+
+        assert_eq!(fixed.servers.len(), 1);
+        assert_eq!(fixed.servers[0].urls, vec!["stun:cat.example.com:3478"]);
+        assert_eq!(fixed.dropped, vec!["turn:cat.example.com:3478"]);
+
+        // 只有 username、没有 credential 同样不算「配了凭据」
+        let half = vec![IceServer {
+            urls: vec!["turns:cat.example.com:5349".to_string()],
+            username: "pair-user".to_string(),
+            credential: String::new(),
+        }];
+
+        let fixed = normalize_ice_servers(half);
+
+        assert!(fixed.servers.is_empty());
+        assert_eq!(fixed.dropped, vec!["turns:cat.example.com:5349"]);
+
+        let with = vec![IceServer {
+            urls: vec!["turn:cat.example.com:3478".to_string()],
+            username: "pair-user".to_string(),
+            credential: "s3cret".to_string(),
+        }];
+
+        let fixed = normalize_ice_servers(with);
+
+        assert!(fixed.dropped.is_empty(), "{:?}", fixed.dropped);
+        assert_eq!(fixed.servers.len(), 1);
+        assert_eq!(fixed.servers[0].urls, vec!["turn:cat.example.com:3478"]);
+    }
+
+    /// 解析不了的才丢，而且**丢什么要报出来**：静默丢会让人以为「配了六个」实际只有五个。
+    /// 报的是**去掉凭据**的形态（`'@'` 之前全丢），日志里不能出现密码。
+    ///
+    /// `turn:user:pass@host` 那种把凭据塞进 URL 的写法**不是** webrtc 认的（它不读 URL 里的
+    /// userinfo，凭据只在同一个条目的 `username` / `credential` 字段里），所以这一条也归在
+    /// 「丢掉」——写成那样的人不是配错了凭据，就是配错了地方，两种情况都该在日志里看见。
+    ///
+    /// 空 URL 是例外——那本来就是「没有这一条」，不报。
+    #[test]
+    fn unusable_ice_urls_are_dropped_and_reported_without_credentials() {
+        let servers = vec![IceServer {
+            urls: [
+                "",
+                "   ",
+                "http://cat.example.com:3478",
+                "192.168.1.9:99999",
+                "http://u:p@cat.example.com",
+                "turn:user:pass@hidden.example.com:3478",
+            ]
+            .iter()
+            .map(|url| url.to_string())
+            .collect(),
+            username: String::new(),
+            credential: String::new(),
+        }];
+
+        let fixed = normalize_ice_servers(servers);
+
+        assert!(fixed.servers.is_empty());
+        assert_eq!(
+            fixed.dropped,
+            vec![
+                "http://cat.example.com:3478",
+                "192.168.1.9:99999",
+                "cat.example.com",
+                "hidden.example.com:3478",
+            ]
+        );
+    }
+
+    /// 接线用例：`drive()` 开头那次 [`normalize_ice_servers`] 真的在跑。
+    ///
+    /// 上面几条钉的是「怎么修」，这一条钉的是「有没有接上」——把那行调用删掉，上面几条照样
+    /// 全绿，只有这一条会红。判据是「这一轮还开得起来」：地址少了前缀时，webrtc 在
+    /// `PeerConnectionBuilder::build()` 那一步就报 `unknown scheme type`，连 offer 都发不出去
+    /// （2026-09-29 那场风暴的每一轮都是这么死的）。
+    ///
+    /// 地址用回环：补出来的 `stun:127.0.0.1:3478` 解析得动、不会去打网络上的第三方 STUN。
+    /// 这一条只验「建得起来、offer 出得来」，不验候选收集。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_entry_without_a_scheme_still_lets_the_round_start() {
+        let server = IceServer {
+            urls: vec!["127.0.0.1:3478".to_string()],
+            username: String::new(),
+            credential: String::new(),
+        };
+        let (link, mut events) = P2pLink::spawn("a".to_string(), vec![server]);
+
+        // 对端的 hello：「b」字典序更大，所以这一侧是发起方，会建通道并发 offer
+        link.handle_signal(PairSignalPayload::Hello {
+            version: SIGNAL_VERSION,
+            device_id: "b".to_string(),
+            features: vec![FEATURE_RELIABLE_CHANNEL.to_string()],
+        });
+
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.next().await {
+                if let P2pEvent::Signal(PairSignalPayload::Offer { .. }) = event {
+                    return true;
+                }
+            }
+
+            false
+        })
+        .await;
+
+        assert!(started.is_ok(), "10 秒内没等到 offer：这一轮没开起来");
+        assert!(started.unwrap_or(false), "腿提前结束了：这一轮没开起来");
+    }
+
+    /// 连着几轮连 `PeerConnection` 都没建起来时要踩刹车：重开一轮的触发点（对端的 hello）
+    /// 会被挡在 [`retry_delay`] 之外，否则对端每 hello 一次我们就重建一次——2026-09-29
+    /// 16:24 那 26 秒 22 轮就是两半加在一起（每一轮都死在 `unknown scheme type` 上 +
+    /// 每次 hello 都把退避清掉）。退避到点则照常重建，并把刹车复位。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_build_failure_brakes_the_next_round_until_the_backoff_elapses() {
+        fn idle_leg(last_build_at: Option<tokio::time::Instant>, build_failures: u32) -> Leg {
+            let (driver, _incoming) = mpsc::unbounded_channel();
+            let (events, _event_rx) = mpsc::unbounded_channel();
+
+            Leg {
+                device_id: "leg-under-test".to_string(),
+                ice_servers: Vec::new(),
+                driver,
+                events,
+                peer_ready: true,
+                offerer: true,
+                peer: None,
+                pet_state: None,
+                reliable: None,
+                peer_features: Vec::new(),
+                manual: false,
+                gathering_complete: false,
+                code_pending: None,
+                code_sent: false,
+                code_deadline: None,
+                writable: Arc::new(AtomicBool::new(true)),
+                remote_ready: false,
+                buffered_candidates: Vec::new(),
+                last_build_at,
+                build_failures,
+                deferred_until: None,
+            }
+        }
+
+        // 刚建失败过：这一轮不建，并把「什么时候再来」交出去
+        let mut braked = idle_leg(Some(tokio::time::Instant::now()), 1);
+
+        braked.start().await;
+
+        assert!(braked.peer.is_none(), "刹车期间不该建 PeerConnection");
+
+        let until = braked.deferred_until.expect("刹车要排出下一次的时刻");
+        let now = tokio::time::Instant::now();
+
+        assert!(until > now, "{until:?} 应该在未来");
+        // 第一次退避就是 `retry_delay(0)`（5 秒），别差太多
+        assert!(until <= now + retry_delay(0) + Duration::from_secs(1));
+
+        // 退避到点：照常建起来，刹车复位
+        let mut released = idle_leg(Some(tokio::time::Instant::now() - retry_delay(0)), 1);
+
+        released.start().await;
+
+        assert!(released.peer.is_some(), "退避到点后应该真的去建");
+        assert_eq!(released.build_failures, 0);
+        assert!(released.deferred_until.is_none());
     }
 
     /// 手工码那句「大概率只有同一个网络里能连」全靠它：数的是**非 host** 候选。
