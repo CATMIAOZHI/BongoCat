@@ -16,6 +16,7 @@ import type { PetSnapshot } from '@/composables/usePairActivity'
 import type { Model } from '@/stores/model'
 
 import AwaySign from '@/components/away-sign/index.vue'
+import HeldKeyHighlights from '@/components/held-key-highlights/index.vue'
 import { getSupportedKey, useModel } from '@/composables/useModel'
 import { defaultSnapshot, sanitizeSnapshot } from '@/composables/usePairActivity'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
@@ -92,6 +93,7 @@ const { handleMouseRatio, handleKeyChange, handleMouseChange, handlePress, handl
 usePairStatus()
 
 const modelSize = ref<ModelSize>()
+const renderedModel = ref<Model>()
 const modelReady = ref(false)
 const backgroundImagePath = ref<string>()
 const remote = ref<PetSnapshot>(defaultSnapshot())
@@ -239,6 +241,7 @@ async function loadModel() {
 
 async function loadModelOnce(model: Model) {
   modelReady.value = false
+  renderedModel.value = undefined
 
   try {
     const loaded = await live2d.load(model.path)
@@ -247,6 +250,7 @@ async function loadModelOnce(model: Model) {
     // 新模型是默认参数：作废「跳过没变化的帧」的记录，否则参数要等下一次变化才补上
     resetApplied()
     await loadSupportKeys(model)
+    renderedModel.value = model
     // 换模型之后贴在旧模型上的键贴图必须立刻摘掉
     appliedRemoteKeys.clear()
 
@@ -582,6 +586,7 @@ function handleMouseDown() {
       />
 
       <!-- R37：对方按着的键贴图，和猫咪窗口同一套渲染方式 -->
+      <HeldKeyHighlights :model="renderedModel" />
       <img
         v-for="path in modelStore.pressedKeys"
         :key="path"

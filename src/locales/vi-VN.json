@@ -14,6 +14,7 @@
           "modelSettings": "Cài đặt Mô hình",
           "mirrorMode": "Chế độ gương",
           "mouseMirror": "Phản chiếu chuột",
+          "highlightAllHeldKeys": "Làm nổi bật mọi phím đang giữ",
           "ignoreMouse": "Bỏ qua sự kiện chuột",
           "windowSettings": "Cài đặt Cửa sổ",
           "passThrough": "Click xuyên",
@@ -31,6 +32,7 @@
         "hints": {
           "mirrorMode": "Bật để lật ngang mô hình.",
           "mouseMirror": "Khi bật, chuột của mô hình sẽ phản chiếu theo chuyển động chuột thực tế.",
+          "highlightAllHeldKeys": "Làm nổi bật mọi phím đang giữ mà không đổi chuyển động chân mèo. Áp dụng cho mô hình tiêu chuẩn và bàn phím có sẵn của cả hai mèo. Mô hình tùy chỉnh giữ cách hiển thị cũ.",
           "ignoreMouse": "Khi bật, mô hình sẽ không phản hồi sự kiện chuột. Hữu ích cho chế độ bàn phím hoặc chế độ tay cầm.",
           "motionSound": "Khi bật, mô hình sẽ phát các âm thanh tương ứng khi thực hiện hành động (nếu tồn tại).",
           "behavior": "Khi bật, các hành động và biểu cảm có thể được cấu hình và kích hoạt.",

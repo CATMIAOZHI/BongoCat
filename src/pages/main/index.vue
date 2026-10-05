@@ -15,6 +15,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import AwaySign from '@/components/away-sign/index.vue'
 import ChatOverlay from '@/components/chat-overlay/index.vue'
+import HeldKeyHighlights from '@/components/held-key-highlights/index.vue'
 import { useAppMenu } from '@/composables/useAppMenu'
 import { useDevice } from '@/composables/useDevice'
 import { useGamepad } from '@/composables/useGamepad'
@@ -385,6 +386,7 @@ function handleMouseMove(event: MouseEvent) {
       >
 
       <canvas id="live2dCanvas" />
+      <HeldKeyHighlights :model="modelStore.currentModel" />
 
       <img
         v-for="path in modelStore.pressedKeys"

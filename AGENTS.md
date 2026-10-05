@@ -44,6 +44,8 @@
 
 ## 仓库边界
 
+- 多键同时高亮由 `cat.model.highlightAllHeldKeys` 控制（默认开启，旧设置缺字段也按开启），入口在偏好设置的模型设置。`held-key-highlights` 组件只给内置标准/键盘模型补画 `heldKeys` 中不在 `pressedKeys` 的青色键位；原 `pressedKeys` 和猫爪动作完全不变。贴图中的爪子与高亮混在一起，不能直接叠加所有按键贴图；青色提取只适用于已核对过的内置模型，自定义模型保留原显示。组件按源路径缓存裁剪后的键位、仅按键变化时重绘，位于 Live2D 与原爪子贴图之间；远端模型以实际加载成功的 `renderedModel`（含回退）为准，不以本机所选模型猜测。
+
 - 远端：`origin` = CATMIAOZHI/BongoCat（fork）；上游 = ayangweb/BongoCat，上游主分支为 `master`（上游没有 `dev` 分支）。
 - **本 fork 的主分支是 `main`**（2026-09-29 起是 GitHub 仓库设置里的 default branch，之前那个名字是 `feat/pair-desktop-v1`）：仓库首页、克隆、新建 PR 的默认 base 都落在这一版上，它在上游 `master` 之上带着本地定制（双人联机功能，仅 Windows 范围）。
 - 上游 `master` 只作参照：本地定制不合并上去；向上游贡献照旧另开分支（见下一条）。

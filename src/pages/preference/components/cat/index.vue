@@ -40,6 +40,16 @@ const catStore = useCatStore()
     </ProListItem>
 
     <ProListItem
+      :description="$t('pages.preference.cat.hints.highlightAllHeldKeys')"
+      :title="$t('pages.preference.cat.labels.highlightAllHeldKeys')"
+    >
+      <Switch
+        :checked="catStore.model.highlightAllHeldKeys !== false"
+        @update:checked="catStore.model.highlightAllHeldKeys = $event"
+      />
+    </ProListItem>
+
+    <ProListItem
       :description="$t('pages.preference.cat.hints.behavior')"
       :title="$t('pages.preference.cat.labels.behavior')"
     >

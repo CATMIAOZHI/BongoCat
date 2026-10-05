@@ -122,6 +122,7 @@
           "modelSettings": "模型设置",
           "mirrorMode": "镜像模式",
           "mouseMirror": "鼠标镜像",
+          "highlightAllHeldKeys": "高亮所有按住的键",
           "ignoreMouse": "忽略鼠标事件",
           "windowSettings": "窗口设置",
           "passThrough": "窗口穿透",
@@ -139,6 +140,7 @@
         "hints": {
           "mirrorMode": "启用后，模型将水平镜像翻转。",
           "mouseMirror": "启用后，鼠标将镜像跟随手部移动。",
+          "highlightAllHeldKeys": "同时高亮所有按住的键，猫爪动作不变。适用于自己和对方的内置标准、键盘模型；自定义模型保留原显示方式。",
           "ignoreMouse": "启用后，模型将不再响应鼠标事件，适用于键盘模式或手柄模式。",
           "motionSound": "启用后，模型执行动作时会播放对应音效（如果存在）。",
           "behavior": "启用后，可以配置和触发模型的动作与表情。",

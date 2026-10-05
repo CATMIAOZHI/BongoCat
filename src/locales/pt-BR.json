@@ -14,6 +14,7 @@
           "modelSettings": "Configurações do Modelo",
           "mirrorMode": "Modo Espelho",
           "mouseMirror": "Espelho do Mouse",
+          "highlightAllHeldKeys": "Destacar Todas as Teclas Pressionadas",
           "ignoreMouse": "Ignorar Eventos do Mouse",
           "windowSettings": "Configurações da Janela",
           "passThrough": "Janela Transparente",
@@ -31,6 +32,7 @@
         "hints": {
           "mirrorMode": "Quando ativado, o modelo será invertido horizontalmente.",
           "mouseMirror": "Quando ativado, o mouse espelhará o movimento da mão.",
+          "highlightAllHeldKeys": "Destaca todas as teclas pressionadas sem alterar as patas. Funciona nos modelos padrão e teclado integrados de ambos os gatos. Modelos personalizados mantêm a exibição original.",
           "ignoreMouse": "Quando ativado, o modelo não responderá a eventos do mouse. Útil para o modo teclado ou modo controle.",
           "motionSound": "Quando ativado, o modelo reproduzirá efeitos sonoros correspondentes ao executar ações (se existirem).",
           "behavior": "Quando ativado, movimentos e expressões podem ser configurados e acionados.",

@@ -122,6 +122,7 @@
           "modelSettings": "Model Settings",
           "mirrorMode": "Mirror Mode",
           "mouseMirror": "Mouse Mirror",
+          "highlightAllHeldKeys": "Highlight All Held Keys",
           "ignoreMouse": "Ignore Mouse Events",
           "windowSettings": "Window Settings",
           "passThrough": "Pass Through",
@@ -139,6 +140,7 @@
         "hints": {
           "mirrorMode": "When enabled, the model will be mirrored horizontally.",
           "mouseMirror": "When enabled, the mouse will mirror the hand movement.",
+          "highlightAllHeldKeys": "Highlight all held keys without changing paw movements. Applies to built-in standard and keyboard models for both cats. Custom models keep their original display.",
           "ignoreMouse": "When enabled, the model will not respond to mouse events. Useful for keyboard mode or gamepad mode.",
           "motionSound": "When enabled, the model will play corresponding sound effects when performing actions (if they exist).",
           "behavior": "When enabled, motions and expressions can be configured and triggered.",
