@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime, command};
@@ -54,15 +55,33 @@ const MOUSE_EMIT_HZ: u64 = 60;
 /// 另一个键。影响很小：注入照例连抬起一起发，而前端在收到抬起时就撤掉了那一轮、不会再问；
 /// 真把抬起丢了也只是可能答成「还按着」，等那个不相干的键松开就自愈。这里不特殊处理——
 /// 分辨不出来，而按扫描码把键名丢掉反而会让这个键退回到点释放。
-static KEY_CODES: LazyLock<Mutex<HashMap<String, i32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static KEY_CODES: LazyLock<Mutex<HashMap<String, i32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[command]
 pub async fn start_device_listening<R: Runtime>(app_handle: AppHandle<R>) -> Result<(), String> {
-    if IS_LISTENING.load(Ordering::SeqCst) {
+    if IS_LISTENING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Ok(());
     }
 
-    IS_LISTENING.store(true, Ordering::SeqCst);
+    // 只传不含字符串的离散事件；鼠标移动不进队列。保持 press/release/repeat 顺序，
+    // 不用有界队列丢弃 release，也不在钩子里等待消费者。消费者的 emit 只是投递窗口消息。
+    let (sender, receiver) = mpsc::channel::<(EventType, u32)>();
+    let dispatcher = app_handle.clone();
+    if let Err(err) = std::thread::Builder::new()
+        .name("device-events".into())
+        .spawn(move || {
+            for (event_type, platform_code) in receiver {
+                dispatch_device_event(&dispatcher, event_type, platform_code);
+            }
+        })
+    {
+        IS_LISTENING.store(false, Ordering::SeqCst);
+        return Err(format!("Failed to start device dispatcher: {err}"));
+    }
 
     // 合并鼠标移动的那条线程（见 `MOUSE_X` 的注释）：与钩子线程分开，钩子只负责记坐标。
     //
@@ -73,26 +92,7 @@ pub async fn start_device_listening<R: Runtime>(app_handle: AppHandle<R>) -> Res
     std::thread::spawn(move || coalesce_mouse_moves(coalescer));
 
     let callback = move |event: Event| {
-        // 键码只在键盘事件上有意义（鼠标事件上是 0）。`platform_code` 在 Windows 上就是
-        // `vkCode`，键名与下面 emit 给前端的是同一个（`{:?}` 出来的枚举名）
-        if let EventType::KeyPress(key) | EventType::KeyRelease(key) = &event.event_type {
-            if event.platform_code != 0 {
-                KEY_CODES
-                    .lock()
-                    .unwrap()
-                    .insert(format!("{key:?}"), event.platform_code as i32);
-            }
-        }
-
-        let device_event = match event.event_type {
-            EventType::ButtonPress(button) => DeviceEvent {
-                kind: DeviceEventKind::MousePress,
-                value: json!(format!("{:?}", button)),
-            },
-            EventType::ButtonRelease(button) => DeviceEvent {
-                kind: DeviceEventKind::MouseRelease,
-                value: json!(format!("{:?}", button)),
-            },
+        match event.event_type {
             EventType::MouseMove { x, y } => {
                 // 这里**不能**直接发（见 `MOUSE_X` 的注释）：只记坐标，最后置一次标志就返回。
                 //
@@ -111,23 +111,106 @@ pub async fn start_device_listening<R: Runtime>(app_handle: AppHandle<R>) -> Res
 
                 return;
             }
-            EventType::KeyPress(key) => DeviceEvent {
-                kind: DeviceEventKind::KeyboardPress,
-                value: json!(format!("{:?}", key)),
-            },
-            EventType::KeyRelease(key) => DeviceEvent {
-                kind: DeviceEventKind::KeyboardRelease,
-                value: json!(format!("{:?}", key)),
-            },
+            EventType::KeyPress(_)
+            | EventType::KeyRelease(_)
+            | EventType::ButtonPress(_)
+            | EventType::ButtonRelease(_) => {
+                let _ = sender.send((event.event_type, event.platform_code));
+            }
             _ => return,
-        };
-
-        let _ = app_handle.emit("device-changed", device_event);
+        }
     };
 
-    listen(callback).map_err(|err| format!("Failed to listen device: {:?}", err))?;
+    // rdev::listen 是常驻阻塞消息循环，不能直接占住 Tokio 的异步工作线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        listen(callback).map_err(|err| format!("Failed to listen device: {err:?}"))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
 
-    Ok(())
+/// 格式化、键码登记和 WebView 消息投递都离开系统输入钩子。
+fn dispatch_device_event<R: Runtime>(
+    app: &AppHandle<R>,
+    event_type: EventType,
+    platform_code: u32,
+) {
+    if let EventType::KeyPress(key) | EventType::KeyRelease(key) = event_type {
+        if platform_code != 0 {
+            KEY_CODES
+                .lock()
+                .unwrap()
+                .insert(format!("{key:?}"), platform_code as i32);
+        }
+    }
+    if let Some(event) = discrete_device_event(event_type) {
+        let _ = app.emit("device-changed", event);
+    }
+}
+
+fn discrete_device_event(event_type: EventType) -> Option<DeviceEvent> {
+    let (kind, value) = match event_type {
+        EventType::ButtonPress(button) => (DeviceEventKind::MousePress, format!("{button:?}")),
+        EventType::ButtonRelease(button) => (DeviceEventKind::MouseRelease, format!("{button:?}")),
+        EventType::KeyPress(key) => (DeviceEventKind::KeyboardPress, format!("{key:?}")),
+        EventType::KeyRelease(key) => (DeviceEventKind::KeyboardRelease, format!("{key:?}")),
+        _ => return None,
+    };
+    Some(DeviceEvent {
+        kind,
+        value: json!(value),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdev::{Button, Key};
+
+    #[test]
+    fn discrete_dispatch_preserves_chords_repeats_and_releases() {
+        // W 一直按着，A/D 按下再释放：队列不能把 W 的重复或任意 release 合并掉。
+        let input = [
+            EventType::KeyPress(Key::KeyW),
+            EventType::KeyPress(Key::KeyW),
+            EventType::KeyPress(Key::KeyA),
+            EventType::KeyPress(Key::KeyD),
+            EventType::KeyRelease(Key::KeyA),
+            EventType::KeyRelease(Key::KeyD),
+            EventType::ButtonPress(Button::Left),
+            EventType::ButtonRelease(Button::Left),
+            EventType::KeyRelease(Key::KeyW),
+        ];
+        let (tx, rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            for event in input {
+                tx.send(event).unwrap();
+            }
+        });
+        let actual: Vec<_> = rx
+            .into_iter()
+            .map(|event| serde_json::to_value(discrete_device_event(event).unwrap()).unwrap())
+            .collect();
+        producer.join().unwrap();
+        assert_eq!(
+            actual,
+            json!([
+                {"kind":"KeyboardPress","value":"KeyW"},
+                {"kind":"KeyboardPress","value":"KeyW"},
+                {"kind":"KeyboardPress","value":"KeyA"},
+                {"kind":"KeyboardPress","value":"KeyD"},
+                {"kind":"KeyboardRelease","value":"KeyA"},
+                {"kind":"KeyboardRelease","value":"KeyD"},
+                {"kind":"MousePress","value":"Left"},
+                {"kind":"MouseRelease","value":"Left"},
+                {"kind":"KeyboardRelease","value":"KeyW"}
+            ])
+            .as_array()
+            .unwrap()
+            .to_vec()
+        );
+        assert!(discrete_device_event(EventType::MouseMove { x: 1.0, y: 2.0 }).is_none());
+    }
 }
 
 /// 把钩子记下的坐标按 [`MOUSE_EMIT_HZ`] 合并后发出去（见 [`MOUSE_X`] 的注释）。

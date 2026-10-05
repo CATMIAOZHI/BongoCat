@@ -54,7 +54,7 @@ function createCursorMonitor() {
 
     const appWindow = getCurrentWebviewWindow()
 
-    const scaleFactor = await appWindow.scaleFactor()
+    const scaleFactor = isMac ? await appWindow.scaleFactor() : 1
 
     const { x, y } = monitorQueryPoint(cursorPoint, scaleFactor)
 

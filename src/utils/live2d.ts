@@ -43,6 +43,7 @@ class Live2d {
       view: view ?? void 0,
       resizeTo: view?.parentElement ?? window,
       backgroundAlpha: 0,
+      autoStart: false,
       autoDensity: true,
       resolution: devicePixelRatio,
     }).then(() => {
@@ -82,6 +83,8 @@ class Live2d {
     })
 
     this.app?.stage.addChild(this.model)
+    // easy-live2d 在首次 renderFrame 中启动加载，必须在等待 ready 前恢复渲染。
+    this.app?.start()
 
     await this.model.ready
 
@@ -99,11 +102,15 @@ class Live2d {
   }
 
   public destroy() {
+    this.app?.ticker?.stop()
+
     if (!this.model) return
 
     this.model?.destroy()
 
     this.model = null
+    // 清掉最后一帧，但不为一张空画布持续请求动画帧。
+    this.app?.render()
   }
 
   public resizeModel(modelSize: ModelSize) {

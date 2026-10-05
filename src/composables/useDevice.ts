@@ -112,6 +112,7 @@ export function useDevice() {
       smoothedCursorPoint.value = { ...destination }
 
       latestCursorPoint.value = void 0
+      Ticker.shared.remove(tickerCallback)
     } else {
       smoothedCursorPoint.value = interpolated
     }
@@ -139,7 +140,7 @@ export function useDevice() {
       return Ticker.shared.remove(tickerCallback)
     }
 
-    return Ticker.shared.add(tickerCallback)
+    if (latestCursorPoint.value) Ticker.shared.add(tickerCallback)
   }, { immediate: true })
 
   const startListening = () => {
@@ -298,7 +299,11 @@ export function useDevice() {
         pairState.handlePointerMove(value)
         void syncPointer(value)
 
-        return latestCursorPoint.value = value
+        // 到位就取消动画回调；下一次真实移动再唤醒。原始点的联机同步不依赖 RAF。
+        if (!catStore.model.ignoreMouse && !latestCursorPoint.value) {
+          Ticker.shared.add(tickerCallback)
+        }
+        latestCursorPoint.value = value
     }
   })
 
