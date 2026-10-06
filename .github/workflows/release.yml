@@ -43,7 +43,7 @@ jobs:
 
       - name: Generate changelog
         id: create_release
-        run: npx changelogithub --draft --name ${{ steps.vars.outputs.tag }}
+        run: npx changelogithub --name ${{ steps.vars.outputs.tag }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -113,7 +113,7 @@ jobs:
           # （标题会变成「BongoCat 」）；自用版直接用标签名
           releaseName: BongoCat ${{ github.ref_name }}
           releaseBody: ''
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           includeUpdaterJson: false
           args: --target ${{ matrix.target }} --no-sign
