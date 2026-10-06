@@ -203,7 +203,7 @@ export function pairManualOffer(secret?: string, stun?: string) {
   return invoke<void>(INVOKE_KEY.PAIR_MANUAL_OFFER, { secret, stun })
 }
 
-/** 配对码第二步（粘贴方）：把对方发来的码 1 粘进来，本端会出码 2 交给对方 */
+/** 粘贴统一入口：后端按码的实际类型接收出码或回码 */
 export function pairManualJoin(code: string, secret?: string, stun?: string) {
   return invoke<void>(INVOKE_KEY.PAIR_MANUAL_JOIN, { code, secret, stun })
 }

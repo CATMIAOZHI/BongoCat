@@ -28,7 +28,6 @@ import {
   pairHistoryExport,
   pairHistoryStartNewEpoch,
   pairHistoryStats,
-  pairManualAnswer,
   pairManualJoin,
   pairManualOffer,
   pairSetMaxAttachmentMb,
@@ -458,6 +457,23 @@ const modelOptions = computed(() => {
 
 const statusText = computed(() => `pages.preference.pair.status.${status.value.key}`)
 
+const peerInputStats = computed(() => {
+  const { connection, peerOnline, remoteStats } = pairStore.runtime
+
+  return pairStore.settings.enabled && connection === 'connected' && peerOnline && remoteStats?.share
+    ? remoteStats
+    : undefined
+})
+
+const peerInputNote = computed(() => {
+  if (!pairStore.settings.enabled) return 'pages.preference.pair.status.disabled'
+  if (pairStore.runtime.connection !== 'connected') return statusText.value
+  if (!pairStore.runtime.peerOnline) return 'pages.preference.pair.status.peerOffline'
+  if (pairStore.runtime.remoteStats?.share === false) return 'pages.preference.pair.hints.peerStatsPrivate'
+
+  return 'pages.preference.pair.hints.peerStatsWaiting'
+})
+
 /**
  * 换了任一凭据之后，旧连接上用的凭据已经失效。
  *
@@ -876,15 +892,6 @@ const manualFewCandidates = computed(() => {
   return Boolean(manual?.waitingForCode && manual.nonHostCandidates === 0)
 })
 
-/** 粘贴框那个按钮叫什么、点了做什么，取决于现在有没有一次配对在进行 */
-const manualPasteLabel = computed(() => {
-  const manual = pairStore.runtime.manual
-
-  if (manual?.role === 'host') return 'pages.preference.pair.manual.answer'
-
-  return 'pages.preference.pair.manual.join'
-})
-
 /** 配对码还缺什么（缺了就别让人点——点了只会等一句 Rust 的报错） */
 const manualMissing = computed(() => {
   if (!secretInput.value.trim() && !pairStore.hasSecret && !secretUnknown.value) {
@@ -946,12 +953,8 @@ async function handleManualPaste() {
   try {
     pairStore.runtime.lastError = void 0
 
-    // 出码方手里已经有会话了：这一段就是对方交回来的码 2；其余情况都是「拿别人的码 1 加入」
-    if (pairStore.runtime.manual?.role === 'host') {
-      await pairManualAnswer(code)
-    } else {
-      await pairManualJoin(code, secretInput.value.trim() || void 0, stunSetting())
-    }
+    // 双方可能都点过生成：以解密后的码类型为准，不按本机角色猜。
+    await pairManualJoin(code, secretInput.value.trim() || void 0, stunSetting())
 
     manualCodeInput.value = ''
   } catch (reason) {
@@ -1541,7 +1544,7 @@ const {
         type="warning"
       />
 
-      <!-- 粘贴框：出码方用它交回码 2，其余情况都是「拿别人的码 1 加入」 -->
+      <!-- 统一粘贴入口：后端识别出码/回码，处理双方都生成了出码的情况。 -->
       <Flex
         class="mt-2 w-full"
         gap="small"
@@ -1561,7 +1564,7 @@ const {
           type="primary"
           @click="handleManualPaste"
         >
-          {{ $t(manualPasteLabel) }}
+          {{ $t('pages.preference.pair.manual.join') }}
         </Button>
       </Flex>
     </ProListItem>
@@ -2035,6 +2038,34 @@ const {
           {{ $t('pages.preference.pair.labels.totalInput', {
             keyboard: pairStatsStore.stats.totalKeyboard,
             mouse: pairStatsStore.stats.totalMouse,
+          }) }}
+        </span>
+      </Flex>
+    </ProListItem>
+    <ProListItem
+      :description="peerInputStats
+        ? $t('pages.preference.pair.hints.peerStatsDate', { date: peerInputStats.date })
+        : $t(peerInputNote)"
+      :title="$t('pages.preference.pair.labels.peerInput')"
+      vertical
+    >
+      <Flex
+        v-if="peerInputStats"
+        align="center"
+        class="w-full"
+        gap="large"
+        wrap
+      >
+        <span>
+          {{ $t('pages.preference.pair.labels.todayInput', {
+            keyboard: peerInputStats.todayKeyboard,
+            mouse: peerInputStats.todayMouse,
+          }) }}
+        </span>
+        <span class="color-text-tertiary">
+          {{ $t('pages.preference.pair.labels.totalInput', {
+            keyboard: peerInputStats.totalKeyboard,
+            mouse: peerInputStats.totalMouse,
           }) }}
         </span>
       </Flex>

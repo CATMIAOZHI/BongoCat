@@ -769,6 +769,24 @@ impl PairManager {
         )
     }
 
+    /// 粘贴统一入口：码的类型决定操作，不能用界面缓存的本机角色猜测。
+    pub fn paste_manual(
+        self: &Arc<Self>,
+        code_text: &str,
+        secret: Option<&str>,
+        stun: Option<&str>,
+    ) -> Result<(), String> {
+        // 回码必须沿用出码时的密码，不能被后来修改的输入框或凭据覆盖。
+        if let Some((active_secret, _)) = self.manual_state() {
+            if let Ok(code) = manual::decode(&active_secret, code_text) {
+                if code.kind == ManualCodeKind::Answer {
+                    return self.apply_manual_answer(code_text);
+                }
+            }
+        }
+        self.join_manual(code_text, secret, stun)
+    }
+
     /// 手工码第二步（粘贴方）：解开码 1 并起会话，接着出码 2。
     ///
     /// 会话 id 用**对端码里那个**：两段码必须属于同一次配对，出码方交回码 2 时会核对。
@@ -785,6 +803,8 @@ impl PairManager {
         if code.kind != ManualCodeKind::Offer {
             return Err("这是一段回码，要交给出码的那台电脑".to_string());
         }
+
+        validate_manual_offer(&self.status(), &self.device_id(), &code.device_id)?;
 
         self.spawn_manual(
             secret,
@@ -804,6 +824,10 @@ impl PairManager {
 
         let code = manual::decode(&secret, code_text)
             .map_err(|error| error.user_message().to_string())?;
+
+        if code.device_id == self.device_id() {
+            return Err("这是本机生成的配对码，请粘贴对方发来的码".to_string());
+        }
 
         if code.kind != ManualCodeKind::Answer {
             return Err("这是一段出码，应该交给另一台电脑".to_string());
@@ -1908,6 +1932,38 @@ async fn run_session(
         status.state = PairConnectionState::Disconnected;
         status.peer_online = false;
     });
+}
+
+/// 新出码只替换尚未完成的配对；双出码碰撞时只允许一方退为粘贴方。
+fn validate_manual_offer(status: &PairStatus, local_id: &str, peer_id: &str) -> Result<(), String> {
+    if local_id == peer_id {
+        return Err("这是本机生成的配对码，请粘贴对方发来的码".into());
+    }
+    if let Some(manual) = &status.manual {
+        match manual.phase {
+            ManualPhase::Joining | ManualPhase::Connected => {
+                return Err("正在连接或已经连上了；要换一段出码，请先取消当前配对".into());
+            }
+            ManualPhase::AnswerReady => {
+                return Err("已生成回码，请把本机的回码发给对方；要重新配对请先取消".into());
+            }
+            ManualPhase::Gathering | ManualPhase::OfferReady
+                if manual.role == ManualRole::Host && local_id < peer_id
+                    && (manual.phase == ManualPhase::Gathering
+                        || manual.expires_at.is_some_and(|expiry| expiry > now_millis())) =>
+            {
+                // 双方都生成了出码时固定保留一方，避免同时互贴后两边都变成 guest。
+                return Err("双方都生成了出码：请保留本机这段码并发给对方，让对方粘贴后把回码发回来；不要重新生成".into());
+            }
+            _ => {}
+        }
+    } else if matches!(status.state, PairConnectionState::Connecting
+        | PairConnectionState::Connected | PairConnectionState::ConnectedPeerOffline
+        | PairConnectionState::Reconnecting)
+    {
+        return Err("当前正在使用服务器连接，请先断开，再使用配对码".into());
+    }
+    Ok(())
 }
 
 /// 把设置里那份公益 STUN 清单变成 ICE 条目。
@@ -4781,6 +4837,81 @@ mod tests {
         ));
 
         (manager, sink)
+    }
+
+    fn manual_host_for_test(manager: &Arc<PairManager>) {
+        *PairManager::lock(&manager.manual) = Some(ManualSession {
+            secret: [7; 32],
+            session_id: "manual-test".into(),
+        });
+        let mut status = PairManager::lock(&manager.status);
+        let mut manual = ManualStatus::starting(ManualRole::Host, "manual-test".into());
+        manual.phase = ManualPhase::OfferReady;
+        manual.expires_at = Some(now_millis() + 60_000);
+        status.manual = Some(manual);
+    }
+
+    #[test]
+    fn manual_paste_routes_answer_using_active_secret_and_keeps_session_checks() {
+        let (manager, _) = test_manager();
+        manual_host_for_test(&manager);
+        let mut receiver = with_session(&manager);
+        let answer = manual::ManualCode::answer("peer", "manual-test", vec![], "answer-sdp".into());
+        let text = manual::encode(&[7; 32], &answer).unwrap();
+        // 即便输入框的密码已被改坏，当前回码仍使用出码时的密码。
+        manager.paste_manual(&text, Some("changed draft"), None).unwrap();
+        assert!(matches!(receiver.try_recv().unwrap(), Command::ManualSignal(signal)
+            if matches!(*signal, PairSignalPayload::Answer { ref description } if description == "answer-sdp")));
+
+        let wrong = manual::ManualCode::answer("peer", "other-session", vec![], "sdp".into());
+        assert!(manager.paste_manual(&manual::encode(&[7; 32], &wrong).unwrap(), None, None)
+            .unwrap_err().contains("会话对不上"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn manual_paste_host_accepts_offer_path_instead_of_forcing_answer() {
+        use base64::Engine;
+        let (manager, _) = test_manager();
+        manual_host_for_test(&manager);
+        let offer = manual::ManualCode::offer("a-peer", "peer-session", vec![], "sdp".into());
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]);
+        // 无效 STUN 让测试在创建连接之前退出；抵达这个校验说明已正确选择加入新 offer。
+        let error = manager.paste_manual(
+            &manual::encode(&[7; 32], &offer).unwrap(), Some(&secret), Some("turn:invalid"),
+        ).unwrap_err();
+        assert!(error.contains("STUN") || error.contains("第 1 行"), "{error}");
+        assert_eq!(manager.manual_state().unwrap().1, "manual-test");
+    }
+
+    #[test]
+    fn manual_offer_collision_keeps_exactly_one_host_and_protects_live_sessions() {
+        let (manager, _) = test_manager();
+        manual_host_for_test(&manager);
+        let mut status = manager.status();
+        assert!(validate_manual_offer(&status, "a", "b").unwrap_err().contains("双方"));
+        assert!(validate_manual_offer(&status, "b", "a").is_ok());
+        assert!(validate_manual_offer(&status, "a", "a").unwrap_err().contains("本机"));
+        status.manual.as_mut().unwrap().expires_at = Some(0);
+        assert!(validate_manual_offer(&status, "a", "b").is_ok());
+        for phase in [ManualPhase::Joining, ManualPhase::Connected, ManualPhase::AnswerReady] {
+            status.manual.as_mut().unwrap().phase = phase;
+            assert!(validate_manual_offer(&status, "b", "a").is_err());
+        }
+        status.manual = None;
+        status.state = PairConnectionState::Connected;
+        assert!(validate_manual_offer(&status, "b", "a").is_err());
+    }
+
+    #[test]
+    fn manual_paste_rejects_own_reply_without_sending() {
+        let (manager, _) = test_manager();
+        manual_host_for_test(&manager);
+        let mut receiver = with_session(&manager);
+        let own = manual::ManualCode::answer(&manager.device_id(), "manual-test", vec![], "sdp".into());
+        assert!(manager.paste_manual(&manual::encode(&[7; 32], &own).unwrap(), None, None)
+            .unwrap_err().contains("本机"));
+        assert!(receiver.try_recv().is_err());
     }
 
     /// 单测用的附件目录：每次一片新的临时目录，互不干扰

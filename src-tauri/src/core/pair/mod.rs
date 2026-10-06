@@ -242,7 +242,7 @@ pub async fn pair_manual_offer(
     Arc::clone(&manager).start_manual_offer(secret.as_deref(), stun.as_deref())
 }
 
-/// 手工码第二步（粘贴方）：把对方发来的码 1 粘进来，本端会出码 2 交给对方。
+/// 粘贴对方的配对码：按码内类型接收出码或回码，不依赖前端角色。
 #[command]
 pub async fn pair_manual_join(
     manager: State<'_, Arc<PairManager>>,
@@ -250,7 +250,7 @@ pub async fn pair_manual_join(
     secret: Option<String>,
     stun: Option<String>,
 ) -> Result<(), String> {
-    Arc::clone(&manager).join_manual(&code, secret.as_deref(), stun.as_deref())
+    Arc::clone(&manager).paste_manual(&code, secret.as_deref(), stun.as_deref())
 }
 
 /// 手工码最后一步（出码方）：把对方发回来的码 2 粘进来，ICE 从这一刻开始。
