@@ -24,7 +24,7 @@ import { useModel } from '@/composables/useModel'
 import { RECORDING_LIMIT_SECS } from '@/composables/usePair'
 import { usePairVoiceRecorder } from '@/composables/usePairVoice'
 import { useTauriListen } from '@/composables/useTauriListen'
-import { CHAT_OVERLAY_RATIO, LISTEN_KEY } from '@/constants'
+import { CHAT_OVERLAY_HEIGHT, LISTEN_KEY } from '@/constants'
 import { hideWindow, setAlwaysOnTop, setTaskbarVisibility, showWindow } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
 import { useGeneralStore } from '@/stores/general.ts'
@@ -70,19 +70,13 @@ const { stickActive } = useGamepad()
 /**
  * R39：猫咪窗口上那条聊天浮层只在**开启双人联机**时出现。
  *
- * 它占窗口顶上一块（高度按 `CHAT_OVERLAY_RATIO` 相对模型高度算），猫咪本体贴底不动，
- * 所以窗口总高 = 模型高 × (1 + 比例)。没开联机时窗口尺寸与过去完全一样。
+ * 聊天区保留固定的 CSS 高度，猫咪本体贴底。关闭后只收回聊天区。
  */
 const overlayVisible = computed(() => pairStore.settings.enabled && pairStore.settings.chat.overlayVisible !== false)
 
-/** 猫咪本体占窗口的百分比：浮层出现时把上面那块让出来 */
-const modelAreaPercent = computed(() => {
-  const ratio = overlayVisible.value ? CHAT_OVERLAY_RATIO : 0
-
-  return 100 / (1 + ratio)
-})
-
-const overlayAreaPercent = computed(() => 100 - modelAreaPercent.value)
+const overlayHeight = computed(() => overlayVisible.value ? CHAT_OVERLAY_HEIGHT : 0)
+const modelAreaHeight = computed(() => `calc(100% - ${overlayHeight.value}px)`)
+const pixelRatio = ref(window.devicePixelRatio || 1)
 
 /** 录音提示、待确认的语音、失败原因与「太短没录上」共用一块位置 */
 const showVoiceOverlay = computed(() => {
@@ -192,12 +186,11 @@ function targetWindowSize(scale = catStore.window.scale) {
   if (!modelSize.value) return
 
   const { width, height } = modelSize.value
-  const overlayHeight = overlayVisible.value ? height * CHAT_OVERLAY_RATIO : 0
   const factor = scale / 100
 
   return {
     width: Math.round(width * factor),
-    height: Math.round((height + overlayHeight) * factor),
+    height: Math.round(height * factor + overlayHeight.value * pixelRatio.value),
   }
 }
 
@@ -238,6 +231,7 @@ const debouncedResize = useDebounceFn(async () => {
 }, 100)
 
 useEventListener('resize', () => {
+  pixelRatio.value = window.devicePixelRatio || 1
   resizing.value = true
 
   debouncedResize()
@@ -246,8 +240,8 @@ useEventListener('resize', () => {
 watch(() => modelStore.currentModel, async (model) => {
   if (!model) return
 
-  // R39：换模型时把聊天浮层那一条也算进窗口高度
-  await handleLoad(overlayVisible.value ? CHAT_OVERLAY_RATIO : 0)
+  // 换模型时同样保留固定高度的聊天区。
+  await handleLoad(overlayHeight.value)
 
   const path = join(model.path, 'resources', 'background.png')
 
@@ -275,7 +269,7 @@ watch(() => modelStore.currentModel, async (model) => {
   modelStore.modelReady = true
 }, { deep: true, immediate: true })
 
-watch([() => catStore.window.scale, modelSize, overlayVisible], async () => {
+watch([() => catStore.window.scale, modelSize, overlayVisible, pixelRatio], async () => {
   const target = targetWindowSize()
 
   if (!target) return
@@ -361,7 +355,7 @@ function handleMouseMove(event: MouseEvent) {
     <div
       class="absolute inset-x-0 bottom-0 overflow-hidden children:(absolute size-full)"
       :class="{ '-scale-x-100': catStore.model.mirror }"
-      :style="{ height: `${modelAreaPercent}%` }"
+      :style="{ height: modelAreaHeight }"
     >
       <img
         v-if="backgroundImagePath"
@@ -383,7 +377,7 @@ function handleMouseMove(event: MouseEvent) {
     <div
       v-if="pairStore.settings.enabled && pairStore.settings.presence === 'away'"
       class="pointer-events-none absolute inset-x-0 bottom-0"
-      :style="{ height: `${modelAreaPercent}%` }"
+      :style="{ height: modelAreaHeight }"
     >
       <AwaySign :text="pairStore.settings.away.message || $t('pages.main.hints.awaySign')" />
     </div>
@@ -392,7 +386,7 @@ function handleMouseMove(event: MouseEvent) {
     <div
       v-show="overlayVisible"
       class="absolute inset-x-0 top-0"
-      :style="{ height: `${overlayAreaPercent}%` }"
+      :style="{ height: `${overlayHeight}px` }"
     >
       <ChatOverlay
         :pending="Boolean(recordingPending)"

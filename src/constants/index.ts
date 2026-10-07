@@ -1,13 +1,9 @@
 export const GITHUB_LINK = 'https://github.com/CATMIAOZHI/BongoCat'
 
 /**
- * 聊天浮层（R39）占猫咪窗口的高度比例：**相对模型高度**。
- *
- * 浮层挂在猫咪窗口的上方一条里，猫咪本体贴底不动，所以窗口总高 = 模型高 × (1 + 这个值)。
- * 只有开启双人联机时窗口才会多出这一条（见 `pages/main/index.vue`）。
- * 鼠标悬停不淡出、以及「点不到」的分界线都用它算，所以放在常量里让几处共用同一份口径。
+ * 猫咪上方聊天区的 CSS 高度：气泡字号和输入栏都是固定像素，预留空间也不能随猫缩小。
  */
-export const CHAT_OVERLAY_RATIO = 0.62
+export const CHAT_OVERLAY_HEIGHT = 190
 
 export const LISTEN_KEY = {
   SHOW_WINDOW: 'show-window',

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, useTemplateRef } from 'vue'
+import { useResizeObserver } from '@vueuse/core'
+import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type { ChatMessage } from '@/composables/usePair'
@@ -47,6 +48,7 @@ const { t } = useI18n()
 const { messages, loadLatest, apply, send } = usePairChat()
 
 const inputRef = useTemplateRef<HTMLTextAreaElement>('input')
+const messagesRef = useTemplateRef<HTMLElement>('messages')
 const draft = ref('')
 const sending = ref(false)
 const sendError = ref('')
@@ -81,6 +83,15 @@ const bubbleCount = computed(() => {
 const shownCount = computed(() => Math.min(bubbleCount.value, OVERLAY_BUBBLE_MAX))
 
 const bubbles = computed(() => messages.value.slice(-shownCount.value))
+
+async function revealLatest() {
+  await nextTick()
+  const list = messagesRef.value
+  if (list) list.scrollTop = list.scrollHeight
+}
+
+watch(bubbles, revealLatest)
+useResizeObserver(messagesRef, revealLatest)
 
 /**
  * 超出的那几条去哪了：浮层是窄条，只说最新几条，剩下的在聊天窗口里。
@@ -273,31 +284,37 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 
 <template>
   <!--
-    R46：浮层里的字号、圆角、间距都用固定像素，不随猫的缩放变大变小（以前是 vw / %，
-    跟着窗口宽度走）。浮层那一块的高度仍按猫的比例留（R39），猫缩得很小时放不下的旧气泡
-    会从上沿被裁掉，输入条始终贴在最下面。
+    气泡与预留高度都是固定 CSS 像素。长消息可滚动阅读，输入条不挤占猫的区域。
   -->
   <div class="cat-chat size-full flex flex-col justify-end gap-[7px] px-[7px] pt-[4px]">
-    <div class="min-h-0 flex flex-col justify-end gap-[4px] overflow-hidden">
-      <div
-        v-for="message in bubbles"
-        :key="message.id"
-        class="overlay-bubble max-w-[86%] shrink-0 break-all rounded-[14px] px-[11px] py-[6px] text-[12px] leading-[1.45]"
-        :class="[
-          message.direction === 'outgoing'
-            ? 'overlay-out self-end rounded-br-[4px]'
-            : 'overlay-in self-start rounded-bl-[4px]',
-          attachmentMessage(message) ? 'cursor-pointer' : '',
-        ]"
-        :role="attachmentMessage(message) ? 'button' : undefined"
-        :tabindex="attachmentMessage(message) ? 0 : undefined"
-        :title="attachmentMessage(message) ? $t('pages.main.hints.openInChat') : ''"
-        @click="attachmentMessage(message) && openChatWindow()"
-        @keydown.enter.prevent="attachmentMessage(message) && openChatWindow()"
-        @keydown.space.prevent="attachmentMessage(message) && openChatWindow()"
-        @mousedown="handleBubbleMouseDown($event, message)"
-      >
-        {{ bubbleText(message) }}
+    <div
+      ref="messages"
+      :aria-label="$t('pages.chat.labels.history')"
+      class="overlay-messages min-h-0 flex-1 overflow-y-auto"
+      tabindex="0"
+      @mousedown.stop
+    >
+      <div class="min-h-full flex flex-col justify-end gap-[4px]">
+        <div
+          v-for="message in bubbles"
+          :key="message.id"
+          class="overlay-bubble max-w-[86%] shrink-0 break-all rounded-[14px] px-[11px] py-[6px] text-[12px] leading-[1.45]"
+          :class="[
+            message.direction === 'outgoing'
+              ? 'overlay-out self-end rounded-br-[4px]'
+              : 'overlay-in self-start rounded-bl-[4px]',
+            attachmentMessage(message) ? 'cursor-pointer' : '',
+          ]"
+          :role="attachmentMessage(message) ? 'button' : undefined"
+          :tabindex="attachmentMessage(message) ? 0 : undefined"
+          :title="attachmentMessage(message) ? $t('pages.main.hints.openInChat') : ''"
+          @click="attachmentMessage(message) && openChatWindow()"
+          @keydown.enter.prevent="attachmentMessage(message) && openChatWindow()"
+          @keydown.space.prevent="attachmentMessage(message) && openChatWindow()"
+          @mousedown="handleBubbleMouseDown($event, message)"
+        >
+          {{ bubbleText(message) }}
+        </div>
       </div>
     </div>
 
@@ -342,8 +359,7 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
     </div>
 
     <!--
-      发不出去的原因 / 上一次发送失败 / 更早的消息在哪：写在框外，框里一有字 placeholder 就看不见了。
-      猫缩得很小时（见下面的 <style>）这一行先让位，保住输入条。
+      状态放在输入框外，草稿不会遮住连接状态；消息区独立滚动，状态行不被挤掉。
     -->
     <p
       v-if="statusNote"
@@ -358,6 +374,11 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 <style scoped>
 .cat-chat {
   color: #392b33;
+}
+.overlay-messages {
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #d9a8ba transparent;
 }
 .overlay-bubble {
   border: 1px solid #ecdfe5;
@@ -434,15 +455,5 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 .cat-chat button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
-}
-/*
- * R46：浮层里的东西是固定像素，浮层那一块的高度却随猫缩放（约占窗口高的 38%）。
- * 输入条 + 状态行要约 60px，也就是窗口矮于约 160px 时就放不下了——先把状态行藏起来，
- * 输入条（约 42px）还能完整显示到窗口约 110px 高。
- */
-@media (max-height: 160px) {
-  .overlay-status {
-    display: none;
-  }
 }
 </style>

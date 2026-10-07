@@ -16,7 +16,7 @@ import { createKeyAutoRelease } from '@/utils/keyAutoRelease'
 import { getCursorMonitor } from '@/utils/monitor'
 import { isMac, isWindows } from '@/utils/platform'
 
-import { CHAT_OVERLAY_RATIO, INVOKE_KEY, LISTEN_KEY, WINDOW_LABEL } from '../constants'
+import { CHAT_OVERLAY_HEIGHT, INVOKE_KEY, LISTEN_KEY, WINDOW_LABEL } from '../constants'
 import { getSupportedKey as resolveSupportedKey, useModel } from './useModel'
 import { usePairState } from './usePairState'
 import { useTauriListen } from './useTauriListen'
@@ -164,7 +164,7 @@ export function useDevice() {
       // R39：开着双人联机时，窗口顶上那一条是聊天浮层。鼠标停在它上面不该让窗口淡出，
       // 否则「悬停就变透明」会把输入框也一起藏掉，根本点不到
       const overlayBand = pairStore.settings.enabled && pairStore.settings.chat.overlayVisible !== false
-        ? height * (CHAT_OVERLAY_RATIO / (1 + CHAT_OVERLAY_RATIO))
+        ? CHAT_OVERLAY_HEIGHT * (window.devicePixelRatio || 1)
         : 0
       const isOverOverlay = overlayBand > 0 && y <= winY + overlayBand
       const shouldHide = isInWindow && !isOverOverlay

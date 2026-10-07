@@ -91,11 +91,11 @@ export function useModel() {
   }
 
   /**
-   * `extraRatio` = 窗口顶上要额外留出来的高度，按模型高度的比例算（R39 的聊天浮层）。
+   * `extraHeight` = 窗口顶部为聊天保留的 CSS 像素，不随模型缩放。
    *
    * 默认 0：窗口比例就是模型比例（对方猫咪窗口与单机时的猫咪窗口都是这样）。
    */
-  async function handleLoad(extraRatio = 0) {
+  async function handleLoad(extraHeight = 0) {
     try {
       if (!modelStore.currentModel) return
 
@@ -111,7 +111,7 @@ export function useModel() {
       modelStore.currentMotions = nextMotions
       modelStore.currentExpressions = expressions
 
-      handleResize(extraRatio)
+      await handleResize(extraHeight)
 
       const modelId = modelStore.currentModel.id
 
@@ -145,7 +145,7 @@ export function useModel() {
     live2d.destroy()
   }
 
-  async function handleResize(extraRatio = 0) {
+  async function handleResize(extraHeight = 0) {
     if (!modelSize.value) return
 
     live2d.resizeModel(modelSize.value)
@@ -153,13 +153,13 @@ export function useModel() {
     const { width, height } = modelSize.value
     // R39：猫咪窗口顶上那条聊天浮层要算进窗口比例里，否则这里会把窗口按模型比例摆正、
     // 把浮层那一条挤掉（对方猫咪窗口与单机时都是 0）
-    const targetHeight = height * (1 + extraRatio)
+    const targetHeight = Math.ceil(innerWidth * height / width + extraHeight)
 
-    if (round(innerWidth / innerHeight, 1) !== round(width / targetHeight, 1)) {
+    if (Math.abs(innerHeight - targetHeight) > 1) {
       await appWindow.setSize(
         new LogicalSize({
           width: innerWidth,
-          height: Math.ceil(innerWidth * (targetHeight / width)),
+          height: targetHeight,
         }),
       )
     }
