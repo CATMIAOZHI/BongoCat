@@ -5,6 +5,7 @@ import type { ChatMessage } from './usePair'
 import {
   chatExportFileName,
   formatClock,
+  formatMessageTime,
   mergeMessages,
   sortMessages,
   upsertMessage,
@@ -84,6 +85,10 @@ describe('消息列表的合并', () => {
 })
 
 describe('时间与导出文件名', () => {
+  it('消息区分日期，并显示完整的本地时间到秒', () => {
+    expect(formatMessageTime(new Date(2026, 0, 2, 8, 5, 9).getTime())).toBe('2026-01-02 08:05:09')
+    expect(formatMessageTime(new Date(2027, 11, 31, 23, 59, 59).getTime())).toBe('2027-12-31 23:59:59')
+  })
   it('只显示时分，且不随后端语言变化', () => {
     expect(formatClock(new Date(2026, 8, 23, 8, 5).getTime())).toBe('08:05')
     expect(formatClock(new Date(2026, 8, 23, 23, 59).getTime())).toBe('23:59')

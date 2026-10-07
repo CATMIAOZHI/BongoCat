@@ -29,7 +29,7 @@ export function useTray() {
   const { getBaseMenu, getExitMenu } = useAppMenu()
   const { t } = useI18n()
 
-  watch([() => catStore.window.visible, () => catStore.window.passThrough, () => generalStore.appearance.language], () => {
+  watch([() => catStore.window.visible, () => catStore.window.passThrough, () => catStore.window.alwaysOnTop, () => generalStore.appearance.language], () => {
     updateTrayMenu()
   })
 
@@ -43,6 +43,7 @@ export function useTray() {
     () => pairStore.settings.enabled,
     () => pairStore.settings.remoteCat.visible,
     () => pairStore.settings.chat.visible,
+    () => pairStore.settings.chat.overlayVisible,
     () => pairStore.settings.presence,
     () => pairStore.runtime.connection,
     () => pairStore.runtime.peerOnline,

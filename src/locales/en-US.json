@@ -49,13 +49,18 @@
     },
     "chat": {
       "labels": {
-        "peer": "Partner"
+        "peer": "Partner",
+        "history": "Chat history"
       },
       "hints": {
         "loading": "Loading chat history...",
         "connected": "Online · Here for a chat",
         "empty": "No messages yet — click the line below or use the shortcut to type",
         "backToNewest": "Back to the newest message",
+        "loadOlder": "Load earlier messages",
+        "historyStart": "The beginning of this conversation",
+        "newMessages": "{count} new messages · Back to latest",
+        "voiceUnavailable": "Connecting to recorder — click to retry",
         "hide": "Hide the chat window",
         "copy": "Copy this message",
         "inputHint": "Click here to type (or use the \"Chat Input\" shortcut)",
@@ -281,7 +286,7 @@
           "chatSettings": "Chat",
           "chatOverlay": "Chat above my cat",
           "showChat": "Show Chat Window",
-          "bubbleCount": "Visible Bubbles",
+          "bubbleCount": "Bubbles Above the Cat",
           "chatAlwaysOnTop": "Chat Always on Top",
           "chatPassThrough": "Chat Pass Through",
           "notificationSound": "New Message Sound",
@@ -363,7 +368,7 @@
           "remoteStats": "Shown when you hover over your partner's cat (always shown while Pass Through is on). Requires your partner to enable \"Share Input Stats\" as well.",
           "windowSize": "Resize the remote cat window.",
           "chatWindow": "Show the chat window (bubbles) on the desktop.",
-          "bubbleCount": "How many of the newest messages the chat window shows at once; use the wheel to look further back.",
+          "bubbleCount": "Up to 3 messages above the cat. The separate chat window scrolls continuously through history.",
           "chatPassThrough": "When enabled the chat window lets clicks through; opening the text box temporarily disables it.",
           "notificationSound": "Play a short sound when a message from your partner arrives.",
           "notificationVolume": "Sound volume; 0 means muted.",

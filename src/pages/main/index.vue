@@ -3,7 +3,6 @@ import type { MotionInfo } from 'easy-live2d'
 
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { PhysicalSize } from '@tauri-apps/api/dpi'
-import { Menu, PredefinedMenuItem } from '@tauri-apps/api/menu'
 import { sep } from '@tauri-apps/api/path'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { exists, readDir } from '@tauri-apps/plugin-fs'
@@ -16,7 +15,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import AwaySign from '@/components/away-sign/index.vue'
 import ChatOverlay from '@/components/chat-overlay/index.vue'
 import HeldKeyHighlights from '@/components/held-key-highlights/index.vue'
-import { useAppMenu } from '@/composables/useAppMenu'
+import { useCatContextMenu } from '@/composables/useCatContextMenu'
+import { provideChatVoice } from '@/composables/useChatVoiceBridge'
 import { useDevice } from '@/composables/useDevice'
 import { useGamepad } from '@/composables/useGamepad'
 import { useKeyStateShortcut } from '@/composables/useKeyStateShortcut'
@@ -34,19 +34,19 @@ import { useShortcutStore } from '@/stores/shortcut'
 import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
-import { isWindows } from '@/utils/platform'
 import { clearObject } from '@/utils/shared'
 
 const { startListening } = useDevice()
 const appWindow = getCurrentWebviewWindow()
 const { modelSize, handleLoad, handleDestroy, handleKeyChange } = useModel()
 const catStore = useCatStore()
-const { getBaseMenu, getExitMenu } = useAppMenu()
+const openContextMenu = useCatContextMenu('main')
 const modelStore = useModelStore()
 const generalStore = useGeneralStore()
 const pairStore = usePairStore()
 const shortcutStore = useShortcutStore()
 const { pushToTalk } = storeToRefs(shortcutStore)
+const voiceRecorder = usePairVoiceRecorder()
 const {
   recording,
   seconds: recordingSeconds,
@@ -62,7 +62,7 @@ const {
   send: sendRecording,
   play: playRecording,
   cancel: cancelRecording,
-} = usePairVoiceRecorder()
+} = voiceRecorder
 const resizing = ref(false)
 const backgroundImagePath = ref<string>()
 const { stickActive } = useGamepad()
@@ -157,6 +157,8 @@ const canSendRecording = computed(() => {
   // 正在发送时那份「原因」是空串（界面由「正在发送…」接管），所以要单独排掉
   return !recordingSending.value && !recordingBlockReason.value
 })
+
+provideChatVoice(voiceRecorder, () => recordingBlockReason.value)
 
 /** R41：离线时点「发送」直接不发起（理由同上，别把录音弄丢） */
 function handleSendRecording() {
@@ -317,8 +319,8 @@ useTauriListen<number>(LISTEN_KEY.SET_EXPRESSION, ({ payload }) => {
   live2d.setExpression(payload)
 })
 
-function handleMouseDown() {
-  appWindow.startDragging()
+function handleMouseDown(event: MouseEvent) {
+  if (event.button === 0) appWindow.startDragging()
 }
 
 async function handleContextmenu(event: MouseEvent) {
@@ -326,25 +328,7 @@ async function handleContextmenu(event: MouseEvent) {
 
   if (event.shiftKey) return
 
-  const menu = await Menu.new({
-    items: [
-      ...await getBaseMenu(),
-      await PredefinedMenuItem.new({ item: 'Separator' }),
-      ...await getExitMenu(),
-    ],
-  })
-
-  // Temporarily disable always-on-top on Windows so the context menu is not covered
-  if (isWindows && catStore.window.alwaysOnTop) {
-    setAlwaysOnTop(false)
-  }
-
-  await menu.popup()
-
-  // Restore always-on-top after the menu is closed
-  if (!isWindows || !catStore.window.alwaysOnTop) return
-
-  setAlwaysOnTop(true)
+  await openContextMenu()
 }
 
 function handleMouseMove(event: MouseEvent) {

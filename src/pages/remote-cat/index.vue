@@ -17,6 +17,7 @@ import type { Model } from '@/stores/model'
 
 import AwaySign from '@/components/away-sign/index.vue'
 import HeldKeyHighlights from '@/components/held-key-highlights/index.vue'
+import { useCatContextMenu } from '@/composables/useCatContextMenu'
 import { getSupportedKey, useModel } from '@/composables/useModel'
 import { defaultSnapshot, sanitizeSnapshot } from '@/composables/usePairActivity'
 import { playPairMessageSound } from '@/composables/usePairMessageSound'
@@ -84,6 +85,7 @@ const FRAME_INTERVAL_TOLERANCE_MS = 1
 
 const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
+const openContextMenu = useCatContextMenu('remote')
 const modelStore = useModelStore()
 const peerModel = usePeerModel()
 const catStore = useCatStore()
@@ -553,8 +555,13 @@ function notifyChatMessage() {
 // §47：聊天窗口负责把消息加进列表，通知动画只在这里做
 useTauriListen<ChatMessage>(LISTEN_KEY.PAIR_MESSAGE_RECEIVED, notifyChatMessage)
 
-function handleMouseDown() {
-  appWindow.startDragging()
+function handleMouseDown(event: MouseEvent) {
+  if (event.button === 0) appWindow.startDragging()
+}
+
+async function handleContextmenu(event: MouseEvent) {
+  event.preventDefault()
+  await openContextMenu()
 }
 </script>
 
@@ -565,6 +572,7 @@ function handleMouseDown() {
       opacity: pairStore.settings.remoteCat.opacity / 100,
       borderRadius: `${pairStore.settings.remoteCat.radius}%`,
     }"
+    @contextmenu="handleContextmenu"
     @mousedown="handleMouseDown"
   >
     <div

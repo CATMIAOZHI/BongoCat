@@ -49,13 +49,18 @@
     },
     "chat": {
       "labels": {
-        "peer": "对方"
+        "peer": "对方",
+        "history": "聊天记录"
       },
       "hints": {
         "loading": "正在读取聊天记录...",
         "empty": "和你的搭子说声喵吧",
         "connected": "在线 · 随时聊聊",
         "backToNewest": "回到最新消息",
+        "loadOlder": "查看更早的消息",
+        "historyStart": "这段聊天从这里开始",
+        "newMessages": "{count} 条新消息 · 回到最新",
+        "voiceUnavailable": "正在连接录音控制，点此重试",
         "hide": "隐藏聊天窗口",
         "copy": "复制这条消息",
         "inputHint": "点这里输入消息（或按「聊天输入」快捷键）",
@@ -281,7 +286,7 @@
           "chatSettings": "聊天",
           "chatOverlay": "自己猫上方的聊天框",
           "showChat": "显示聊天窗口",
-          "bubbleCount": "同时显示的气泡数",
+          "bubbleCount": "猫咪上方的气泡数",
           "chatAlwaysOnTop": "聊天窗口置顶",
           "chatPassThrough": "聊天窗口穿透",
           "notificationSound": "新消息提示音",
@@ -363,7 +368,7 @@
           "remoteStats": "鼠标挪到对方猫上才显示（开着窗口穿透时一直显示）。需要对方也开启「分享输入统计」，否则不会显示。",
           "windowSize": "调整对方猫窗口的大小。",
           "chatWindow": "在桌面上单独显示聊天窗口（气泡）。",
-          "bubbleCount": "聊天窗口同时显示多少条最新消息，滚轮可以往回看更旧的消息。",
+          "bubbleCount": "猫咪上方最多显示 3 条消息；独立聊天窗口可以连续滚动查看历史。",
           "chatPassThrough": "开启后聊天窗口不挡鼠标；打开输入框时会临时关闭。",
           "notificationSound": "收到对方消息时播一声提示音。",
           "notificationVolume": "提示音音量，0 表示静音。",

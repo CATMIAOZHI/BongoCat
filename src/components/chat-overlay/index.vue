@@ -245,7 +245,7 @@ function handleKeydown(event: KeyboardEvent) {
  * 录音期间把焦点交还出去，免得打字又被当成按键。
  */
 function handleVoice() {
-  if (blocked.value) return
+  if (blocked.value && !props.recording) return
 
   inputRef.value?.blur()
 
@@ -277,7 +277,7 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
     跟着窗口宽度走）。浮层那一块的高度仍按猫的比例留（R39），猫缩得很小时放不下的旧气泡
     会从上沿被裁掉，输入条始终贴在最下面。
   -->
-  <div class="cat-chat size-full flex flex-col justify-end gap-[7px] px-[7px] pt-[4px] text-[#fff]">
+  <div class="cat-chat size-full flex flex-col justify-end gap-[7px] px-[7px] pt-[4px]">
     <div class="min-h-0 flex flex-col justify-end gap-[4px] overflow-hidden">
       <div
         v-for="message in bubbles"
@@ -285,8 +285,8 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
         class="overlay-bubble max-w-[86%] shrink-0 break-all rounded-[14px] px-[11px] py-[6px] text-[12px] leading-[1.45]"
         :class="[
           message.direction === 'outgoing'
-            ? 'self-end bg-[#69559d] rounded-br-[4px]'
-            : 'self-start bg-[#35303f] rounded-bl-[4px]',
+            ? 'overlay-out self-end rounded-br-[4px]'
+            : 'overlay-in self-start rounded-bl-[4px]',
           attachmentMessage(message) ? 'cursor-pointer' : '',
         ]"
         :role="attachmentMessage(message) ? 'button' : undefined"
@@ -302,28 +302,28 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
     </div>
 
     <div
-      class="overlay-compose pointer-events-auto flex shrink-0 items-center gap-[8px] rounded-[16px] px-[9px] py-[6px]"
+      class="overlay-compose pointer-events-auto flex shrink-0 items-center gap-[7px] rounded-[16px] p-[6px]"
       @mousedown.stop
     >
       <button
         :aria-label="props.recording ? $t('pages.main.hints.stopRecording') : $t('pages.main.hints.voice')"
-        class="voice-button size-[28px] flex shrink-0 items-center justify-center text-[16px] rounded-full"
-        :class="blocked ? 'cursor-not-allowed' : 'cursor-pointer'"
-        :disabled="blocked"
+        class="voice-button size-[30px] flex shrink-0 items-center justify-center rounded-[10px] text-[16px]"
+        :class="{ 'is-recording': props.recording }"
+        :disabled="blocked && !props.recording"
         :title="props.pending && !props.recording
           ? $t('pages.main.hints.reRecord')
           : $t('pages.main.hints.voice')"
         type="button"
         @click="handleVoice"
       >
-        <span :class="props.recording ? 'i-lucide:square animate-pulse text-[#ffb0bc]' : 'i-lucide:mic text-[#ead5f5]'" />
+        <span :class="props.recording ? 'i-lucide:square' : 'i-lucide:mic'" />
       </button>
 
       <textarea
         ref="input"
         v-model="draft"
         :aria-label="$t('pages.chat.placeholders.input')"
-        class="min-w-0 flex-1 resize-none text-[12px] leading-[1.4] outline-none bg-transparent placeholder:color-[#ffffff66]"
+        class="overlay-input min-w-0 flex-1 resize-none text-[12px] outline-none bg-transparent"
         :placeholder="hint || $t('pages.chat.placeholders.input')"
         rows="1"
         @keydown="handleKeydown"
@@ -331,14 +331,13 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 
       <button
         :aria-label="$t('pages.main.hints.send')"
-        class="size-[28px] flex shrink-0 items-center justify-center transition rounded-full"
-        :class="canSend ? 'cursor-pointer bg-[#7964bc] hover:bg-[#917bd2]' : 'bg-[#ffffff14]'"
+        class="overlay-send size-[30px] flex shrink-0 items-center justify-center rounded-[10px] transition"
         :disabled="!canSend"
         :title="$t('pages.main.hints.send')"
         type="button"
         @click="handleSend"
       >
-        <span class="i-lucide:arrow-up text-[13px] text-[#fff]" />
+        <span class="i-lucide:arrow-up text-[15px]" />
       </button>
     </div>
 
@@ -348,7 +347,7 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
     -->
     <p
       v-if="statusNote"
-      class="overlay-status shrink-0 truncate px-[10px] py-[2px] text-[10px] color-[#eee3f5] rounded-full"
+      class="overlay-status shrink-0 truncate px-[10px] py-[3px] text-[10px] rounded-full"
       :title="statusNote"
     >
       {{ statusNote }}
@@ -357,30 +356,80 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 </template>
 
 <style scoped>
+.cat-chat {
+  color: #392b33;
+}
 .overlay-bubble {
-  border: 1px solid #bca6ce50;
-  box-shadow: 0 2px 5px #100a2020;
+  border: 1px solid #ecdfe5;
+  box-shadow: 0 2px 5px #6d244910;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.overlay-in {
+  background: #fff;
+}
+.overlay-out {
+  background: #ffd1dc;
+  border-color: #f4bace;
 }
 .overlay-compose {
-  background: #2c2637;
-  border: 1px solid #796887;
-  box-shadow: 0 3px 10px #130d2229;
+  background: #fff;
+  border: 1px solid #e6c5d2;
+  box-shadow: 0 2px 8px #9f285412;
+  transition:
+    border-color 160ms,
+    box-shadow 160ms;
 }
 .overlay-compose:focus-within {
-  border-color: #d3b5e6;
+  border-color: #e91e63;
+  box-shadow: 0 0 0 2px #ff85a226;
+}
+.overlay-input {
+  height: 30px;
+  padding: 6px 0;
+  line-height: 18px;
+  color: #392b33;
+  scrollbar-width: thin;
+  scrollbar-color: #d9a8ba transparent;
+}
+.overlay-input::placeholder {
+  color: #927b87;
+}
+.cat-chat button {
+  cursor: pointer;
 }
 .voice-button {
-  background: #ffffff0c;
+  background: #fff1f5;
+  color: #b12b59;
 }
-.voice-button:hover {
-  background: #ffffff20;
+.voice-button:hover:not(:disabled) {
+  background: #ffe4ee;
+}
+.voice-button.is-recording {
+  background: #bd2456;
+  color: #fff;
+}
+.overlay-send {
+  background: #bd2456;
+  color: #fff;
+}
+.overlay-send:hover:not(:disabled) {
+  background: #a51f4b;
+}
+.cat-chat .overlay-send:disabled {
+  background: #f4e1e9;
+  color: #a98b98;
+  opacity: 1;
 }
 .overlay-status {
-  background: #2c2637;
+  background: #fff1f5;
+  border: 1px solid #efd8e1;
+  color: #795064;
 }
 .cat-chat button:focus-visible,
 .overlay-bubble:focus-visible {
-  box-shadow: 0 0 0 2px #eed7fc;
+  outline: 2px solid #bd2456;
+  outline-offset: 1px;
 }
 .cat-chat button:disabled {
   opacity: 0.45;

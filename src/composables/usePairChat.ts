@@ -16,6 +16,7 @@ export const PAGE_SIZE = 50
 const messages = ref<ChatMessage[]>([])
 const hasMore = ref(false)
 const loading = ref(false)
+let generation = 0
 
 /** 按 `seq`（本地自增序号）升序排列，越旧越靠前 */
 export function sortMessages(list: ChatMessage[]) {
@@ -80,6 +81,14 @@ export function formatClock(value: number) {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+/** Full local date and time: messages from different days must not look identical. */
+export function formatMessageTime(value: number) {
+  const date = new Date(value)
+  const pad = (part: number) => String(part).padStart(2, '0')
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${formatClock(value)}:${pad(date.getSeconds())}`
+}
+
 /** 导出文件的默认文件名，例如 bongocat-chat-2026-09-23.json */
 export function chatExportFileName(format: ExportFormat, now: number) {
   const date = new Date(now)
@@ -92,20 +101,22 @@ export function chatExportFileName(format: ExportFormat, now: number) {
 export function usePairChat() {
   /** 读最新一页：窗口打开、以及开始新周期之后都走这里 */
   async function loadLatest() {
+    const mine = ++generation
     loading.value = true
 
     try {
       const page = await pairHistoryList(void 0, PAGE_SIZE)
 
+      if (mine !== generation) return
       messages.value = sortMessages(page.messages)
       hasMore.value = page.hasMore
     } finally {
-      loading.value = false
+      if (mine === generation) loading.value = false
     }
   }
 
   /** 往前翻一页，返回真正新增的条数（调用方用它保持画面不动） */
-  async function loadOlder() {
+  async function loadOlder(beforeMerge?: () => void) {
     if (loading.value || !hasMore.value) return 0
 
     const oldest = messages.value[0]
@@ -113,17 +124,21 @@ export function usePairChat() {
     if (!oldest) return 0
 
     loading.value = true
+    const mine = generation
 
     try {
       const page = await pairHistoryList(oldest.seq, PAGE_SIZE)
+      if (mine !== generation) return 0
       const before = messages.value.length
+
+      beforeMerge?.()
 
       messages.value = mergeMessages(messages.value, page.messages)
       hasMore.value = page.hasMore
 
       return messages.value.length - before
     } finally {
-      loading.value = false
+      if (mine === generation) loading.value = false
     }
   }
 

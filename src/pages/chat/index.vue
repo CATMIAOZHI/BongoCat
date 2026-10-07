@@ -6,14 +6,15 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { copyFile, readFile } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { openPath } from '@tauri-apps/plugin-opener'
-import { useEventListener } from '@vueuse/core'
-import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue'
+import { useEventListener, useResizeObserver } from '@vueuse/core'
+import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import type { ChatMessage, MessageStatus, TransferProgress } from '@/composables/usePair'
 
-import { MESSAGE_TEXT_LIMIT, pairSetMaxAttachmentMb } from '@/composables/usePair'
-import { formatClock, usePairChat, visibleWindow } from '@/composables/usePairChat'
+import { useChatVoice } from '@/composables/useChatVoiceBridge'
+import { MESSAGE_TEXT_LIMIT, pairSetMaxAttachmentMb, RECORDING_LIMIT_SECS } from '@/composables/usePair'
+import { formatMessageTime, usePairChat } from '@/composables/usePairChat'
 import { setChatVisible } from '@/composables/usePairOverlay'
 import { usePairStatus } from '@/composables/usePairStatus'
 import {
@@ -57,7 +58,8 @@ const STATUS_ICON: Record<MessageStatus, string> = {
 const appWindow = getCurrentWebviewWindow()
 const pairStore = usePairStore()
 const { t } = useI18n()
-const { messages, loading, loadLatest, loadOlder, send, apply } = usePairChat()
+const { messages, hasMore, loading, loadLatest, loadOlder, send, apply } = usePairChat()
+const { state: voice, ready: voiceReady, bridgeError, action: voiceAction } = useChatVoice()
 const { transferOf, apply: applyTransfer, reset: resetTransfers } = usePairTransfer()
 const {
   isFailed: voiceFailed,
@@ -68,10 +70,13 @@ const {
   toggle: toggleVoice,
 } = usePairVoicePlayback()
 const listRef = useTemplateRef<HTMLElement>('list')
+const contentRef = useTemplateRef<HTMLElement>('content')
 const inputRef = useTemplateRef<HTMLTextAreaElement>('input')
 
-/** 从最新一条往回数的条数：0 就是「看最新的一屏」 */
-const offset = ref(0)
+const atNewest = ref(true)
+const unread = ref(0)
+const historyError = ref('')
+let prepending = false
 const inputMode = ref(false)
 const draft = ref('')
 const sending = ref(false)
@@ -87,24 +92,21 @@ let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
 usePairStatus()
 
-const bubbleCount = computed(() => {
-  const value = Math.round(Number(pairStore.settings.chat.bubbleCount))
-
-  return Math.min(20, Math.max(1, Number.isFinite(value) ? value : 5))
-})
-
-const visibleMessages = computed(() => {
-  const { start, end } = visibleWindow(messages.value.length, bubbleCount.value, offset.value)
-
-  return messages.value.slice(start, end)
-})
-
-const atNewest = computed(() => offset.value === 0)
-
 /** 输入的内容按 UTF-8 字节算，和 Rust 侧的限制对齐（§31） */
 const draftBytes = computed(() => new TextEncoder().encode(draft.value).length)
 const tooLong = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT)
 const showingLimit = computed(() => draftBytes.value > MESSAGE_TEXT_LIMIT * 0.8)
+
+function resizeComposer() {
+  const input = inputRef.value
+  if (!input) return
+  input.style.height = '36px'
+  input.style.height = `${Math.min(112, Math.max(36, input.scrollHeight))}px`
+}
+
+watch(draft, resizeComposer, { flush: 'post' })
+useEventListener('resize', resizeComposer)
+onMounted(() => nextTick(resizeComposer))
 
 /**
  * 现在发不出去的原因（i18n key）；能发时是空串。
@@ -223,6 +225,7 @@ watch(() => pairStore.settings.chat.visible, (visible) => {
   }
 
   closeInput()
+  if (voice.value.recording) void voiceAction('release')
   // R42：窗口都藏了就别在后台接着放语音
   stopVoice()
   hideWindowByLabel(WINDOW_LABEL.CHAT).catch(reason => error(String(reason)))
@@ -236,45 +239,45 @@ async function scrollToNewest() {
   if (list) list.scrollTop = list.scrollHeight
 }
 
-/** 滚轮在边界上继续滚时，一次往前/往后挪一条（§29 的「滚轮查看历史」） */
+/** Prepend history without moving the message the reader is looking at. */
 async function stepOlder() {
-  const maxOffset = Math.max(0, messages.value.length - bubbleCount.value)
-
-  if (offset.value < maxOffset) {
-    offset.value += 1
-
-    return
-  }
-
-  const loadedCount = await loadOlder().catch((reason) => {
-    error(String(reason))
-
-    return 0
-  })
-
-  // 新读出来的更旧消息都算进「已经回看」的范围，画面因此不会跳
-  if (loadedCount > 0) offset.value += loadedCount
-}
-
-function handleWheel(event: WheelEvent) {
   const list = listRef.value
-
-  if (!list) return
-
-  if (event.deltaY < 0) {
-    if (list.scrollTop > 0) return
-
-    event.preventDefault()
-    void stepOlder()
-
-    return
+  if (!list || loading.value || !hasMore.value || prepending) return
+  historyError.value = ''
+  let anchor: HTMLElement | undefined
+  let top = 0
+  try {
+    const count = await loadOlder(() => {
+      prepending = true
+      atNewest.value = false
+      anchor = [...list.querySelectorAll<HTMLElement>('[data-message]')]
+        .find(element => element.getBoundingClientRect().bottom > list.getBoundingClientRect().top)
+      top = anchor?.getBoundingClientRect().top ?? 0
+    })
+    await nextTick()
+    if (count && anchor?.isConnected) {
+      list.scrollTop += anchor.getBoundingClientRect().top - top
+    }
+  } catch (reason) {
+    historyError.value = String(reason)
+  } finally {
+    prepending = false
   }
-
-  if (list.scrollTop + list.clientHeight < list.scrollHeight - 1) return
-
-  event.preventDefault()
-  offset.value = Math.max(0, offset.value - 1)
 }
+
+function handleScroll() {
+  const list = listRef.value
+  if (!list || prepending) return
+  atNewest.value = list.scrollHeight - list.scrollTop - list.clientHeight < 48
+  if (atNewest.value) unread.value = 0
+  if (list.scrollTop < 64 && !historyError.value) void stepOlder()
+}
+
+// Images, wrapping text and a growing composer can change the viewport size.
+// Follow those changes only while the reader is already at the latest message.
+useResizeObserver([listRef, contentRef], () => {
+  if (atNewest.value && !prepending) void scrollToNewest()
+})
 
 async function handleSend() {
   // 被挡住的时候连回车也不要发：`sendReady` 只管住了发送键，而 `@keydown.enter` 走的是
@@ -290,7 +293,8 @@ async function handleSend() {
     // 连不上时这条消息留在本地队列里（§32），状态显示为「等待发送」
     await send(draft.value)
     draft.value = ''
-    offset.value = 0
+    atNewest.value = true
+    unread.value = 0
     await scrollToNewest()
   } catch (reason) {
     sendError.value = String(reason)
@@ -468,7 +472,8 @@ function handleHide() {
 }
 
 async function backToNewest() {
-  offset.value = 0
+  atNewest.value = true
+  unread.value = 0
 
   await scrollToNewest()
 }
@@ -482,7 +487,9 @@ function handleMouseDown(event: MouseEvent) {
 useTauriListen(LISTEN_KEY.CHAT_INPUT_TOGGLE, toggleInput)
 
 useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
-  offset.value = 0
+  atNewest.value = true
+  unread.value = 0
+  historyError.value = ''
 
   closePreview()
   resetTransfers()
@@ -495,13 +502,16 @@ useTauriListen(LISTEN_KEY.CHAT_HISTORY_RESET, () => {
 })
 
 useTauriListen<ChatMessage>(LISTEN_KEY.PAIR_MESSAGE_RECEIVED, ({ payload }) => {
+  const isNew = !messages.value.some(message => message.id === payload.id)
   apply(payload)
 
   if (atNewest.value) void scrollToNewest()
+  else if (isNew) unread.value += 1
 })
 
 useTauriListen<ChatMessage>(LISTEN_KEY.PAIR_MESSAGE_UPDATED, ({ payload }) => {
   apply(payload)
+  if (atNewest.value) void scrollToNewest()
 })
 
 useTauriListen<TransferProgress>(LISTEN_KEY.PAIR_TRANSFER, ({ payload }) => {
@@ -533,6 +543,11 @@ onMounted(async () => {
     error(String(reason))
   }
 })
+
+onUnmounted(() => {
+  if (copiedTimer) clearTimeout(copiedTimer)
+  if (noticeTimer) clearTimeout(noticeTimer)
+})
 </script>
 
 <template>
@@ -541,7 +556,7 @@ onMounted(async () => {
     以前是 `bg-black/45`，桌面上任何东西都会透进来，字很难读。气泡上的半透明白都是叠在
     这一层实色上面的，所以不用逐个改。
   -->
-  <div class="chat-shell relative size-screen flex flex-col overflow-hidden text-[#fff] rounded-2xl">
+  <div class="chat-shell relative size-screen flex flex-col overflow-hidden rounded-2xl">
     <header
       class="chat-header flex shrink-0 cursor-move items-center gap-3 px-4 py-3"
       @mousedown="handleMouseDown"
@@ -555,27 +570,27 @@ onMounted(async () => {
         class="size-1.5 shrink-0 rounded-full"
         :class="!pairStore.settings.enabled
           ? 'bg-[#faad14]'
-          : (pairStore.runtime.peerOnline ? 'bg-[#52c41a]' : 'bg-[#ffffff4c]')"
+          : (pairStore.runtime.peerOnline ? 'bg-[#52c41a]' : 'bg-[#9c8991]')"
       />
 
       <div class="min-w-0 flex-1">
         <div class="truncate text-[13px] font-semibold">
           {{ pairStore.runtime.peerName || $t('pages.chat.labels.peer') }}
         </div>
-        <div class="chat-presence mt-0.5 truncate text-[10px] color-[#c1bbc9]">
+        <div class="chat-presence mt-0.5 truncate text-[11px]">
           {{ manualState || blockState || pairState || $t('pages.chat.hints.connected') }}
         </div>
       </div>
 
       <button
         v-if="!atNewest"
-        class="i-lucide:chevron-down relative shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
+        class="i-lucide:chevron-down relative shrink-0 cursor-pointer text-[18px]"
         :title="$t('pages.chat.hints.backToNewest')"
         @click="backToNewest"
       />
 
       <button
-        class="i-lucide:x relative shrink-0 cursor-pointer text-[14px] color-[#ffffff8c] before:absolute hover:text-[#fff] before:content-empty before:-inset-[0.4em]"
+        class="i-lucide:x relative shrink-0 cursor-pointer text-[18px]"
         :title="$t('pages.chat.hints.hide')"
         @click="handleHide"
       />
@@ -590,256 +605,373 @@ onMounted(async () => {
 
     <div
       ref="list"
-      class="chat-list min-h-0 flex flex-1 flex-col gap-3 overflow-y-auto px-3 py-4 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-[#ffffff26] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:hover:bg-[#ffffff40]"
-      @wheel="handleWheel"
+      :aria-label="$t('pages.chat.labels.history')"
+      class="chat-list min-h-0 flex-1 overflow-y-auto px-3 py-4"
+      tabindex="0"
+      @scroll.passive="handleScroll"
     >
       <div
-        v-if="loading && !messages.length"
-        class="flex flex-1 flex-col items-center justify-center gap-2 color-[#ffffff66]"
-      >
-        <span class="i-lucide:message-circle animate-pulse text-[22px]" />
-        <span class="text-[10px]">{{ $t('pages.chat.hints.loading') }}</span>
-      </div>
-
-      <div
-        v-else-if="!messages.length"
-        class="flex flex-1 flex-col items-center justify-center gap-2 color-[#ffffff59]"
-      >
-        <span class="empty-avatar"><span class="i-lucide:messages-square" /></span>
-        <span class="mt-2 text-[12px] color-[#c1bbc9]">{{ $t('pages.chat.hints.empty') }}</span>
-      </div>
-
-      <div
-        v-for="item in visibleMessages"
-        :key="item.id"
-        class="group flex"
-        :class="item.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
+        ref="content"
+        class="chat-content min-h-full flex flex-col gap-3"
       >
         <div
-          class="chat-bubble max-w-[86%] min-w-0 break-words px-3 py-2.5 text-[13px] leading-[1.55] rounded-2xl"
-          :class="item.direction === 'outgoing'
-            ? 'bubble-out rounded-br-md'
-            : 'bubble-in rounded-bl-md'"
+          v-if="messages.length && hasMore"
+          class="history-control"
         >
-          <template v-if="item.attachment">
-            <button
-              v-if="previewableImage(item)"
-              class="block cursor-pointer"
-              :title="$t('pages.chat.hints.preview')"
-              @click="openPreview(item)"
-            >
-              <img
-                alt=""
-                class="max-h-40 max-w-full object-cover rounded-md"
-                :src="assetSource(item)"
-              >
-            </button>
+          <button
+            :disabled="loading"
+            @click="stepOlder"
+          >
+            {{ loading ? $t('pages.chat.hints.loading') : $t('pages.chat.hints.loadOlder') }}
+          </button>
+        </div>
+        <p
+          v-else-if="messages.length"
+          class="history-control"
+        >
+          {{ $t('pages.chat.hints.historyStart') }}
+        </p>
+        <p
+          v-if="historyError"
+          class="chat-error"
+          role="alert"
+        >
+          {{ historyError }}
+        </p>
+        <div
+          v-if="loading && !messages.length"
+          class="flex flex-1 flex-col items-center justify-center gap-2"
+        >
+          <span class="i-lucide:message-circle animate-pulse text-[22px]" />
+          <span class="text-[10px]">{{ $t('pages.chat.hints.loading') }}</span>
+        </div>
 
-            <template v-else-if="item.kind === 'voice'">
-              <!--
+        <div
+          v-else-if="!messages.length"
+          class="flex flex-1 flex-col items-center justify-center gap-2"
+        >
+          <span class="empty-avatar"><span class="i-lucide:messages-square" /></span>
+          <span class="mt-2 text-[12px]">{{ $t('pages.chat.hints.empty') }}</span>
+        </div>
+
+        <div
+          v-for="item in messages"
+          :key="item.id"
+          class="group message-row flex"
+          :class="item.direction === 'outgoing' ? 'justify-end' : 'justify-start'"
+          :data-message="item.id"
+        >
+          <div
+            class="chat-bubble max-w-[92%] min-w-0 break-words px-3 py-2.5 text-[14px] leading-[1.6] rounded-2xl"
+            :class="item.direction === 'outgoing'
+              ? 'bubble-out rounded-br-md'
+              : 'bubble-in rounded-bl-md'"
+          >
+            <template v-if="item.attachment">
+              <button
+                v-if="previewableImage(item)"
+                class="block cursor-pointer"
+                :title="$t('pages.chat.hints.preview')"
+                @click="openPreview(item)"
+              >
+                <img
+                  alt=""
+                  class="max-h-40 max-w-full object-cover rounded-md"
+                  :src="assetSource(item)"
+                >
+              </button>
+
+              <template v-else-if="item.kind === 'voice'">
+                <!--
                 R42：不再用系统原生 `<audio controls>`（那条「播放 / 0:00 / 下载 / ⋮」），
                 换成自绘的一行：播放键 + 进度条 + 时长。播放走 `new Audio()` + asset 协议，
                 与猫咪窗口里试听录音同一套（`usePairVoicePlayback`）。
               -->
-              <div class="voice-message min-w-0 flex items-center gap-2.5">
-                <button
-                  class="size-9 flex shrink-0 items-center justify-center transition rounded-full"
-                  :class="canPlayVoice(item) ? 'cursor-pointer bg-[#ffffff26] hover:bg-[#ffffff40]' : 'bg-[#ffffff1a] opacity-40'"
-                  :disabled="!canPlayVoice(item)"
-                  :title="canPlayVoice(item)
-                    ? (voicePlaying(item.id) ? $t('pages.chat.player.pause') : $t('pages.chat.player.play'))
-                    : $t('pages.chat.player.waiting')"
-                  @click="toggleVoiceOf(item)"
-                >
-                  <span
-                    class="text-[13px] text-[#fff]"
-                    :class="voicePlaying(item.id) ? 'i-lucide:pause' : 'i-lucide:play'"
-                  />
-                </button>
-
-                <div class="min-w-0 flex-1">
-                  <div class="h-1 w-full overflow-hidden bg-[#ffffff33] rounded-full">
-                    <div
-                      class="h-full bg-[#ffffffe6] transition-[width] duration-150"
-                      :style="{ width: `${voicePercent(item.id)}%` }"
+                <div class="voice-message min-w-0 flex items-center gap-2.5">
+                  <button
+                    class="size-9 flex shrink-0 items-center justify-center transition rounded-full"
+                    :class="canPlayVoice(item) ? 'cursor-pointer bg-[#ffffff26] hover:bg-[#ffffff40]' : 'bg-[#ffffff1a] opacity-40'"
+                    :disabled="!canPlayVoice(item)"
+                    :title="canPlayVoice(item)
+                      ? (voicePlaying(item.id) ? $t('pages.chat.player.pause') : $t('pages.chat.player.play'))
+                      : $t('pages.chat.player.waiting')"
+                    @click="toggleVoiceOf(item)"
+                  >
+                    <span
+                      class="text-[13px] text-[#fff]"
+                      :class="voicePlaying(item.id) ? 'i-lucide:pause' : 'i-lucide:play'"
                     />
-                  </div>
+                  </button>
 
-                  <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-[#ffffff99]">
-                    <span class="truncate">
-                      {{ voiceFailed(item.id)
-                        ? $t('pages.chat.player.failed')
-                        : (canPlayVoice(item) ? $t('pages.chat.hints.voice') : $t('pages.chat.player.waiting')) }}
-                    </span>
+                  <div class="min-w-0 flex-1">
+                    <div class="progress-track h-1 w-full overflow-hidden rounded-full">
+                      <div
+                        class="progress-fill h-full transition-[width] duration-150"
+                        :style="{ width: `${voicePercent(item.id)}%` }"
+                      />
+                    </div>
 
-                    <span class="shrink-0">{{ voiceLabel(item.id) }}</span>
+                    <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-[#ffffff99]">
+                      <span class="truncate">
+                        {{ voiceFailed(item.id)
+                          ? $t('pages.chat.player.failed')
+                          : (canPlayVoice(item) ? $t('pages.chat.hints.voice') : $t('pages.chat.player.waiting')) }}
+                      </span>
+
+                      <span class="shrink-0">{{ voiceLabel(item.id) }}</span>
+                    </div>
                   </div>
                 </div>
+              </template>
+
+              <template v-else>
+                <div class="flex items-center gap-1.5">
+                  <span class="i-lucide:file shrink-0 text-[14px]" />
+
+                  <span class="min-w-0 truncate">
+                    {{ attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment') }}
+                  </span>
+                </div>
+              </template>
+
+              <div
+                v-if="item.kind !== 'voice'"
+                class="mt-1 flex items-center gap-1 text-[10px] color-[#ffffff99]"
+              >
+                <span>{{ formatFileSize(item.attachment.size ?? 0) }}</span>
+              </div>
+
+              <!-- 传输进度（§38）：还没结束才显示 -->
+              <template v-if="transferOf(item.id)">
+                <div class="progress-track mt-1 h-1 w-full overflow-hidden rounded-full">
+                  <div
+                    class="progress-fill h-full"
+                    :style="{ width: `${transferOf(item.id)!.percent}%` }"
+                  />
+                </div>
+
+                <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-[#ffffffb2]">
+                  <span>{{ $t(`pages.chat.transfer.${transferLabelKey(transferOf(item.id)!)}`) }}</span>
+
+                  <span v-if="isTransferActive(transferOf(item.id)!.state)">
+                    {{ formatFileSize(transferOf(item.id)!.transferred) }}
+                    /
+                    {{ formatFileSize(transferOf(item.id)!.size) }}
+                  </span>
+                </div>
+
+                <p
+                  v-if="transferOf(item.id)!.message"
+                  class="mt-0.5 break-all text-[9px]"
+                  :class="transferOf(item.id)!.state === 'failed' ? 'text-[#ff7875]' : 'color-[#ffffff99]'"
+                >
+                  {{ transferOf(item.id)!.message }}
+                </p>
+
+                <p
+                  v-if="item.status === 'failed' && item.direction === 'incoming'"
+                  class="mt-0.5 text-[9px] color-[#ffffff99]"
+                >
+                  {{ $t('pages.chat.hints.askPeerResend') }}
+                </p>
+              </template>
+
+              <!-- 接收方：大文件先问一句（§42） -->
+              <div
+                v-if="needsDecision(transferOf(item.id))"
+                class="mt-1 flex items-center gap-2"
+              >
+                <button
+                  class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
+                  @click="handleAccept(item)"
+                >
+                  {{ $t('pages.chat.buttons.accept') }}
+                </button>
+
+                <button
+                  class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
+                  @click="handleReject(item)"
+                >
+                  {{ $t('pages.chat.buttons.reject') }}
+                </button>
+              </div>
+
+              <div
+                v-if="localPathOf(item.attachment) || canCancel(transferOf(item.id)) || (item.status === 'failed' && item.direction === 'outgoing')"
+                class="mt-1.5 flex flex-wrap items-center gap-1"
+              >
+                <button
+                  v-if="item.kind !== 'image' && item.kind !== 'voice' && localPathOf(item.attachment)"
+                  class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
+                  @click="handleOpen(item)"
+                >
+                  {{ $t('pages.chat.buttons.open') }}
+                </button>
+
+                <button
+                  v-if="localPathOf(item.attachment)"
+                  class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
+                  @click="handleSaveAs(item)"
+                >
+                  {{ $t('pages.chat.buttons.saveAs') }}
+                </button>
+
+                <button
+                  v-if="canCancel(transferOf(item.id))"
+                  class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
+                  @click="handleCancel(item)"
+                >
+                  {{ $t('pages.chat.buttons.cancel') }}
+                </button>
+
+                <button
+                  v-if="item.status === 'failed' && item.direction === 'outgoing'"
+                  class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
+                  @click="handleRetry(item)"
+                >
+                  {{ $t('pages.chat.buttons.retry') }}
+                </button>
               </div>
             </template>
 
-            <template v-else>
-              <div class="flex items-center gap-1.5">
-                <span class="i-lucide:file shrink-0 text-[14px]" />
-
-                <span class="min-w-0 truncate">
-                  {{ attachmentTitle(item.attachment) || $t('pages.chat.hints.attachment') }}
-                </span>
-              </div>
-            </template>
-
-            <div
-              v-if="item.kind !== 'voice'"
-              class="mt-1 flex items-center gap-1 text-[10px] color-[#ffffff99]"
+            <p
+              v-else
+              class="message-text whitespace-pre-wrap"
             >
-              <span>{{ formatFileSize(item.attachment.size ?? 0) }}</span>
+              {{ item.text }}
+            </p>
+
+            <div class="bubble-meta mt-1.5 flex flex-wrap items-center justify-end gap-1.5 text-[10px]">
+              <button
+                v-if="item.text"
+                class="relative shrink-0 cursor-pointer text-[12px] opacity-50 transition group-focus-within:opacity-100 group-hover:opacity-100"
+                :class="copiedId === item.id ? 'i-lucide:check' : 'i-lucide:copy'"
+                :title="$t('pages.chat.hints.copy')"
+                @click="handleCopy(item)"
+              />
+
+              <time class="message-time">{{ formatMessageTime(item.createdAt) }}</time>
+
+              <span
+                v-if="item.direction === 'outgoing'"
+                class="shrink-0 text-[10px]"
+                :class="[STATUS_ICON[item.status], item.status === 'failed' ? 'text-[#b42348]' : '']"
+                :title="statusTitle(item.status)"
+              />
             </div>
-
-            <!-- 传输进度（§38）：还没结束才显示 -->
-            <template v-if="transferOf(item.id)">
-              <div class="mt-1 h-1 w-full overflow-hidden bg-[#ffffff33] rounded-full">
-                <div
-                  class="h-full bg-[#ffffffcc]"
-                  :style="{ width: `${transferOf(item.id)!.percent}%` }"
-                />
-              </div>
-
-              <div class="mt-0.5 flex items-center justify-between gap-1 text-[9px] color-[#ffffffb2]">
-                <span>{{ $t(`pages.chat.transfer.${transferLabelKey(transferOf(item.id)!)}`) }}</span>
-
-                <span v-if="isTransferActive(transferOf(item.id)!.state)">
-                  {{ formatFileSize(transferOf(item.id)!.transferred) }}
-                  /
-                  {{ formatFileSize(transferOf(item.id)!.size) }}
-                </span>
-              </div>
-
-              <p
-                v-if="transferOf(item.id)!.message"
-                class="mt-0.5 break-all text-[9px]"
-                :class="transferOf(item.id)!.state === 'failed' ? 'text-[#ff7875]' : 'color-[#ffffff99]'"
-              >
-                {{ transferOf(item.id)!.message }}
-              </p>
-
-              <p
-                v-if="item.status === 'failed' && item.direction === 'incoming'"
-                class="mt-0.5 text-[9px] color-[#ffffff99]"
-              >
-                {{ $t('pages.chat.hints.askPeerResend') }}
-              </p>
-            </template>
-
-            <!-- 接收方：大文件先问一句（§42） -->
-            <div
-              v-if="needsDecision(transferOf(item.id))"
-              class="mt-1 flex items-center gap-2"
-            >
-              <button
-                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
-                @click="handleAccept(item)"
-              >
-                {{ $t('pages.chat.buttons.accept') }}
-              </button>
-
-              <button
-                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
-                @click="handleReject(item)"
-              >
-                {{ $t('pages.chat.buttons.reject') }}
-              </button>
-            </div>
-
-            <div
-              v-if="localPathOf(item.attachment) || canCancel(transferOf(item.id)) || (item.status === 'failed' && item.direction === 'outgoing')"
-              class="mt-1.5 flex flex-wrap items-center gap-1"
-            >
-              <button
-                v-if="item.kind !== 'image' && item.kind !== 'voice' && localPathOf(item.attachment)"
-                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
-                @click="handleOpen(item)"
-              >
-                {{ $t('pages.chat.buttons.open') }}
-              </button>
-
-              <button
-                v-if="localPathOf(item.attachment)"
-                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
-                @click="handleSaveAs(item)"
-              >
-                {{ $t('pages.chat.buttons.saveAs') }}
-              </button>
-
-              <button
-                v-if="canCancel(transferOf(item.id))"
-                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
-                @click="handleCancel(item)"
-              >
-                {{ $t('pages.chat.buttons.cancel') }}
-              </button>
-
-              <button
-                v-if="item.status === 'failed' && item.direction === 'outgoing'"
-                class="cursor-pointer bg-[#ffffff1f] px-1.5 py-0.5 text-[10px] rounded-md hover:bg-[#ffffff38]"
-                @click="handleRetry(item)"
-              >
-                {{ $t('pages.chat.buttons.retry') }}
-              </button>
-            </div>
-          </template>
-
-          <p
-            v-else
-            class="whitespace-pre-wrap break-all"
-          >
-            {{ item.text }}
-          </p>
-
-          <div class="bubble-meta mt-1.5 flex items-center justify-end gap-1.5 text-[10px] color-[#ffffffb2]">
-            <button
-              v-if="item.text"
-              class="relative shrink-0 cursor-pointer text-[12px] opacity-0 transition before:absolute hover:text-[#fff] group-focus-within:opacity-100 group-hover:opacity-100 before:content-empty before:-inset-[0.4em]"
-              :class="copiedId === item.id ? 'i-lucide:check' : 'i-lucide:copy'"
-              :title="$t('pages.chat.hints.copy')"
-              @click="handleCopy(item)"
-            />
-
-            <span>{{ formatClock(item.createdAt) }}</span>
-
-            <span
-              v-if="item.direction === 'outgoing'"
-              class="shrink-0 text-[10px]"
-              :class="[STATUS_ICON[item.status], item.status === 'failed' ? 'text-[#ff7875]' : 'color-[#ffffffb2]']"
-              :title="statusTitle(item.status)"
-            />
           </div>
         </div>
       </div>
     </div>
 
+    <button
+      v-if="!atNewest"
+      class="latest-button"
+      @click="backToNewest"
+    >
+      <span class="i-lucide:arrow-down" />
+      {{ unread ? $t('pages.chat.hints.newMessages', { count: unread }) : $t('pages.chat.hints.backToNewest') }}
+    </button>
+
     <div
       class="chat-composer shrink-0 p-3"
     >
-      <!--
-        R42：输入框改成「一个盒子 + 圆形发送键」，和猫咪窗口浮层的输入条同款。
-        R46：不再能发附件（去掉回形针与粘贴图片），只能发文字；语音从猫咪窗口的麦克风或快捷键发。
-      -->
-      <div class="composer-field flex items-end gap-2 px-3 py-2 rounded-xl">
+      <div
+        v-if="voice.recording || voice.pending"
+        class="voice-draft"
+        role="status"
+      >
+        <span class="voice-draft-label">
+          {{ voice.recording
+            ? $t('pages.main.hints.recording', { seconds: voice.seconds, limit: RECORDING_LIMIT_SECS })
+            : $t('pages.main.hints.recordingReady', { seconds: voice.pendingSeconds }) }}
+        </span>
+        <button
+          v-if="voice.recording"
+          class="voice-action"
+          :disabled="voice.busy"
+          @click="voiceAction('release')"
+        >
+          {{ $t('pages.main.hints.stopRecording') }}
+        </button>
+        <button
+          v-else
+          class="voice-action"
+          :disabled="voice.sending || voice.busy"
+          @click="stopVoice(); voiceAction('play')"
+        >
+          {{ voice.playing ? $t('pages.main.hints.pauseRecording') : $t('pages.main.hints.playRecording') }}
+        </button>
+        <button
+          class="voice-action"
+          :disabled="voice.sending || voice.busy"
+          @click="voiceAction('cancel')"
+        >
+          {{ $t('pages.chat.buttons.cancel') }}
+        </button>
+        <button
+          v-if="!voice.recording"
+          class="voice-action voice-send"
+          :disabled="voice.sending || voice.busy || Boolean(voice.blockReason) || blocked"
+          :title="voice.blockReason ? $t(voice.blockReason) : ''"
+          @click="voiceAction('send')"
+        >
+          {{ voice.sending ? $t('pages.main.hints.sendingRecording') : $t('pages.chat.buttons.send') }}
+        </button>
+      </div>
+      <p
+        v-if="voice.error || bridgeError"
+        class="chat-error"
+        role="alert"
+      >
+        {{ voice.error || bridgeError }}
+      </p>
+      <p
+        v-else-if="voice.skipped"
+        class="chat-error"
+        role="status"
+      >
+        {{ $t('pages.main.hints.recordingTooShort') }}
+      </p>
+      <p
+        v-if="voice.pending && voice.blockReason"
+        class="chat-error"
+      >
+        {{ $t(voice.blockReason) }}
+      </p>
+      <button
+        v-if="!voiceReady"
+        class="history-control"
+        @click="voiceAction('sync')"
+      >
+        {{ $t('pages.chat.hints.voiceUnavailable') }}
+      </button>
+      <div class="composer-field">
+        <button
+          :aria-label="voice.recording ? $t('pages.main.hints.stopRecording') : $t('pages.main.hints.voice')"
+          class="composer-voice"
+          :disabled="!voiceReady || voice.busy || voice.sending || voice.pending || (!voice.recording && (blocked || Boolean(voice.blockReason)))"
+          :title="voice.recording ? $t('pages.main.hints.stopRecording') : voice.blockReason ? $t(voice.blockReason) : $t('pages.main.hints.voice')"
+          @click="stopVoice(); voiceAction(voice.recording ? 'release' : 'press')"
+        >
+          <span :class="voice.recording ? 'i-lucide:square' : 'i-lucide:mic'" />
+        </button>
         <textarea
           ref="input"
           v-model="draft"
           :aria-label="$t('pages.chat.placeholders.input')"
-          class="max-h-24 min-h-10 min-w-0 flex-1 resize-none py-1 text-[13px] leading-[1.55] outline-none bg-transparent placeholder:color-[#aaa3b4]"
+          class="composer-input"
           :placeholder="$t('pages.chat.placeholders.input')"
-          rows="2"
+          rows="1"
+          :title="$t('pages.chat.hints.inputKeys')"
           @focus="inputMode = true"
           @keydown.enter.exact="handleSendKey"
           @keydown.esc.prevent="closeInput"
         />
 
         <button
-          class="send-button mb-0.5 size-8 flex shrink-0 items-center justify-center transition rounded-full"
-          :class="sendReady ? 'cursor-pointer bg-[#7964bc] hover:bg-[#917bd2]' : 'bg-[#ffffff14]'"
+          :aria-label="$t('pages.chat.buttons.send')"
+          class="send-button"
           :disabled="!sendReady"
           :title="$t('pages.chat.buttons.send')"
           @click="handleSend"
@@ -848,15 +980,11 @@ onMounted(async () => {
         </button>
       </div>
 
-      <div class="composer-hint mt-2 flex items-center justify-between gap-2 px-0.5 text-[10px] color-[#aaa3b4]">
-        <button
-          class="min-w-0 truncate text-left"
-          :title="footerHint"
-          type="button"
-          @click="openInput"
-        >
-          {{ inputMode ? $t('pages.chat.hints.inputKeys') : footerHint }}
-        </button>
+      <div
+        v-if="showingLimit || (pairStore.settings.chat.passThrough && !inputMode)"
+        class="composer-hint"
+      >
+        <span v-if="pairStore.settings.chat.passThrough && !inputMode">{{ footerHint }}</span>
 
         <span
           v-if="showingLimit"
@@ -902,7 +1030,7 @@ onMounted(async () => {
     <!-- 图片预览（§37）：复制图片 / 另存为 -->
     <div
       v-if="previewMessage"
-      class="absolute inset-0 z-50 flex flex-col bg-black/95 rounded-2xl"
+      class="absolute inset-0 z-50 flex flex-col bg-black/95 text-white rounded-2xl"
     >
       <header
         class="flex shrink-0 cursor-move items-center gap-1.5 px-2.5 py-1.5"
@@ -949,13 +1077,21 @@ onMounted(async () => {
 
 <style scoped>
 .chat-shell {
-  background: #211f29;
-  border: 1px solid #4c4658;
-  color: #f6f2fa;
+  /* RainyToken: sakura #FFD1DC, pink #FF85A2, accent #E91E63. */
+  --chat-muted: #806371;
+  background: #fff8fa;
+  border: 1px solid #efd8e1;
+  color: #392b33;
+  font-family: system-ui, sans-serif;
 }
 .chat-header {
-  background: #2b2734;
-  border-bottom: 1px solid #403949;
+  background: #fff1f5;
+  border-bottom: 1px solid #efd8e1;
+}
+.chat-presence,
+.composer-hint,
+.bubble-meta {
+  color: var(--chat-muted);
 }
 .chat-avatar,
 .empty-avatar {
@@ -963,9 +1099,9 @@ onMounted(async () => {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  background: #44384f;
-  color: #edcbdc;
-  border: 1px solid #62516b;
+  background: #ffd1dc;
+  color: #9f2854;
+  border: 1px solid #f0b2c7;
 }
 .chat-avatar {
   width: 34px;
@@ -981,41 +1117,226 @@ onMounted(async () => {
   transform: rotate(-7deg);
 }
 .chat-list {
-  background: radial-gradient(ellipse at top left, #302735 0%, #211f29 65%);
+  background: #fff8fa;
+  overscroll-behavior: contain;
+  /* Native anchoring also handles images loading above the reader after pagination. */
+  overflow-anchor: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #d9a8ba transparent;
+}
+.message-row {
+  flex-shrink: 0;
+}
+.message-text {
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.message-time {
+  font-variant-numeric: tabular-nums;
+}
+.chat-bubble {
+  box-shadow: 0 2px 5px #6d244909;
 }
 .bubble-out {
-  background: #69559d;
-  box-shadow: 0 3px 9px #120e2026;
-  border: 1px solid #8570b2;
+  background: #ffd1dc;
+  border: 1px solid #f4bace;
+  --chat-muted: #795064;
 }
 .bubble-in {
-  background: #35303f;
-  border: 1px solid #4b4255;
+  background: #ffffff;
+  border: 1px solid #ecdfe5;
+}
+.chat-bubble button {
+  color: #9f2854;
+}
+.chat-bubble button:hover {
+  background-color: #e91e6312;
+}
+.chat-bubble [class*='color-'] {
+  color: var(--chat-muted);
+}
+.chat-bubble [class*='bg-[#ffffff'] {
+  background-color: #b8467429;
+}
+.voice-message button span {
+  color: #9f2854;
+}
+.progress-track {
+  background: #b8467429;
+}
+.progress-fill {
+  background: #bd2456;
 }
 .voice-message {
   width: 174px;
   max-width: 100%;
 }
 .chat-composer {
-  background: #292530;
-  border-top: 1px solid #403949;
+  background: #fff1f5;
+  border-top: 1px solid #efd8e1;
+  max-height: 55%;
+  overflow-y: auto;
+}
+.chat-composer > p {
+  color: var(--chat-muted);
+  font-size: 11px;
+}
+.chat-composer > .chat-error,
+.chat-error {
+  color: #ae244c;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  margin-bottom: 6px;
 }
 .composer-field {
-  border: 1px solid #51475e;
-  background: #322c3c;
-  transition: border-color 160ms;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 18px;
+  border: 1px solid #e6c5d2;
+  background: #ffffff;
+  box-shadow: 0 2px 8px #9f285408;
+  transition:
+    border-color 160ms,
+    box-shadow 160ms;
+}
+.composer-input {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  min-height: 36px;
+  max-height: 112px;
+  padding: 7px 0;
+  margin: 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: #392b33;
+  font: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  scrollbar-width: thin;
+  scrollbar-color: #d9a8ba transparent;
+}
+.composer-hint {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 8px 4px 0;
+  font-size: 11px;
+  line-height: 1.5;
 }
 .composer-field:focus-within {
-  border-color: #b79ddd;
-  box-shadow: 0 0 0 2px #b79ddd15;
+  border-color: #e91e63;
+  box-shadow: 0 0 0 3px #ff85a21c;
+}
+.composer-field textarea::placeholder {
+  color: #927b87;
+}
+.send-button {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 12px;
+  background: #bd2456;
+  color: white;
+  transition: background 160ms;
+}
+.chat-shell .send-button:disabled {
+  background: #f4e1e9;
+  color: #a98b98;
+  opacity: 1;
+}
+.send-button span {
+  color: inherit;
+  font-size: 17px;
+}
+.send-button:hover:not(:disabled) {
+  background: #a51f4b;
+}
+.composer-voice {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #b12b59;
+  font-size: 19px;
+  border-radius: 12px;
+  background: #fff1f5;
+}
+.composer-voice:hover:not(:disabled) {
+  background: #fff1f5;
+}
+.voice-draft {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: #fff;
+  border: 1px solid #f0b2c7;
+  border-radius: 12px;
+  font-size: 12px;
+}
+.voice-draft-label {
+  flex: 1 1 100%;
+}
+.voice-action {
+  padding: 6px 10px;
+  min-height: 32px;
+  background: #fff1f5;
+  color: #9f2854;
+  border-radius: 8px;
+}
+.voice-send {
+  background: #bd2456;
+  color: white;
+  margin-left: auto;
+}
+.history-control {
+  text-align: center;
+  color: var(--chat-muted);
+  font-size: 11px;
+  padding: 2px 0 6px;
+}
+.history-control button {
+  padding: 6px 14px;
+  border-radius: 12px;
+  background: #ffeaf1;
+}
+.latest-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 12px;
+  background: #ffe4ee;
+  color: #9f2854;
+  flex-shrink: 0;
+  border-top: 1px solid #efd8e1;
 }
 .chat-shell button:focus-visible {
-  box-shadow: 0 0 0 2px #e2cafa;
+  outline: 2px solid #bd2456;
+  outline-offset: 2px;
   border-radius: 5px;
 }
+.chat-shell button {
+  cursor: pointer;
+}
 .chat-header button {
-  min-width: 24px;
-  min-height: 24px;
+  min-width: 28px;
+  min-height: 28px;
 }
 .chat-shell button:disabled {
   cursor: not-allowed;
@@ -1048,8 +1369,7 @@ onMounted(async () => {
     border-radius: 8px;
     font-size: 17px;
   }
-  .chat-presence,
-  .composer-hint {
+  .chat-presence {
     display: none;
   }
   .chat-composer {
@@ -1059,10 +1379,6 @@ onMounted(async () => {
   }
   .composer-field {
     padding: 4px 8px;
-  }
-  .composer-field textarea {
-    height: 28px;
-    min-height: 28px;
   }
   .chat-list {
     padding: 7px;
