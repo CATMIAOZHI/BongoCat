@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "bongo-cat"
-version = "1.4.4"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -625,6 +625,7 @@ dependencies = [
  "tokio-tungstenite",
  "uuid",
  "webrtc",
+ "webview2-com",
  "winapi",
 ]
 

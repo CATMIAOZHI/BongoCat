@@ -1,6 +1,6 @@
 [package]
 name = "bongo-cat"
-version = "1.4.4"
+version = "1.5.0"
 description = "A Tauri App"
 authors = [ "CATMIAOZHI" ]
 edition = "2024"
@@ -68,6 +68,7 @@ tauri-nspanel.workspace = true
 # 的 ring 本来就在树里，没有新增构建工具要求），构建风险面从 7 个目标降到 3 个。
 # 调用点不要在这里散写 cfg：见 src/core/pair/link.rs 那层 cfg 中立的 seam。
 [target."cfg(windows)".dependencies]
+webview2-com = "0.38.2"
 webrtc.workspace = true
 async-trait.workspace = true
 # `DataChannel::send` 收的是 `BytesMut`。这个 crate 本来就在依赖树里（tungstenite），

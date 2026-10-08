@@ -1,5 +1,4 @@
 import { CheckMenuItem as NativeCheckMenuItem, MenuItem as NativeMenuItem, PredefinedMenuItem as NativePredefinedMenuItem, Submenu as NativeSubmenu } from '@tauri-apps/api/menu'
-import { exit, relaunch } from '@tauri-apps/plugin-process'
 import { range } from 'es-toolkit'
 import { useI18n } from 'vue-i18n'
 
@@ -184,13 +183,13 @@ export function useAppMenu(resources?: MenuResources) {
   const getExitMenu = async () => {
     return await Promise.all([
       MenuItem.new({
+        id: 'bongo-restart-native',
         text: t('composables.useAppMenu.labels.restartApp'),
-        action: relaunch,
       }),
       MenuItem.new({
+        id: 'bongo-exit-native',
         text: t('composables.useAppMenu.labels.quitApp'),
         accelerator: isMac ? 'Cmd+Q' : '',
-        action: () => exit(0),
       }),
     ])
   }

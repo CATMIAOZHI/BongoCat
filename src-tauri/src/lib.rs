@@ -15,7 +15,11 @@ use utils::fs_extra::copy_dir;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let builder = builder.plugin(core::recovery::init());
+    let app = builder
+        .on_menu_event(core::recovery::on_menu_event)
         .setup(|app| {
             let app_handle = app.handle();
 
