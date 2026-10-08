@@ -11,6 +11,7 @@ import { onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterView } from 'vue-router'
 
+import { useAutostart } from './composables/useAutostart'
 import { useTauriListen } from './composables/useTauriListen'
 import { useWindowState } from './composables/useWindowState'
 import { LANGUAGE, LISTEN_KEY } from './constants'
@@ -27,6 +28,7 @@ const appStore = useAppStore()
 const modelStore = useModelStore()
 const catStore = useCatStore()
 const generalStore = useGeneralStore()
+const autostart = useAutostart()
 const shortcutStore = useShortcutStore()
 const pairStatsStore = usePairStatsStore()
 const appWindow = getCurrentWebviewWindow()
@@ -47,6 +49,11 @@ onMounted(async () => {
   catStore.init()
   await generalStore.$tauri.start()
   await generalStore.init()
+  // Only one window reconciles startup, after persistent settings are hydrated.
+  // Do not block page restoration on Task Scheduler.
+  if (appWindow.label === 'preference') {
+    void autostart.apply(generalStore.app.autostart)
+  }
   await shortcutStore.$tauri.start()
   await restoreState()
 })

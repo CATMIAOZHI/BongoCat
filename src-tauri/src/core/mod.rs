@@ -1,4 +1,5 @@
 pub mod device;
+pub mod autostart;
 pub mod gamepad;
 pub mod pair;
 pub mod prevent_default;

@@ -850,6 +850,15 @@ Section Uninstall
   ; If it doesn't exist, it does nothing.
   ; We do this when not updating (to preserve the registry value on updates)
   ${If} $UpdateMode <> 1
+    ; Remove only our tasks whose executable belongs to this installation.
+    ; Pass the path through the environment, never interpolate it into PowerShell code.
+    System::Call 'kernel32::SetEnvironmentVariable(t "BONGO_UNINSTALL_EXE", t "$INSTDIR\${MAINBINARYNAME}.exe")i.r0'
+    nsExec::ExecToLog /TIMEOUT=30000 `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "$$ErrorActionPreference='Stop'; try { $$s=New-Object -ComObject 'Schedule.Service'; $$s.Connect(); $$f=$$s.GetFolder('\'); foreach($$t in $$f.GetTasks(0)) { if($$t.Name -like 'BongoCat-Autostart-*' -and $$t.Definition.Actions.Count -eq 1 -and $$t.Definition.Actions.Item(1).Path -eq $$env:BONGO_UNINSTALL_EXE) { $$f.DeleteTask($$t.Name,0) } } } catch { Write-Output $$_; exit 1 }"`
+    Pop $0
+    ${If} $0 != 0
+      DetailPrint "BongoCat startup task cleanup failed: $0"
+    ${EndIf}
+    System::Call 'kernel32::SetEnvironmentVariable(t "BONGO_UNINSTALL_EXE", p 0)i.r0'
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
   ${EndIf}
 

@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
-import { Switch } from 'antdv-next'
-import { watch } from 'vue'
+import { Alert, Switch } from 'antdv-next'
 
 import ProListItem from '@/components/pro-list-item/index.vue'
 import ProList from '@/components/pro-list/index.vue'
+import { useAutostart } from '@/composables/useAutostart'
 import { useGeneralStore } from '@/stores/general'
 import { isMac, isWindows } from '@/utils/platform'
 
@@ -14,18 +13,7 @@ import ThemeMode from './components/theme-mode/index.vue'
 import WindowsPermissions from './components/windows-permissions/index.vue'
 
 const generalStore = useGeneralStore()
-
-watch(() => generalStore.app.autostart, async (value) => {
-  const enabled = await isEnabled()
-
-  if (value && !enabled) {
-    return enable()
-  }
-
-  if (!value && enabled) {
-    disable()
-  }
-}, { immediate: true })
+const { busy, failure, apply } = useAutostart()
 </script>
 
 <template>
@@ -35,8 +23,19 @@ watch(() => generalStore.app.autostart, async (value) => {
 
   <ProList :title="$t('pages.preference.general.labels.appSettings')">
     <ProListItem :title="$t('pages.preference.general.labels.launchOnStartup')">
-      <Switch v-model:checked="generalStore.app.autostart" />
+      <Switch
+        :checked="generalStore.app.autostart"
+        :disabled="busy"
+        :loading="busy"
+        @change="value => apply(Boolean(value))"
+      />
     </ProListItem>
+    <Alert
+      v-if="failure"
+      :message="failure"
+      show-icon
+      type="error"
+    />
 
     <ProListItem
       :description="$t('pages.preference.general.hints.showTaskbarIcon')"

@@ -185,7 +185,7 @@
           "inputMonitoringPermission": "Enable input monitoring to receive keyboard and mouse events from the system.",
           "inputMonitoringPermissionGuide": "Input Monitoring permission is required for the app to receive keyboard and mouse events from the system.\n\nSteps:\n1. Open System Settings → Privacy & Security → Input Monitoring.\n2. If BongoCat already appears in the list, select it and click the \"-\" button to remove it.\n3. Click the \"+\" button to find and add BongoCat.\n4. Restart the app for the permission to take effect.",
           "administratorPermission": "Running the app as administrator helps capture some system-level keys and input events more reliably.",
-          "administratorPermissionGuide": "To capture some system-level keys and input events more reliably, it is recommended to run the app as administrator.\n\nHow to do it:\n1. Exit the app first.\n2. Find the app exe or its shortcut in File Explorer.\n3. Choose how to launch:\n   • One-time: Right-click and choose \"Run as administrator\".\n   • Always (default): Right-click → Properties → Compatibility tab → check \"Run this program as an administrator\" → OK."
+          "administratorPermissionGuide": "The Windows app requests administrator permission when opened. Accept the system prompt; no compatibility setting is needed.\n\nEnabling launch on startup registers an elevated sign-in task for the account running the app. If you authorize with a different administrator account, the task belongs to that account.\n\nIf permission is still missing, exit and reopen the installed release."
         },
         "status": {
           "authorized": "Authorized",

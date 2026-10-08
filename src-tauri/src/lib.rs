@@ -34,6 +34,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(generate_handler![
+            core::autostart::configure_autostart,
             copy_dir,
             start_device_listening,
             is_key_down,
