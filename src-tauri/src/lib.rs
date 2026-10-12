@@ -31,6 +31,9 @@ pub fn run() {
 
             core::pair::setup(&app_handle);
 
+            #[cfg(windows)]
+            core::recovery::watch_startup(app_handle);
+
             Ok(())
         })
         .invoke_handler(generate_handler![

@@ -23,6 +23,10 @@ try {
         $task.Settings.MultipleInstances = 2 # IgnoreNew
         $trigger = $task.Triggers.Create(9) # Logon
         $trigger.UserId = $sid
+        # Launched at the very moment of sign-in, WebView2 can fail to initialise
+        # (0x80070490) and the app then runs with no window at all. Let the
+        # session settle first; this is also how long until the cat appears.
+        $trigger.Delay = 'PT30S'
         $trigger.Enabled = $true
         $action = $task.Actions.Create(0)
         $action.Path = $exe
