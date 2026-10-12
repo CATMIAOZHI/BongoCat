@@ -54,6 +54,10 @@ pub async fn show_window_label<R: Runtime>(
         // 被冻结过的页面（对方猫窗口遇到的那种）靠这一步是醒不过来的。
         set_webview_visible(&window, true);
 
+        // 隐藏再显示会让任务栏按钮回来（见 `restore_taskbar_visibility`）
+        #[cfg(target_os = "windows")]
+        windows::restore_taskbar_visibility(&window);
+
         if focus {
             let _ = window.set_focus();
         }
@@ -95,6 +99,20 @@ pub async fn is_window_visible<R: Runtime>(
     };
 
     window.is_visible().map_err(|err| err.to_string())
+}
+
+/// 重新播一次「显示任务栏图标」的当前状态（前端在改过窗口标志之后调用）。
+///
+/// 置顶 / 穿透这些操作会让 tao 重算窗口样式，把 `WS_EX_TOOLWINDOW` 抹掉，任务栏按钮就回来了
+/// （细节见 `windows.rs` 的 `set_taskbar_style`）。这些操作在前端是直接调 Tauri API 的，
+/// 所以它们改完之后要顺手叫一次这里。Windows 之外没有这件事，命令保留为空实现。
+#[command]
+pub async fn refresh_taskbar_visibility<R: Runtime>(app_handle: AppHandle<R>) {
+    #[cfg(target_os = "windows")]
+    windows::refresh_taskbar_visibility(&app_handle);
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = app_handle;
 }
 
 fn show_window_by_label(app_handle: &AppHandle, label: &str) {

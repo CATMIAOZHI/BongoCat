@@ -7,6 +7,7 @@ import { onMounted, onUnmounted, ref, watch } from 'vue'
 
 import type { KeyAutoReleasePressOptions } from '@/utils/keyAutoRelease'
 
+import { setPassThrough } from '@/plugins/window'
 import { useAppStore } from '@/stores/app'
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
@@ -181,12 +182,12 @@ export function useDevice() {
         timer = setTimeout(() => {
           document.body.style.setProperty('opacity', '0')
 
-          appWindow.setIgnoreCursorEvents(true)
+          setPassThrough(true)
         }, catStore.window.hideOnHoverDelay * 1000)
       } else {
         document.body.style.setProperty('opacity', 'unset')
 
-        appWindow.setIgnoreCursorEvents(catStore.window.passThrough)
+        setPassThrough(catStore.window.passThrough)
       }
 
       wasInWindow = shouldHide

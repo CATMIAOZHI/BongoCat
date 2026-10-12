@@ -40,7 +40,7 @@
         "label": "remote-cat",
         "url": "index.html/#/remote-cat",
         "visible": false,
-        "title": "BongoCat",
+        "title": "BongoCat · 对方猫",
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows",
         "shadow": false,
         "alwaysOnTop": true,

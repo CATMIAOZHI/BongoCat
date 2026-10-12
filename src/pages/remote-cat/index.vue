@@ -25,7 +25,7 @@ import { usePairStatus } from '@/composables/usePairStatus'
 import { usePeerModel } from '@/composables/usePeerModel'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
-import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
+import { hideWindowByLabel, setAlwaysOnTop, setPassThrough, showWindowByLabel } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { pairStateKey, usePairStore } from '@/stores/pair'
@@ -502,7 +502,7 @@ watch(() => catStore.model.maxFPS, live2d.setMaxFPS, { immediate: true })
 watch(() => pairStore.settings.remoteCat.alwaysOnTop, setAlwaysOnTop, { immediate: true })
 
 watch(() => pairStore.settings.remoteCat.passThrough, (value) => {
-  appWindow.setIgnoreCursorEvents(value)
+  setPassThrough(value)
 }, { immediate: true })
 
 /**

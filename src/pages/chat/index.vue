@@ -36,7 +36,7 @@ import {
 import { usePairVoicePlayback } from '@/composables/usePairVoicePlayback'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { LISTEN_KEY, WINDOW_LABEL } from '@/constants'
-import { hideWindowByLabel, setAlwaysOnTop, showWindowByLabel } from '@/plugins/window'
+import { hideWindowByLabel, setAlwaysOnTop, setPassThrough, showWindowByLabel } from '@/plugins/window'
 import { outboundBlockKey, pairStateKey, usePairStore } from '@/stores/pair'
 
 /**
@@ -191,7 +191,7 @@ function statusTitle(status: MessageStatus) {
 const ignoreCursor = computed(() => pairStore.settings.chat.passThrough && !inputMode.value)
 
 watch(ignoreCursor, (value) => {
-  appWindow.setIgnoreCursorEvents(value)
+  setPassThrough(value)
 }, { immediate: true })
 
 watch(() => pairStore.settings.chat.alwaysOnTop, setAlwaysOnTop, { immediate: true })

@@ -16,7 +16,7 @@ import { useTauriListen } from './composables/useTauriListen'
 import { useWindowState } from './composables/useWindowState'
 import { LANGUAGE, LISTEN_KEY } from './constants'
 import { getAntdLocale } from './locales/index.ts'
-import { hideWindow, showWindow } from './plugins/window'
+import { hideWindow, setTaskbarVisibility, showWindow } from './plugins/window'
 import { useAppStore } from './stores/app'
 import { useCatStore } from './stores/cat'
 import { useGeneralStore } from './stores/general'
@@ -49,6 +49,12 @@ onMounted(async () => {
   catStore.init()
   await generalStore.$tauri.start()
   await generalStore.init()
+  // 任务栏状态记在后端（`TASKBAR_VISIBLE`），要有人播一次样式才落下去。别等猫咪窗口那一页
+  // ——它在 `restoreState()` 之后才挂载，中间那几百毫秒里几扇浮层窗只有 tao 的任务栏提示压着，
+  // 按钮可能闪一下。
+  if (appWindow.label === 'main') {
+    setTaskbarVisibility(generalStore.app.taskbarVisible)
+  }
   // Only one window reconciles startup, after persistent settings are hydrated.
   // Do not block page restoration on Task Scheduler.
   if (appWindow.label === 'preference') {

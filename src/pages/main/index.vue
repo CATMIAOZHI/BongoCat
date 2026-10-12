@@ -25,7 +25,7 @@ import { RECORDING_LIMIT_SECS } from '@/composables/usePair'
 import { usePairVoiceRecorder } from '@/composables/usePairVoice'
 import { useTauriListen } from '@/composables/useTauriListen'
 import { CHAT_OVERLAY_HEIGHT, LISTEN_KEY } from '@/constants'
-import { hideWindow, setAlwaysOnTop, setTaskbarVisibility, showWindow } from '@/plugins/window'
+import { hideWindow, setAlwaysOnTop, setPassThrough, setTaskbarVisibility, showWindow } from '@/plugins/window'
 import { useCatStore } from '@/stores/cat'
 import { useGeneralStore } from '@/stores/general.ts'
 import { useModelStore } from '@/stores/model'
@@ -294,7 +294,7 @@ watch(() => catStore.window.visible, async (value) => {
 })
 
 watch(() => catStore.window.passThrough, (value) => {
-  appWindow.setIgnoreCursorEvents(value)
+  setPassThrough(value)
 }, { immediate: true })
 
 watch(() => catStore.window.alwaysOnTop, setAlwaysOnTop, { immediate: true })

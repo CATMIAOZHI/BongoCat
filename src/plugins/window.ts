@@ -23,6 +23,7 @@ const COMMAND = {
   HIDE_WINDOW: 'plugin:custom-window|hide_window',
   SET_ALWAYS_ON_TOP: 'plugin:custom-window|set_always_on_top',
   SET_TASKBAR_VISIBILITY: 'plugin:custom-window|set_taskbar_visibility',
+  REFRESH_TASKBAR_VISIBILITY: 'plugin:custom-window|refresh_taskbar_visibility',
   SHOW_WINDOW_LABEL: 'plugin:custom-window|show_window_label',
   HIDE_WINDOW_LABEL: 'plugin:custom-window|hide_window_label',
   IS_WINDOW_VISIBLE: 'plugin:custom-window|is_window_visible',
@@ -96,4 +97,17 @@ export async function toggleWindowVisible(label?: WindowLabel) {
 
 export async function setTaskbarVisibility(visible: boolean) {
   invoke(COMMAND.SET_TASKBAR_VISIBILITY, { visible })
+}
+
+/**
+ * 设置鼠标穿透。
+ *
+ * 别直接调 `appWindow.setIgnoreCursorEvents`：改窗口标志会让 tao 重算整份窗口样式，而那份
+ * 样式里没有 `WS_EX_TOOLWINDOW`（tao 只认自己的任务栏提示），刚压下去的任务栏按钮就回来了。
+ * 所以穿透改完顺手让后端把任务栏状态重播一次。
+ */
+export async function setPassThrough(passThrough: boolean) {
+  await getCurrentWebviewWindow().setIgnoreCursorEvents(passThrough)
+
+  await invoke(COMMAND.REFRESH_TASKBAR_VISIBILITY)
 }
