@@ -162,11 +162,16 @@ fn apply_taskbar_style(hwnd: isize, visible: bool) {
     // 不引它的类型。
     let hwnd = HWND(hwnd as _);
 
-    let tool_window = WS_EX_TOOLWINDOW.0 as isize;
-    let app_window = WS_EX_APPWINDOW.0 as isize;
-
     unsafe {
-        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        // `GetWindowLongPtrW` 在 32 位下返回 `i32`、64 位下是 `isize`，所以先整成 `isize` 再算，
+        // 写回时按它自己的类型转回去。**不能把常量写死成 `isize` 直接和返回值做位运算**：那样
+        // i686 上会报 `i32 | isize`、crate 编不过（本 fork 从 v1.5.4 起已经不出 32 位包，但这段
+        // 代码保持两个指针宽度都能过，免得以后有人为了别的原因编 32 位时撞上）。样式常量只有
+        // 低 32 位、都是正数，来回转换不丢位。
+        let tool_window = WS_EX_TOOLWINDOW.0 as isize;
+        let app_window = WS_EX_APPWINDOW.0 as isize;
+
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as isize;
 
         let next = if visible {
             (current | app_window) & !tool_window
@@ -178,7 +183,7 @@ fn apply_taskbar_style(hwnd: isize, visible: bool) {
             return;
         }
 
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as _);
 
         // 改完要让系统重算非客户区，否则有的配置下样式要等下一次尺寸变化才生效。
         let _ = SetWindowPos(

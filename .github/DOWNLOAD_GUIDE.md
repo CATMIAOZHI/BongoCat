@@ -4,7 +4,6 @@
 
 - 大多数 Windows 电脑：`x64-setup.exe`。
 - Windows ARM 设备：`arm64-setup.exe`。
-- 32 位 Windows：`x86-setup.exe`。
 
 运行安装包，按提示安装。更新前退出正在运行的 BongoCat。
 

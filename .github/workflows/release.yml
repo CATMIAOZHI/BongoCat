@@ -55,15 +55,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 只构建 Windows：双人联机只在 Windows 上实现和验证过，macOS / Linux
-          # 的包在这里没人用，白等几分钟 runner。要恢复上游的全平台，把
-          # macos-latest（aarch64 / x86_64-apple-darwin）与 ubuntu-22.04 /
-          # ubuntu-22.04-arm（x86_64 / aarch64-unknown-linux-gnu）加回来，并把
-          # 下面那段「Install dependencies (ubuntu only)」一起恢复即可。
+          # 只构建 Windows 的两个 64 位目标：双人联机只在 Windows 上实现和验证过，
+          # macOS / Linux 的包在这里没人用，白等几分钟 runner。32 位（i686）从
+          # 2026-10-13 起也不出了——本 fork 用不到它，而那一格从 v1.5.2 起就因为
+          # 窗口样式那段位运算编不过（`i32 | isize`）一直是个红叉。
+          # 要恢复上游的全平台，把 macos-latest（aarch64 / x86_64-apple-darwin）与
+          # ubuntu-22.04 / ubuntu-22.04-arm（x86_64 / aarch64-unknown-linux-gnu）
+          # 加回来，并把下面那段「Install dependencies (ubuntu only)」一起恢复即可。
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-          - platform: windows-latest
-            target: i686-pc-windows-msvc
           - platform: windows-latest
             target: aarch64-pc-windows-msvc
 
