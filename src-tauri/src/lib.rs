@@ -15,6 +15,12 @@ use utils::fs_extra::copy_dir;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 第一行：rdev 装钩子时只装键盘那一半（见 `core::device::init_keyboard_only`）。
+    // 这一条是整份改动里最关键的一步——低层鼠标钩子让系统每一次鼠标移动都要唤醒并调度
+    // 装钩子的线程，那才是全系统鼠标发涩的来源。
+    #[cfg(windows)]
+    core::device::init_keyboard_only();
+
     let builder = tauri::Builder::default();
     #[cfg(windows)]
     let builder = builder.plugin(core::recovery::init());
