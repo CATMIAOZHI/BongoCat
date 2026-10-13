@@ -1,6 +1,6 @@
 [package]
 name = "bongo-cat"
-version = "1.5.2"
+version = "1.5.3"
 description = "A Tauri App"
 authors = [ "CATMIAOZHI" ]
 edition = "2024"

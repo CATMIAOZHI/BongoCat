@@ -19,6 +19,16 @@ fn overlay_window_labels() -> [&'static str; 3] {
     ]
 }
 
+/// 这扇窗是不是贴在桌面上的浮层窗口——只有这三扇跟「显示任务栏图标」走，别的窗口一律不碰。
+///
+/// 判断放在这里而不是各个调用点：`show_window` / `set_always_on_top` / `show_window_label`
+/// 都是通用命令，**谁调用就作用在谁身上**，任何一处漏判都会让偏好设置被顺手套上浮层的样式。
+fn is_overlay_window(label: &str) -> bool {
+    overlay_window_labels()
+        .iter()
+        .any(|overlay| *overlay == label)
+}
+
 /// 「显示任务栏图标」的当前状态（打开它 = OBS 能在这几扇窗里选到猫）。
 ///
 /// 默认关，与 `tauri.conf.json` 里的 `skipTaskbar: true` 一致；前端那一页载入后会照设置里的
@@ -98,6 +108,14 @@ pub async fn set_taskbar_visibility<R: Runtime>(app_handle: AppHandle<R>, visibl
 
 /// 把开关落到一扇窗上：tao 的记账 + 我们自己的窗口样式。
 fn apply_taskbar_visibility<R: Runtime>(window: &WebviewWindow<R>, visible: bool) {
+    // 偏好设置不在这里，而且必须在这里挡住：`show_window` 是通用命令，用托盘打开偏好设置
+    // 时它拿到的就是偏好设置那扇窗。`WS_EX_TOOLWINDOW` 一旦加上，系统会改用**工具窗口的
+    // 紧凑标题栏**——最小化 / 最大化不再画，只剩一个更小的关闭按钮，用户看到的就是
+    // 「标题栏三个按钮变成这样了」。偏好设置是普通窗口，仍照上游只靠 tao 的任务栏提示。
+    if !is_overlay_window(window.label()) {
+        return;
+    }
+
     // tao 会在 `TaskbarCreated`（资源管理器重启）之后照它存的那份值重放一次，
     // 所以这一句不能省——省了它，下次重启资源管理器就会把「显示任务栏图标」关掉。
     let _ = window.set_skip_taskbar(!visible);
@@ -191,5 +209,25 @@ pub fn refresh_taskbar_visibility<R: Runtime>(app_handle: &AppHandle<R>) {
         if let Some(window) = app_handle.get_webview_window(label) {
             restore_taskbar_visibility(&window);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三扇浮层窗口跟着开关走，偏好设置不跟。
+    ///
+    /// 它一旦被顺手套上 `WS_EX_TOOLWINDOW`，系统会改用工具窗口的紧凑标题栏：最小化 /
+    /// 最大化不再画，只剩一个更小的关闭按钮——这正是用户报过的现象。
+    #[test]
+    fn only_the_overlay_windows_follow_the_taskbar_switch() {
+        use crate::commands::PREFERENCE_WINDOW_LABEL;
+
+        assert!(is_overlay_window(MAIN_WINDOW_LABEL));
+        assert!(is_overlay_window(REMOTE_CAT_WINDOW_LABEL));
+        assert!(is_overlay_window(CHAT_WINDOW_LABEL));
+        assert!(!is_overlay_window(PREFERENCE_WINDOW_LABEL));
+        assert!(!is_overlay_window(""));
     }
 }
