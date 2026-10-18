@@ -11,6 +11,7 @@ import type { ModelSize } from '@/composables/useModel'
 
 import { i18n } from '@/locales'
 
+import { normalizeMaxFPS } from './frameRate'
 import { join } from './path'
 
 Config.MouseFollow = false
@@ -154,7 +155,9 @@ class Live2d {
     Config.MotionSound = enabled
   }
 
-  public setMaxFPS(fps: number) {
+  // 两只猫直接把此函数传给 watch，必须保留实例绑定，否则回调中的 this 是 undefined。
+  public setMaxFPS = (value: number) => {
+    const fps = normalizeMaxFPS(value)
     this.maxFPS = fps
 
     /*

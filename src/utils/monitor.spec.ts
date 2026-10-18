@@ -3,7 +3,7 @@ import type { Monitor } from '@tauri-apps/api/window'
 import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi'
 import { describe, expect, it, vi } from 'vitest'
 
-import { chooseMonitor, clampIntoMonitor, monitorQueryPoint, pickMonitor } from './monitor'
+import { chooseMonitor, clampIntoMonitor, createCachedMonitorLookup, monitorQueryPoint, pickMonitor } from './monitor'
 
 // `utils/platform.ts` 在模块加载时就要问一次 Tauri（`platform()`），node 里跑不了；
 // 这里换成固定值，顺带把「按平台分坐标空间」这件事钉住
@@ -79,6 +79,55 @@ describe('查鼠标所在显示器的口径', () => {
 // 于是 x>2133 且 y<149 那一带谁都没盖住（「空档」）。所有夹取判据都按物理像素走。
 const primary = at(0, 0, 2133, 1600)
 const secondary = at(2133, 149, 2560, 1440)
+
+describe('鼠标多屏布局缓存', () => {
+  it('两路坐标跨屏往返和停在空档，不逐帧查询系统', async () => {
+    const query = vi.fn(async () => ({ monitors: [primary, secondary], primary }))
+    const lookup = createCachedMonitorLookup(query, () => 0)
+    for (let index = 0; index < 120; index++) {
+      expect(await lookup({ x: 100, y: 100 })).toBe(primary)
+      expect(await lookup({ x: 2500, y: 500 })).toBe(secondary)
+      expect(await lookup({ x: 2500, y: 100 })).toBe(secondary)
+    }
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it('首次查询在途合并，刷新不挡移动，拔屏后不返回旧几何', async () => {
+    let time = 0
+    let finish!: (value: { monitors: Monitor[], primary: Monitor }) => void
+    const query = vi.fn(() => new Promise<{ monitors: Monitor[], primary: Monitor }>((resolve) => {
+      finish = resolve
+    }))
+    const lookup = createCachedMonitorLookup(query, () => time)
+    const first = lookup({ x: 100, y: 100 })
+    const second = lookup({ x: 2500, y: 500 })
+    expect(query).toHaveBeenCalledTimes(1)
+    finish({ monitors: [primary, secondary], primary })
+    expect(await first).toBe(primary)
+    expect(await second).toBe(secondary)
+    time = 5000
+    expect(await lookup({ x: 2500, y: 500 })).toBe(secondary)
+    expect(query).toHaveBeenCalledTimes(2)
+    finish({ monitors: [primary], primary })
+    await Promise.resolve()
+    expect(await lookup({ x: 2500, y: 500 })).toBe(primary)
+  })
+
+  it('查询失败后退避，不会随每次鼠标事件重试', async () => {
+    let time = 0
+    const query = vi.fn(async () => {
+      throw new Error('monitor unavailable')
+    })
+    const lookup = createCachedMonitorLookup(query, () => time)
+    for (let index = 0; index < 120; index++) {
+      expect(await lookup({ x: 100, y: 100 })).toBeNull()
+    }
+    expect(query).toHaveBeenCalledTimes(1)
+    time = 5000
+    await lookup({ x: 100, y: 100 })
+    expect(query).toHaveBeenCalledTimes(2)
+  })
+})
 
 function rect(x: number, y: number, width = 257, height = 149) {
   return {

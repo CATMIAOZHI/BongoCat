@@ -4,7 +4,7 @@ use tauri::{AppHandle, Manager, Runtime, WebviewWindow, command};
 
 use super::{CHAT_WINDOW_LABEL, MAIN_WINDOW_LABEL, REMOTE_CAT_WINDOW_LABEL};
 
-/// 保留跨平台窗口销毁接口；Windows 的置顶状态由系统保持，无后台线程需要停止。
+/// 保留跨平台窗口销毁接口；Windows 的共享检查器通过插件 on_event 清理窗口记录。
 pub fn stop_topmost_keep_alive(_label: &str) {}
 
 /// 贴在桌面上的浮层窗口：自己的猫 / 对方猫 / 聊天窗口。
@@ -78,16 +78,26 @@ pub async fn set_always_on_top<R: Runtime>(
     window: WebviewWindow<R>,
     always_on_top: bool,
 ) {
-    // TOPMOST 是持久的窗口属性，不需要每帧重设。多个窗口每 16ms 重设会
-    // 反复争抢置顶层内的 Z 序，现场采样显示三个保持线程几乎都耗在 SetWindowPos。
-    // 交由 Tauri 在事件循环中设置，避免后台线程直接操作 HWND 及关闭/重开竞态。
-    let _ = window.set_always_on_top(always_on_top);
-
-    // 改置顶会让 tao 重算整份窗口样式（`WindowState::set_window_flags` 在标志有变化时
-    // `SetWindowLongW(GWL_EXSTYLE)`），重算出来的样式里没有我们的 `WS_EX_TOOLWINDOW`。
-    // 猫咪右键菜单每次都会走这里（先取消置顶、再恢复），所以不补这一下，任务栏按钮就会跟着
-    // 右键冒出来。
-    restore_taskbar_visibility(&window);
+    let app = window.app_handle().clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = window.set_always_on_top(always_on_top);
+        if is_overlay_window(window.label()) {
+            if let Ok(hwnd) = window.hwnd() {
+                super::topmost::remember(
+                    window.app_handle(),
+                    window.label(),
+                    hwnd.0 as isize,
+                    always_on_top,
+                );
+                // 显式开启也要绕过 tao 的缓存，确保立刻恢复真实的 Z 序。
+                if always_on_top {
+                    super::topmost::raise(hwnd.0 as isize);
+                }
+            }
+        }
+        // tao 改标志会重写样式；继续补回 OBS/任务栏设置，偏好设置仍不套浮层样式。
+        restore_taskbar_visibility(&window);
+    });
 }
 
 /// 开关「显示任务栏图标」。

@@ -67,6 +67,9 @@ export function useDevice() {
   const { handlePress, handleRelease, handleMouseChange, handleMouseRatio } = useModel()
   // 本地输入同时喂给联机同步：远程猫要「哪只手 + 强度 + 比例 + 能显示的键名」（R37）
   const pairState = usePairState()
+  let disposed = false
+  let cursorRequest = 0
+  let syncRequest = 0
 
   /**
    * 问系统：这些键里有没有还按着的（R46 的「安静 ≠ 抬起」）。
@@ -132,11 +135,16 @@ export function useDevice() {
   })
 
   onUnmounted(() => {
+    disposed = true
+    cursorRequest++
+    syncRequest++
     Ticker.shared.remove(tickerCallback)
     keyAutoRelease.stop()
   })
 
   watch(() => catStore.model.ignoreMouse, (value) => {
+    cursorRequest++
+    syncRequest++
     if (value) {
       return Ticker.shared.remove(tickerCallback)
     }
@@ -195,12 +203,15 @@ export function useDevice() {
   })()
 
   const handleCursorMove = async (cursorPoint: CursorPoint) => {
+    const request = ++cursorRequest
     const x = cursorPoint.x * scaleFactor.value
     const y = cursorPoint.y * scaleFactor.value
 
     // R12：本机渲染用平滑后的点算比例；联机同步用原始点另算一次（见下面的 syncPointer）
     const point = new PhysicalPosition(x, y)
     const monitor = await getCursorMonitor(point)
+
+    if (disposed || request !== cursorRequest || catStore.model.ignoreMouse) return
 
     if (monitor) {
       const { size, position } = monitor
@@ -225,8 +236,11 @@ export function useDevice() {
   const syncPointer = async (cursorPoint: CursorPoint) => {
     if (catStore.model.ignoreMouse) return
 
+    const request = ++syncRequest
     const point = new PhysicalPosition(cursorPoint.x * scaleFactor.value, cursorPoint.y * scaleFactor.value)
     const monitor = await getCursorMonitor(point)
+
+    if (disposed || request !== syncRequest || catStore.model.ignoreMouse) return
 
     if (!monitor) return
 

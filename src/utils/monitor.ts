@@ -1,9 +1,9 @@
 import type { Monitor, PhysicalPosition } from '@tauri-apps/api/window'
 
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
-import { cursorPosition, monitorFromPoint, primaryMonitor } from '@tauri-apps/api/window'
+import { availableMonitors, cursorPosition, monitorFromPoint, primaryMonitor } from '@tauri-apps/api/window'
 
-import { isMac } from './platform'
+import { isMac, isWindows } from './platform'
 
 /**
  * 查显示器时该用哪个坐标空间（纯函数，见 `monitor.spec.ts`）。
@@ -126,11 +126,67 @@ export function clampIntoMonitor(rect: RectLike, monitor: RectLike) {
   }
 }
 
+interface MonitorLayout {
+  monitors: Monitor[]
+  primary: Monitor | null
+}
+
+/**
+ * Windows 原始点与平滑点可能落在不同屏上；缓存整个布局，避免两路交替淘汰单屏缓存。
+ * 五秒最多刷新一次，在途请求共用；已有布局时刷新不阻塞鼠标。空档沿用最近命中的屏。
+ */
+export function createCachedMonitorLookup(
+  query: () => Promise<MonitorLayout>,
+  now: () => number = () => performance.now(),
+) {
+  let layout: MonitorLayout = { monitors: [], primary: null }
+  let lastMatched: Monitor | null = null
+  let refreshedAt = Number.NEGATIVE_INFINITY
+  let inFlight: Promise<void> | undefined
+
+  return async (point: { x: number, y: number }): Promise<Monitor | null> => {
+    if (!inFlight && now() - refreshedAt >= 5000) {
+      inFlight = (async () => {
+        try {
+          const next = await query()
+          layout = next
+          // 拔掉/调整显示器后不保留旧几何；同名屏也要采用新布局里的对象。
+          lastMatched = next.monitors.find(monitor =>
+            lastMatched
+            && monitor.name === lastMatched.name
+            && monitor.position.x === lastMatched.position.x
+            && monitor.position.y === lastMatched.position.y,
+          ) ?? next.primary ?? next.monitors[0] ?? null
+        } catch {
+          // 短暂查询失败继续沿用最近布局，也按五秒退避，不能每次移动都重试。
+        } finally {
+          refreshedAt = now()
+          inFlight = undefined
+        }
+      })()
+    }
+    if (layout.monitors.length === 0 && inFlight) await inFlight
+
+    const found = layout.monitors.find(({ position, size }) =>
+      point.x >= position.x && point.x < position.x + size.width
+      && point.y >= position.y && point.y < position.y + size.height,
+    )
+    lastMatched = found ?? lastMatched
+    return lastMatched
+  }
+}
+
 function createCursorMonitor() {
   let cachedMonitor: Monitor | null = null
+  const cachedLookup = createCachedMonitorLookup(async () => {
+    const [monitors, primary] = await Promise.all([availableMonitors(), primaryMonitor()])
+    return { monitors, primary }
+  })
 
   return async (cursorPoint?: PhysicalPosition) => {
     cursorPoint ??= await cursorPosition()
+
+    if (isWindows) return cachedLookup(cursorPoint)
 
     if (cachedMonitor) {
       const { size, position } = cachedMonitor

@@ -29,6 +29,7 @@ import { hideWindowByLabel, setAlwaysOnTop, setPassThrough, showWindowByLabel } 
 import { useCatStore } from '@/stores/cat'
 import { useModelStore } from '@/stores/model'
 import { pairStateKey, usePairStore } from '@/stores/pair'
+import { remoteFrameInterval } from '@/utils/frameRate'
 import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
@@ -66,15 +67,13 @@ const GAP_MAX_MS = 1000
 /** 指针变化小于它就跳过重绘（量化步长是 0.02，这个阈值远小于它） */
 const POINTER_EPSILON = 0.001
 /**
- * 这一窗的插值循环最多按 60fps 走（见 [`frameLoop`]）。
+ * 这一窗的插值循环按用户设置抽帧，最多 60fps（见 [`frameLoop`]）。
  *
  * `requestAnimationFrame` 跟的是**显示器刷新率**：165Hz 的屏就是每秒 165 次，而这一帧里要做
- * `Object.values` 与路径拆分这类分配。对方快照本身最多 60Hz、本机那份平滑也是 60fps，再密
+ * `Object.values` 与路径拆分这类分配。对方快照本身最多 60Hz，再密
  * 只是白烧一个窗口的 CPU（还要和全屏游戏 + 推流抢资源）。插值是按 `dt` 收敛的，跳帧不改变
  * 它收敛到哪，只改变中间经过几个点。
- */
-const FRAME_INTERVAL_MS = 1000 / 60
-/**
+ *
  * 比目标间隔早这么多毫秒也照渲染（见 [`frameLoop`]）。
  *
  * `Date.now()` 在 Chromium 里是**整数毫秒**，而 60Hz 的 rAF 间隔是 16.67ms —— 取整之后测出来
@@ -116,7 +115,7 @@ let appliedKey: string | undefined
 let appliedX = Number.NaN
 let appliedY = Number.NaN
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
-/** 上一轮插值循环的时刻，只用来按 `FRAME_INTERVAL_MS` 抽帧 */
+/** 上一轮插值循环的时刻，只用来按用户设置的帧率抽帧 */
 let lastLoopAt = Number.NEGATIVE_INFINITY
 let soundFailed = false
 /**
@@ -420,7 +419,7 @@ function frameLoop() {
 
   const now = Date.now()
 
-  if (now - lastLoopAt < FRAME_INTERVAL_MS - FRAME_INTERVAL_TOLERANCE_MS) return
+  if (now - lastLoopAt < remoteFrameInterval(catStore.model.maxFPS) - FRAME_INTERVAL_TOLERANCE_MS) return
 
   lastLoopAt = now
 

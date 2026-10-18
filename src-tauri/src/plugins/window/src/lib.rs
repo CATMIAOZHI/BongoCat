@@ -9,6 +9,15 @@ pub use commands::*;
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("custom-window")
+        .setup(|_app, _api| {
+            #[cfg(target_os = "windows")]
+            commands::topmost::start(_app)?;
+            Ok(())
+        })
+        .on_event(|_app, _event| {
+            #[cfg(target_os = "windows")]
+            commands::topmost::on_event(_app, _event);
+        })
         .invoke_handler(generate_handler![
             commands::show_window,
             commands::hide_window,
