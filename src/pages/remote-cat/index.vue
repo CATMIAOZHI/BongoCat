@@ -6,7 +6,6 @@ import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { exists, readDir } from '@tauri-apps/plugin-fs'
 import { error } from '@tauri-apps/plugin-log'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
-import { round } from 'es-toolkit'
 import { nth } from 'es-toolkit/compat'
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 
@@ -34,6 +33,7 @@ import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
 import { clearObject } from '@/utils/shared'
+import { applyScaleDragDelta, resolveResizedScale } from '@/utils/windowScale'
 
 /**
  * 对方猫咪窗口（§21 - §23）。
@@ -147,7 +147,7 @@ const remoteStats = computed(() => {
  * 对方猫窗口上没有聊天浮层（R39 那条只在自己猫上），所以不用留额外高度。
  */
 function targetRemoteSize(scale = pairStore.settings.remoteCat.scale) {
-  if (!modelSize.value) return
+  if (!modelSize.value || !Number.isFinite(scale) || scale <= 0) return
 
   const factor = scale / 100
 
@@ -189,7 +189,11 @@ const debouncedResize = useDebounceFn(async () => {
     // 反推缩放用**物理宽度**，与自己猫（`pages/main/index.vue`）和 `targetRemoteSize()`
     // 的口径一致：用 CSS 像素在非 100% 系统缩放下会每次都算小一档、窗口越缩越小。
     const size = await appWindow.size()
-    const nextScale = Math.max(10, Math.min(500, round((size.width / modelSize.value.width) * 100)))
+    const nextScale = resolveResizedScale({
+      size,
+      modelSize: modelSize.value,
+      currentScale: pairStore.settings.remoteCat.scale,
+    })
 
     if (nextScale !== pairStore.settings.remoteCat.scale) {
       pairStore.settings.remoteCat.scale = nextScale
@@ -554,13 +558,43 @@ function notifyChatMessage() {
 // §47：聊天窗口负责把消息加进列表，通知动画只在这里做
 useTauriListen<ChatMessage>(LISTEN_KEY.PAIR_MESSAGE_RECEIVED, notifyChatMessage)
 
+let scaleDragRemainder = 0
+
 function handleMouseDown(event: MouseEvent) {
+  scaleDragRemainder = 0
+
   if (event.button === 0) appWindow.startDragging()
 }
 
 async function handleContextmenu(event: MouseEvent) {
   event.preventDefault()
+
+  if (event.shiftKey) return
+
   await openContextMenu()
+}
+
+function handleMouseMove(event: MouseEvent) {
+  const { buttons, shiftKey, movementX, movementY } = event
+
+  if (buttons !== 2 || !shiftKey) {
+    scaleDragRemainder = 0
+
+    return
+  }
+
+  const next = applyScaleDragDelta(
+    pairStore.settings.remoteCat.scale,
+    movementX,
+    movementY,
+    scaleDragRemainder,
+  )
+
+  scaleDragRemainder = next.remainder
+
+  if (next.scale !== pairStore.settings.remoteCat.scale) {
+    pairStore.settings.remoteCat.scale = next.scale
+  }
 }
 </script>
 
@@ -573,6 +607,7 @@ async function handleContextmenu(event: MouseEvent) {
     }"
     @contextmenu="handleContextmenu"
     @mousedown="handleMouseDown"
+    @mousemove="handleMouseMove"
   >
     <div
       ref="model"
@@ -624,7 +659,7 @@ async function handleContextmenu(event: MouseEvent) {
 
     <div
       v-else-if="notice"
-      class="absolute inset-x-0 top-0 flex justify-center pt-2"
+      class="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-2"
     >
       <div class="rounded-[0.5rem] bg-black/50 px-2.5 py-1 text-[11px] text-[#fff]">
         {{ $t('pages.remoteCat.hints.peerBack') }}
@@ -655,7 +690,7 @@ async function handleContextmenu(event: MouseEvent) {
 
     <div
       v-if="isOnline() && pairStore.runtime.peerName"
-      class="absolute inset-x-0 bottom-0 flex justify-center pb-0.5 transition-opacity"
+      class="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-0.5 transition-opacity"
       :class="{ 'group-hover:opacity-0': remoteStats && pairStore.settings.remoteCat.showStats && !pairStore.settings.remoteCat.passThrough }"
     >
       <!-- 昵称是对面自己填的，长度不可控：窗口只有这么宽，长了就省略号，别把窗口撑变形 -->
@@ -677,7 +712,7 @@ async function handleContextmenu(event: MouseEvent) {
     -->
     <div
       v-if="stateNote"
-      class="absolute inset-x-0 top-0 flex justify-center pt-2"
+      class="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-2"
     >
       <div class="max-w-full break-all rounded-[0.5rem] bg-black/55 px-2 py-1 text-[11px] text-[#fff]">
         {{ $t(stateNote) }}

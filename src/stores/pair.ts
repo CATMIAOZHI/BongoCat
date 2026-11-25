@@ -73,7 +73,10 @@ export function pairStateKey(connection: PairConnectionState, enabled: boolean):
 
   const key = pairStatusKey(connection)
 
-  return key === 'connected' ? '' : `pages.pairState.${key}`
+  if (key === 'connected') return ''
+
+  // 联机总开关已经打开时，绝不能再提示「双人联机没打开」
+  return key === 'disabled' ? 'pages.pairState.disconnected' : `pages.pairState.${key}`
 }
 
 /**
@@ -387,12 +390,11 @@ export const usePairStore = defineStore('pair', () => {
 }, {
   tauri: {
     /**
-     * §72：每个 WebView 都要初始化 pair store。
-     *
-     * 没有这一条时 store 只在当前窗口的内存里：设置与统计既不落盘，也不跨窗口同步，
-     * 于是偏好窗口打开的开关（对方猫、暂停同步）在猫咪窗口里读不到，统计也永远显示 0。
+     * 不自动启动，改为由 `App.vue` 统一 `await pairStore.$tauri.start()`：
+     * 这样每个 WebView 都会在挂载页面前完成水合，`remote-cat` / `chat` / `main`
+     * 不会在 `settings.enabled` / `remoteCat.scale` 还是默认值时就执行初始化逻辑。
      */
-    autoStart: true,
+    autoStart: false,
     // 运行时状态与指纹不落盘：重新启动后必须先由 Rust 的真实状态覆盖，
     // 否则会先闪一下上一次会话的「已连接」
     filterKeys: PAIR_LOCAL_STATE_KEYS,

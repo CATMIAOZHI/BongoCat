@@ -1,4 +1,4 @@
-import { onMounted } from 'vue'
+import { onMounted, onUnmounted, watch } from 'vue'
 
 import type { PairConnectionState } from '@/stores/pair'
 import type { PairModelIdentity } from '@/utils/pairModel'
@@ -56,20 +56,34 @@ export function usePairStatus() {
     }
   }
 
-  const applyStatus = (status: PairStatus) => {
-    store.runtime.connection = store.settings.enabled ? translate(status.state) : 'disabled'
-    store.runtime.p2p = store.settings.enabled ? (status.p2p ?? 'off') : 'off'
+  let latestStatus: PairStatus | undefined
+  let receivedEvent = false
+  let unmounted = false
+
+  const applyEnabledDependentStatus = (status: PairStatus) => {
+    const enabled = store.settings.enabled
+    const translated = translate(status.state)
+
+    store.runtime.connection = enabled
+      ? (translated === 'disabled' ? 'disconnected' : translated)
+      : 'disabled'
+    store.runtime.p2p = enabled ? (status.p2p ?? 'off') : 'off'
     // 档位只在连接有效时有意义：关掉联机就落回缺省（部署者那一档），
     // 免得「上次连的是公益服务器」这条记忆在断开之后还灰着发送口
-    store.runtime.tier = store.settings.enabled ? (status.tier ?? 'full') : 'full'
+    store.runtime.tier = enabled ? (status.tier ?? 'full') : 'full'
     // 「服务器报过档位没有」跟着 `tier` 一起归一：关掉联机、或服务器压根没报（CF 版 /
     // 旧中继 / 配对码）时都是 false——界面只有它为真才说「这台服务器说……」。
-    store.runtime.tierReported = store.settings.enabled && (status.tierReported ?? false)
+    store.runtime.tierReported = enabled && (status.tierReported ?? false)
+    store.runtime.petStateHz = enabled ? (status.petStateHz ?? 0) : 0
+    store.runtime.plaintext = enabled && (status.plaintext ?? false)
+  }
+
+  const applyStatus = (status: PairStatus) => {
+    latestStatus = status
+    applyEnabledDependentStatus(status)
     // 配对码面板不受总开关影响：它是「这次配对正在进行」这件事实，关掉联机总开关时
     // Rust 那边也会把它清掉（`disconnect`），所以这里如实照搬
     store.runtime.manual = status.manual ?? void 0
-    store.runtime.petStateHz = store.settings.enabled ? (status.petStateHz ?? 0) : 0
-    store.runtime.plaintext = store.settings.enabled && (status.plaintext ?? false)
     store.runtime.relayUrl = status.relayUrl ?? void 0
     store.runtime.peerOnline = status.peerOnline
     // `|| void 0`：对面清空昵称时 Rust 那份是 `Some("")`，别让它以空串的形态留在 store 里
@@ -83,11 +97,46 @@ export function usePairStatus() {
     store.runtime.deviceId = status.deviceId
   }
 
+  // `enabled` 可能在收到 Rust 状态之后才跨窗口同步过来（例如在偏好页打开联机开关时，
+  // `PAIR_CONNECTION_CHANGED` 先到对方猫窗口，store 同步稍后才到）。这里只重算依赖
+  // `enabled` 的字段，避免用旧快照覆盖之后单独到达的 presence / stats。
+  watch(() => store.settings.enabled, (enabled) => {
+    if (latestStatus) {
+      applyEnabledDependentStatus(latestStatus)
+
+      return
+    }
+
+    if (!enabled) {
+      store.runtime.connection = 'disabled'
+      store.runtime.p2p = 'off'
+      store.runtime.tier = 'full'
+      store.runtime.tierReported = false
+      store.runtime.petStateHz = 0
+      store.runtime.plaintext = false
+
+      return
+    }
+
+    if (store.runtime.connection === 'disabled') {
+      store.runtime.connection = 'disconnected'
+    }
+  }, { immediate: true })
+
   onMounted(async () => {
-    applyStatus(await pairGetStatus())
+    const status = await pairGetStatus()
+
+    if (unmounted || receivedEvent) return
+
+    applyStatus(status)
+  })
+
+  onUnmounted(() => {
+    unmounted = true
   })
 
   useTauriListen<PairStatus>(LISTEN_KEY.PAIR_CONNECTION_CHANGED, ({ payload }) => {
+    receivedEvent = true
     applyStatus(payload)
   })
 

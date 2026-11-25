@@ -21,6 +21,7 @@ import { useAppStore } from './stores/app'
 import { useCatStore } from './stores/cat'
 import { useGeneralStore } from './stores/general'
 import { useModelStore } from './stores/model'
+import { usePairStore } from './stores/pair'
 import { markPairStatsLoaded, usePairStatsStore } from './stores/pairStats'
 import { useShortcutStore } from './stores/shortcut.ts'
 
@@ -30,6 +31,7 @@ const catStore = useCatStore()
 const generalStore = useGeneralStore()
 const autostart = useAutostart()
 const shortcutStore = useShortcutStore()
+const pairStore = usePairStore()
 const pairStatsStore = usePairStatsStore()
 const appWindow = getCurrentWebviewWindow()
 const { isRestored, restoreState } = useWindowState()
@@ -41,6 +43,9 @@ onMounted(async () => {
   // 所以放在最前面先起起来：后面任何一步失败都不至于漏掉它。
   await pairStatsStore.$tauri.start()
   markPairStatsLoaded()
+  // 等 pair store 载入完再挂载页面：否则对方猫等窗口在水合前就查状态、算尺寸，
+  // 会把 `enabled` 误当成 false（永久停在「双人联机没打开」）或拿默认 100% 尺寸盖掉设置。
+  await pairStore.$tauri.start()
   await appStore.$tauri.start()
   await appStore.init()
   await modelStore.$tauri.start()

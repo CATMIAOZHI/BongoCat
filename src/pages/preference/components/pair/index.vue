@@ -1802,7 +1802,10 @@ const {
       <Switch v-model:checked="pairStore.settings.remoteCat.alwaysOnTop" />
     </ProListItem>
 
-    <ProListItem :title="$t('pages.preference.pair.labels.passThrough')">
+    <ProListItem
+      :description="$t('pages.preference.cat.hints.passThrough')"
+      :title="$t('pages.preference.pair.labels.passThrough')"
+    >
       <Switch v-model:checked="pairStore.settings.remoteCat.passThrough" />
     </ProListItem>
   </ProList>

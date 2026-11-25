@@ -366,7 +366,7 @@
           "remoteCat": "Show your partner's cat in a separate desktop window.",
           "remoteModel": "Leave empty to use the same model as your own cat. Only models installed locally can be chosen.",
           "remoteStats": "Shown when you hover over your partner's cat (always shown while Pass Through is on). Requires your partner to enable \"Share Input Stats\" as well.",
-          "windowSize": "Resize the remote cat window.",
+          "windowSize": "Move mouse to the remote cat window edge, or hold Shift and right-drag to resize.",
           "chatWindow": "Show the chat window (bubbles) on the desktop.",
           "bubbleCount": "Up to 3 messages above the cat. The separate chat window scrolls continuously through history.",
           "chatPassThrough": "When enabled the chat window lets clicks through; opening the text box temporarily disables it.",

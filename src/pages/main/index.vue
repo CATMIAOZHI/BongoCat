@@ -7,7 +7,6 @@ import { sep } from '@tauri-apps/api/path'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { exists, readDir } from '@tauri-apps/plugin-fs'
 import { useDebounceFn, useEventListener } from '@vueuse/core'
-import { round } from 'es-toolkit'
 import { nth } from 'es-toolkit/compat'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
@@ -35,6 +34,7 @@ import { isImage } from '@/utils/is'
 import live2d from '@/utils/live2d'
 import { join } from '@/utils/path'
 import { clearObject } from '@/utils/shared'
+import { applyScaleDragDelta, resolveResizedScale } from '@/utils/windowScale'
 
 const { startListening } = useDevice()
 const appWindow = getCurrentWebviewWindow()
@@ -183,7 +183,7 @@ onUnmounted(handleDestroy)
  * 所以猫咪窗口自己算尺寸。
  */
 function targetWindowSize(scale = catStore.window.scale) {
-  if (!modelSize.value) return
+  if (!modelSize.value || !Number.isFinite(scale) || scale <= 0) return
 
   const { width, height } = modelSize.value
   const factor = scale / 100
@@ -212,7 +212,12 @@ const debouncedResize = useDebounceFn(async () => {
     // 反推缩放要用**物理宽度**：`targetWindowSize()` 也是按物理像素设的，用 CSS 像素
     // （`innerWidth`）在非 100% 系统缩放下会每次都算小一档，窗口会一跳一跳地越缩越小。
     const size = await appWindow.size()
-    const nextScale = Math.max(10, Math.min(500, round((size.width / modelSize.value.width) * 100)))
+    const nextScale = resolveResizedScale({
+      size,
+      modelSize: modelSize.value,
+      currentScale: catStore.window.scale,
+      extraHeight: overlayHeight.value * pixelRatio.value,
+    })
 
     if (nextScale !== catStore.window.scale) {
       catStore.window.scale = nextScale
@@ -313,7 +318,11 @@ useTauriListen<number>(LISTEN_KEY.SET_EXPRESSION, ({ payload }) => {
   live2d.setExpression(payload)
 })
 
+let scaleDragRemainder = 0
+
 function handleMouseDown(event: MouseEvent) {
+  scaleDragRemainder = 0
+
   if (event.button === 0) appWindow.startDragging()
 }
 
@@ -328,12 +337,24 @@ async function handleContextmenu(event: MouseEvent) {
 function handleMouseMove(event: MouseEvent) {
   const { buttons, shiftKey, movementX, movementY } = event
 
-  if (buttons !== 2 || !shiftKey) return
+  if (buttons !== 2 || !shiftKey) {
+    scaleDragRemainder = 0
 
-  const delta = (movementX + movementY) * 0.5
-  const nextScale = Math.max(10, Math.min(catStore.window.scale + delta, 500))
+    return
+  }
 
-  catStore.window.scale = round(nextScale)
+  const next = applyScaleDragDelta(
+    catStore.window.scale,
+    movementX,
+    movementY,
+    scaleDragRemainder,
+  )
+
+  scaleDragRemainder = next.remainder
+
+  if (next.scale !== catStore.window.scale) {
+    catStore.window.scale = next.scale
+  }
 }
 </script>
 

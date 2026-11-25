@@ -40,6 +40,10 @@ describe('联机状态到界面上那句话的映射（R44）', () => {
     expect(pairStateKey('something-new' as PairConnectionState, true)).toBe('pages.pairState.disconnected')
     expect(pairStatusKey('something-new' as PairConnectionState)).toBe('disconnected')
   })
+
+  it('联机总开关已经打开时，即使残留 disabled 也不再提示「双人联机没打开」', () => {
+    expect(pairStateKey('disabled', true)).toBe('pages.pairState.disconnected')
+  })
 })
 
 /**
